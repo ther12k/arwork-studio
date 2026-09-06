@@ -12,6 +12,7 @@ import {
   Image as ImageIcon,
   Loader2,
   Merge,
+  SplitSquareHorizontal,
   Tag,
   Layers,
   Crosshair,
@@ -31,6 +32,12 @@ import { ReviewDialog } from "./review-dialog";
 
 function MicroCaption({ children, className = "" }: { children: React.ReactNode; className?: string }) {
   return <p className={`text-[10px] leading-relaxed text-[#778481] ${className}`}>{children}</p>;
+}
+
+/** Pull the ±N px tolerance out of the flattened-rings derivation note. */
+function flattenToleranceLine(derivation: string): string | null {
+  const match = /±\s*([\d.]+)\s*px/.exec(derivation);
+  return match ? match[1] : null;
 }
 
 function NumberField({
@@ -188,6 +195,44 @@ export function RightPanel() {
         </SelectContent>
       </Select>
 
+      {/* Geometry backend + curve fit tolerance */}
+      <Label htmlFor="studio-geometry-backend" className="studio-label mb-1.5">
+        Geometry backend
+      </Label>
+      <Select
+        value={buildSettings.backend ?? "spline-local"}
+        onValueChange={(v) => setBuildSetting("backend", v)}
+        disabled={busy}
+      >
+        <SelectTrigger id="studio-geometry-backend" className="h-8 w-full rounded-md bg-white text-xs">
+          <SelectValue />
+        </SelectTrigger>
+        <SelectContent>
+          <SelectItem value="spline-local">Curved masters (spline fit)</SelectItem>
+          <SelectItem value="polygon-legacy">Legacy polygons (comparison)</SelectItem>
+        </SelectContent>
+      </Select>
+
+      <div className="mt-3 flex items-baseline justify-between">
+        <Label htmlFor="studio-curve-tolerance" className="studio-label mb-1.5 mt-0">
+          Curve fit tolerance
+        </Label>
+        <output htmlFor="studio-curve-tolerance" className="text-sm font-bold text-[#087f74]">
+          ±{(buildSettings.curve_tolerance ?? 1).toFixed(1)} px
+        </output>
+      </div>
+      <Slider
+        id="studio-curve-tolerance"
+        min={0.2}
+        max={2}
+        step={0.1}
+        value={[buildSettings.curve_tolerance ?? 1]}
+        onValueChange={(v) => setBuildSetting("curve_tolerance", v[0] ?? 1)}
+        className="py-1 [&_.bg-primary]:bg-[#087f74] [&_[data-slot=slider-range]]:bg-[#087f74] [&_[data-slot=slider-thumb]]:border-[#087f74]"
+        aria-label="Curve fit tolerance"
+      />
+      <MicroCaption>How far the spline fit may deviate from traced pixel edges.</MicroCaption>
+
       {/* Advanced settings */}
       <button
         type="button"
@@ -233,6 +278,26 @@ export function RightPanel() {
             max={80}
             onCommit={(v) => setBuildSetting("ink_threshold", v)}
           />
+          <div className="col-span-2">
+            <div className="flex items-baseline justify-between">
+              <Label htmlFor="studio-corner-angle" className="text-[10px] leading-snug text-[#657671]">
+                Corner threshold (spline fit)
+              </Label>
+              <output htmlFor="studio-corner-angle" className="text-xs font-bold text-[#087f74]">
+                {Math.round(buildSettings.corner_angle_deg ?? 60)}°
+              </output>
+            </div>
+            <Slider
+              id="studio-corner-angle"
+              min={25}
+              max={110}
+              step={5}
+              value={[buildSettings.corner_angle_deg ?? 60]}
+              onValueChange={(v) => setBuildSetting("corner_angle_deg", v[0] ?? 60)}
+              className="mt-1 py-1 [&_.bg-primary]:bg-[#087f74] [&_[data-slot=slider-range]]:bg-[#087f74] [&_[data-slot=slider-thumb]]:border-[#087f74]"
+              aria-label="Corner threshold"
+            />
+          </div>
           <div className="col-span-2">
             <Label htmlFor="studio-quality" className="studio-label mb-1.5">
               AI image quality
@@ -310,6 +375,43 @@ export function RightPanel() {
             </p>
             {qa.humanReviewed && (
               <p className="font-bold text-[#167a5d]">✓ Self-attested visual review recorded</p>
+            )}
+            {qa.geometry && (
+              <div className="mt-1.5 border-t border-[#d7e0cf] pt-1.5">
+                <p className="font-bold">Geometry (schema {qa.geometry.schema})</p>
+                <p className="mt-0.5">
+                  {qa.geometry.curvedCommands.toLocaleString("en-US")} /{" "}
+                  {qa.geometry.totalCommands.toLocaleString("en-US")} curved commands (
+                  {Math.round((qa.geometry.curvedCommandRatio ?? 0) * 100)}%)
+                </p>
+                <p>
+                  hit-test: {qa.geometry.hitTestProbes.toLocaleString("en-US")} probes ·{" "}
+                  {qa.geometry.hitTestConflicts} conflicts
+                </p>
+                {flattenToleranceLine(qa.geometry.flattenedDerivation) && (
+                  <p>flattened rings derived at ±{flattenToleranceLine(qa.geometry.flattenedDerivation)} px</p>
+                )}
+                <p>partition band {qa.geometry.partitionToleranceAllowance.toFixed(2)} px²</p>
+                {(qa.missingArea !== undefined || qa.overlapArea !== undefined) && (
+                  <p>
+                    missing {(qa.missingArea ?? 0).toFixed(2)} px² · overlap {(qa.overlapArea ?? 0).toFixed(2)} px²
+                  </p>
+                )}
+              </div>
+            )}
+            {qa.visualReview && (
+              <div className="mt-2 rounded-[8px] border border-[#e8d9b8] bg-[#fdf6e3] px-2.5 py-2">
+                <p className="font-bold text-[#957242]">Visual review (separate from geometry tests)</p>
+                <p className="mt-1 font-semibold text-[#957242]">Required — geometry tests cannot detect:</p>
+                <ul className="mt-1 space-y-1">
+                  {qa.visualReview.limitations.map((limitation, i) => (
+                    <li key={i} className="flex gap-1.5 text-[#957242]">
+                      <span aria-hidden>·</span>
+                      <span>{limitation}</span>
+                    </li>
+                  ))}
+                </ul>
+              </div>
             )}
             {qa.warnings.length > 0 && (
               <ul className="studio-scroll mt-1.5 max-h-40 space-y-1.5 overflow-y-auto pr-1">
@@ -400,6 +502,23 @@ export function RightPanel() {
             >
               <Tag className="size-3" aria-hidden />
               Make detail
+            </Button>
+            <Button
+              variant="outline"
+              size="sm"
+              className="h-8 rounded-md border-[#e1e5df] bg-white text-[9px]"
+              disabled={busy || !selected.size}
+              title="Split disconnected tap targets into separate regions"
+              onClick={() => {
+                if (selected.size !== 1) {
+                  toast("Select exactly one region to split.");
+                  return;
+                }
+                doEdit("split");
+              }}
+            >
+              <SplitSquareHorizontal className="size-3" aria-hidden />
+              Split
             </Button>
             <Button
               variant="outline"

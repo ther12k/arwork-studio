@@ -20,16 +20,19 @@ import {
   buildDraft,
   createProject,
   generateMaster,
+  generateSvgMaster,
   getConfig,
   getProject,
   listProjects,
   loadSample,
+  loadSvgSample,
   patchProject,
   promoteReference as promoteReferenceApi,
   runEdit as apiRunEdit,
   sendChat as apiSendChat,
   submitReview as apiSubmitReview,
   uploadImage as apiUploadImage,
+  uploadSvgMaster as apiUploadSvgMaster,
   type BuildSettings,
   type EditAction,
   type EditPayload,
@@ -40,7 +43,7 @@ import {
   type StudioConfig,
 } from "@/lib/studio-api";
 
-export type StudioView = "master" | "colored" | "numbered" | "play" | "inspect";
+export type StudioView = "master" | "colored" | "numbered" | "play" | "inspect" | "zoomlab";
 
 export const VIEW_LABELS: Record<StudioView, string> = {
   master: "Master",
@@ -48,6 +51,7 @@ export const VIEW_LABELS: Record<StudioView, string> = {
   numbered: "Numbered",
   play: "Play test",
   inspect: "Edit regions",
+  zoomlab: "Zoom lab",
 };
 
 const PROJECT_STORAGE_KEY = "studio-project";
@@ -105,16 +109,26 @@ export interface StudioApi {
   setEditPalette: (v: string) => void;
   setObjectGroup: (v: string) => void;
   setRevisionSelect: (v: string) => void;
-  setBuildSetting: (key: keyof BuildSettings, value: number) => void;
+  setBuildSetting: (key: keyof BuildSettings, value: number | string) => void;
+  // SVG master generation inputs
+  svgPrompt: string;
+  setSvgPrompt: (v: string) => void;
+  svgAspect: "1024x1536" | "1536x1024" | "1024x1024";
+  setSvgAspect: (v: "1024x1536" | "1536x1024" | "1024x1024") => void;
+  svgPaidConsent: boolean;
+  setSvgPaidConsent: (v: boolean) => void;
   // actions
   openProjectById: (pid: string) => Promise<void>;
   createNewProject: () => Promise<void>;
   saveBrief: () => Promise<void>;
   uploadFile: (file: File, role: "reference" | "master") => Promise<void>;
+  uploadSvgFile: (file: File) => Promise<void>;
   promoteReference: () => Promise<void>;
   loadSampleProject: () => Promise<void>;
+  loadSvgSampleProject: () => Promise<void>;
   sendChat: () => Promise<void>;
   generate: () => Promise<void>;
+  generateSvg: () => Promise<void>;
   build: () => Promise<void>;
   runEdit: (action: EditAction, extra?: Partial<EditPayload>) => Promise<void>;
   clearSelection: () => void;
@@ -166,7 +180,13 @@ export function StudioProvider({ children }: { children: React.ReactNode }) {
     min_region_pixels: 35,
     min_label_radius: 3,
     ink_threshold: 40,
+    backend: "spline-local",
+    curve_tolerance: 1.0,
+    corner_angle_deg: 60,
   });
+  const [svgPrompt, setSvgPrompt] = useState("");
+  const [svgAspect, setSvgAspect] = useState<"1024x1536" | "1536x1024" | "1024x1024">("1024x1536");
+  const [svgPaidConsent, setSvgPaidConsent] = useState(false);
 
   // refs mirroring state for closures created once
   const projectRef = useRef<Project | null>(null);
@@ -187,6 +207,10 @@ export function StudioProvider({ children }: { children: React.ReactNode }) {
   const qualityRef = useRef(quality);
   const buildSettingsRef = useRef(buildSettings);
   const revisionSelectRef = useRef(revisionSelect);
+  const svgPromptRef = useRef(svgPrompt);
+  const svgAspectRef = useRef(svgAspect);
+  const svgPaidRef = useRef(svgPaidConsent);
+  const configRef = useRef<StudioConfig | null>(null);
 
   // DOM refs
   const svgRef = useRef<SVGSVGElement | null>(null);
@@ -202,6 +226,10 @@ export function StudioProvider({ children }: { children: React.ReactNode }) {
   useEffect(() => void (rightsRef.current = rightsConfirmed), [rightsConfirmed]);
   useEffect(() => void (generationSourceRef.current = generationSource), [generationSource]);
   useEffect(() => void (qualityRef.current = quality), [quality]);
+  useEffect(() => void (svgPromptRef.current = svgPrompt), [svgPrompt]);
+  useEffect(() => void (svgAspectRef.current = svgAspect), [svgAspect]);
+  useEffect(() => void (svgPaidRef.current = svgPaidConsent), [svgPaidConsent]);
+  useEffect(() => void (configRef.current = config), [config]);
   useEffect(() => void (buildSettingsRef.current = buildSettings), [buildSettings]);
   useEffect(() => void (revisionSelectRef.current = revisionSelect), [revisionSelect]);
 
@@ -563,6 +591,29 @@ export function StudioProvider({ children }: { children: React.ReactNode }) {
     toast("Example loaded. Build vector draft to convert it locally.");
   }, [ensureProject, setProjectSync]);
 
+  const loadSvgSampleProject = useCallback(async () => {
+    const p = await ensureProject();
+    const next = await loadSvgSample(p.id);
+    setProjectSync(next);
+    syncFields(next);
+    viewRef.current = "master";
+    setView("master");
+    toast("Curved SVG master loaded — curves preserved, never rasterized. Build the draft.");
+  }, [ensureProject, setProjectSync, syncFields]);
+
+  const uploadSvgFile = useCallback(
+    async (file: File) => {
+      const p = await ensureProject();
+      const next = await apiUploadSvgMaster(p.id, file, rightsRef.current);
+      setProjectSync(next);
+      syncFields(next);
+      viewRef.current = "master";
+      setView("master");
+      toast("SVG master imported (sanitized, curves preserved). Build the vector draft.");
+    },
+    [ensureProject, setProjectSync, syncFields]
+  );
+
   const sendChat = useCallback(async () => {
     const p = projectRef.current;
     if (!p) throw new Error("Create a project first.");
@@ -588,6 +639,28 @@ export function StudioProvider({ children }: { children: React.ReactNode }) {
       })
     );
     setPaidConsent(false);
+    viewRef.current = "master";
+    setView("master");
+  }, [job, saveBrief]);
+
+  const generateSvg = useCallback(async () => {
+    const p = projectRef.current;
+    if (!p) throw new Error("Create a project first.");
+    const prompt = svgPromptRef.current.trim();
+    if (!prompt) throw new Error("Describe the SVG artwork first.");
+    if (!svgPaidRef.current) throw new Error("Tick the paid-request consent first.");
+    if (!configRef.current?.ai?.configured) throw new Error("AI provider is not configured on this server.");
+    await saveBrief();
+    await job(() =>
+      generateSvgMaster(p.id, {
+        prompt,
+        aspect: svgAspectRef.current,
+        include_reference: true,
+        confirm_paid: true,
+      })
+    );
+    setSvgPrompt("");
+    setSvgPaidConsent(false);
     viewRef.current = "master";
     setView("master");
   }, [job, saveBrief]);
@@ -682,7 +755,7 @@ export function StudioProvider({ children }: { children: React.ReactNode }) {
     [mountBoard]
   );
 
-  const setBuildSetting = useCallback((key: keyof BuildSettings, value: number) => {
+  const setBuildSetting = useCallback((key: keyof BuildSettings, value: number | string) => {
     setBuildSettings((prev) => ({ ...prev, [key]: value }));
   }, []);
 
@@ -731,14 +804,23 @@ export function StudioProvider({ children }: { children: React.ReactNode }) {
     setObjectGroup,
     setRevisionSelect,
     setBuildSetting,
+    svgPrompt,
+    setSvgPrompt,
+    svgAspect,
+    setSvgAspect,
+    svgPaidConsent,
+    setSvgPaidConsent,
     openProjectById,
     createNewProject,
     saveBrief,
     uploadFile,
+    uploadSvgFile,
     promoteReference,
     loadSampleProject,
+    loadSvgSampleProject,
     sendChat,
     generate,
+    generateSvg,
     build,
     runEdit,
     clearSelection,

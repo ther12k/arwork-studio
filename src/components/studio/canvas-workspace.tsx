@@ -9,14 +9,16 @@ import { Button } from "@/components/ui/button";
 import { Progress } from "@/components/ui/progress";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Textarea } from "@/components/ui/textarea";
-import { imageUrl } from "@/lib/studio-api";
+import { imageUrl, masterSvgUrl } from "@/lib/studio-api";
 import { VIEW_LABELS, type StudioView, useStudioContext } from "./use-studio";
+import ZoomLab from "./zoom-lab";
 
-const VIEW_ORDER: StudioView[] = ["master", "colored", "numbered", "play", "inspect"];
+const VIEW_ORDER: StudioView[] = ["master", "colored", "numbered", "play", "inspect", "zoomlab"];
 
 function canvasTag(view: StudioView): string {
   if (view === "inspect") return "Select · merge · group · fix labels";
   if (view === "play") return "Play test · separate from game progress";
+  if (view === "zoomlab") return "Same crop · curved vs legacy";
   return "Draft · review required";
 }
 
@@ -166,7 +168,7 @@ export function CanvasWorkspace() {
       {/* Canvas toolbar */}
       <div className="mx-0 my-4 flex flex-wrap items-center justify-between gap-2">
         <div
-          className="flex gap-0.5 rounded-[9px] bg-[#e8ece5] p-1"
+          className="flex flex-wrap gap-0.5 rounded-[9px] bg-[#e8ece5] p-1"
           role="group"
           aria-label="Artwork preview state"
         >
@@ -223,11 +225,15 @@ export function CanvasWorkspace() {
       {/* Canvas area */}
       <div
         ref={canvasRef}
-        className="studio-canvas relative flex h-[clamp(440px,60vh,880px)] min-h-64 items-center justify-center overflow-hidden rounded-xl border border-[#dce2d9] p-3.5"
-        role="img"
-        aria-label="Artwork canvas"
+        className={`studio-canvas relative flex min-w-0 rounded-xl border border-[#dce2d9] ${
+          view === "zoomlab"
+            ? "min-h-64 w-full flex-col items-stretch justify-start px-3.5 pb-14 pt-3.5"
+            : "h-[clamp(440px,60vh,880px)] min-h-64 items-center justify-center overflow-hidden p-3.5"
+        }`}
+        role={view === "zoomlab" ? undefined : "img"}
+        aria-label={view === "zoomlab" ? undefined : "Artwork canvas"}
       >
-        {!hasMaster && !hasBundle && (
+        {!hasMaster && !hasBundle && view !== "zoomlab" && (
           <div className="px-6 py-6 text-center">
             <span className="mb-5 block text-6xl text-[#acbfb1]" aria-hidden>
               ◈
@@ -244,18 +250,32 @@ export function CanvasWorkspace() {
           </div>
         )}
         {view === "master" && hasMaster && project && (
-          <img
-            src={imageUrl(project.id, "master", project.master!.sha256)}
-            alt="Current approved artwork master"
-            className="h-full w-full object-contain drop-shadow-[0_4px_15px_rgba(33,56,47,0.13)]"
-          />
+          <figure className="flex h-full w-full min-h-0 flex-col items-center gap-1.5">
+            <img
+              src={
+                project.master?.kind === "svg"
+                  ? masterSvgUrl(project.id, project.master.sha256)
+                  : imageUrl(project.id, "master", project.master!.sha256)
+              }
+              alt="Current approved artwork master"
+              className="min-h-0 w-full flex-1 object-contain drop-shadow-[0_4px_15px_rgba(33,56,47,0.13)]"
+            />
+            {project.master?.kind === "svg" && project.master.summary && (
+              <figcaption className="shrink-0 text-center text-[9px] leading-relaxed text-[#607767]">
+                {project.master.summary.shapes} shapes · {project.master.summary.curvedShapes} curved ·{" "}
+                {project.master.summary.gradients} gradients · {project.master.summary.hiddenShapes} hidden
+                excluded · {project.master.summary.rasterized ? "rasterized" : "never rasterized"}
+              </figcaption>
+            )}
+          </figure>
         )}
+        {view === "zoomlab" && <ZoomLab />}
         {/* VectorBoard owns this element's children — React renders it empty, once. */}
         <svg
           ref={svgRef}
           xmlns="http://www.w3.org/2000/svg"
           className={`h-full w-full select-none drop-shadow-[0_4px_15px_rgba(33,56,47,0.06)] ${
-            view === "master" || !hasBundle ? "hidden" : "block"
+            view === "master" || view === "zoomlab" || !hasBundle ? "hidden" : "block"
           }`}
           aria-label="Interactive vector artwork"
         />
@@ -267,7 +287,7 @@ export function CanvasWorkspace() {
       </div>
 
       {/* Palette bar */}
-      {hasBundle && view !== "master" && view !== "colored" && (
+      {hasBundle && view !== "master" && view !== "colored" && view !== "zoomlab" && (
         <div className="mt-2.5">
           <div className="mb-1 flex flex-wrap items-center justify-between gap-1.5 text-[10px] text-[#778481]">
             <span id="studio-progress-text">

@@ -1,0 +1,838 @@
+     1→     1→"use client";
+     2→     2→
+     3→     3→/**
+     4→     4→ * useStudio — page-level state + data flow for the Color Duel Art Studio.
+     5→     5→ * Faithful port of the vanilla-JS `web/studio.mjs` controller onto React state.
+     6→     6→ *
+     7→     7→ * Board specifics (imperative, non-React):
+     8→     8→ *  - the <svg> element is rendered ONCE by React with no children; VectorBoard
+     9→     9→ *    owns its DOM children and is re-created only when the revision changes;
+    10→    10→ *  - `board.paint` is wrapped so "Edit regions" taps select instead of fill;
+    11→    11→ *  - `board.clientToArt` is wrapped to capture the last tap point (Place number).
+    12→    12→ */
+    13→    13→
+    14→    14→import { createContext, useCallback, useContext, useEffect, useRef, useState } from "react";
+    15→    15→import { toast } from "sonner";
+    16→    16→
+    17→    17→import { loadBundle, VectorBoard, type BoardState, type Bundle } from "@/lib/detailed-board";
+    18→    18→import {
+    19→    19→  activateRevision,
+    20→    20→  buildDraft,
+    21→    21→  createProject,
+    22→    22→  generateMaster,
+    23→    23→  generateSvgMaster,
+    24→    24→  getConfig,
+    25→    25→  getProject,
+    26→    26→  listProjects,
+    27→    27→  loadSample,
+    28→    28→  loadSvgSample,
+    29→    29→  patchProject,
+    30→    30→  promoteReference as promoteReferenceApi,
+    31→    31→  runEdit as apiRunEdit,
+    32→    32→  sendChat as apiSendChat,
+    33→    33→  submitReview as apiSubmitReview,
+    34→    34→  uploadImage as apiUploadImage,
+    35→    35→  uploadSvgMaster as apiUploadSvgMaster,
+    36→    36→  type BuildSettings,
+    37→    37→  type EditAction,
+    38→    38→  type EditPayload,
+    39→    39→  type GenerateSource,
+    40→    40→  type ImageQuality,
+    41→    41→  type Project,
+    42→    42→  type Revision,
+    43→    43→  type StudioConfig,
+    44→    44→} from "@/lib/studio-api";
+    45→    45→
+    46→    46→export type StudioView = "master" | "colored" | "numbered" | "play" | "inspect" | "zoomlab";
+    47→    47→
+    48→    48→export const VIEW_LABELS: Record<StudioView, string> = {
+    49→    49→  master: "Master",
+    50→    50→  colored: "Vector",
+    51→    51→  numbered: "Numbered",
+    52→    52→  play: "Play test",
+    53→    53→  inspect: "Edit regions",
+    54→    54→  zoomlab: "Zoom lab",
+    55→    55→};
+    56→    56→
+    57→    57→const PROJECT_STORAGE_KEY = "studio-project";
+    58→    58→const DEFAULT_BRIEF =
+    59→    59→  "An original detailed woodland treehouse beside a waterfall, with warm lanterns, a winding staircase and flowering plants. Clear contours, coherent architecture, rich shading. No text, UI, palette or gameplay numbers.";
+    60→    60→
+    61→    61→const isBusyProject = (p: Project | null): boolean =>
+    62→    62→  p?.job?.status === "queued" || p?.job?.status === "running";
+    63→    63→
+    64→    64→export interface StudioApi {
+    65→    65→  // data
+    66→    66→  config: StudioConfig | null;
+    67→    67→  projects: Project[];
+    68→    68→  project: Project | null;
+    69→    69→  busy: boolean;
+    70→    70→  revision: Revision | null;
+    71→    71→  connectionError: boolean;
+    72→    72→  // board
+    73→    73→  view: StudioView;
+    74→    74→  bundle: Bundle | null;
+    75→    75→  boardState: BoardState | null;
+    76→    76→  selected: Set<string>;
+    77→    77→  placing: boolean;
+    78→    78→  selectionInfo: string;
+    79→    79→  // board action wrappers (safe to call from event handlers)
+    80→    80→  setBoardPalette: (id: number) => void;
+    81→    81→  findRegion: () => void;
+    82→    82→  undoFill: () => void;
+    83→    83→  resetTest: () => void;
+    84→    84→  // refs shared with imperative DOM
+    85→    85→  svgRef: React.RefObject<SVGSVGElement | null>;
+    86→    86→  canvasRef: React.RefObject<HTMLDivElement | null>;
+    87→    87→  zoomRef: React.RefObject<HTMLSpanElement | null>;
+    88→    88→  messagesRef: React.RefObject<HTMLDivElement | null>;
+    89→    89→  // editable fields
+    90→    90→  titleInput: string;
+    91→    91→  briefInput: string;
+    92→    92→  chatInput: string;
+    93→    93→  paidConsent: boolean;
+    94→    94→  rightsConfirmed: boolean;
+    95→    95→  generationSource: GenerateSource;
+    96→    96→  quality: ImageQuality;
+    97→    97→  editPalette: string;
+    98→    98→  objectGroup: string;
+    99→    99→  revisionSelect: string;
+   100→   100→  buildSettings: BuildSettings;
+   101→   101→  // setters used by panels
+   102→   102→  setTitleInput: (v: string) => void;
+   103→   103→  setBriefInput: (v: string) => void;
+   104→   104→  setChatInput: (v: string) => void;
+   105→   105→  setPaidConsent: (v: boolean) => void;
+   106→   106→  setRightsConfirmed: (v: boolean) => void;
+   107→   107→  setGenerationSource: (v: GenerateSource) => void;
+   108→   108→  setQuality: (v: ImageQuality) => void;
+   109→   109→  setEditPalette: (v: string) => void;
+   110→   110→  setObjectGroup: (v: string) => void;
+   111→   111→  setRevisionSelect: (v: string) => void;
+   112→   112→  setBuildSetting: (key: keyof BuildSettings, value: number | string) => void;
+   113→   113→  // SVG master generation inputs
+   114→   114→  svgPrompt: string;
+   115→   115→  setSvgPrompt: (v: string) => void;
+   116→   116→  svgAspect: "1024x1536" | "1536x1024" | "1024x1024";
+   117→   117→  setSvgAspect: (v: "1024x1536" | "1536x1024" | "1024x1024") => void;
+   118→   118→  svgPaidConsent: boolean;
+   119→   119→  setSvgPaidConsent: (v: boolean) => void;
+   120→   120→  // actions
+   121→   121→  openProjectById: (pid: string) => Promise<void>;
+   122→   122→  createNewProject: () => Promise<void>;
+   123→   123→  saveBrief: () => Promise<void>;
+   124→   124→  uploadFile: (file: File, role: "reference" | "master") => Promise<void>;
+   125→   125→  uploadSvgFile: (file: File) => Promise<void>;
+   126→   126→  promoteReference: () => Promise<void>;
+   127→   127→  loadSampleProject: () => Promise<void>;
+   128→   128→  loadSvgSampleProject: () => Promise<void>;
+   129→   129→  sendChat: () => Promise<void>;
+   130→   130→  generate: () => Promise<void>;
+   131→   131→  generateSvg: () => Promise<void>;
+   132→   132→  build: () => Promise<void>;
+   133→   133→  runEdit: (action: EditAction, extra?: Partial<EditPayload>) => Promise<void>;
+   134→   134→  clearSelection: () => void;
+   135→   135→  startPlacing: () => void;
+   136→   136→  activateSelectedRevision: () => Promise<void>;
+   137→   137→  submitReviewNote: (note: string) => Promise<void>;
+   138→   138→  switchView: (next: StudioView) => void;
+   139→   139→  zoomIn: () => void;
+   140→   140→  zoomOut: () => void;
+   141→   141→  fit: () => void;
+   142→   142→}
+   143→   143→
+   144→   144→const StudioContext = createContext<StudioApi | null>(null);
+   145→   145→
+   146→   146→export function useStudioContext(): StudioApi {
+   147→   147→  const ctx = useContext(StudioContext);
+   148→   148→  if (!ctx) throw new Error("useStudioContext must be used inside <StudioProvider>");
+   149→   149→  return ctx;
+   150→   150→}
+   151→   151→
+   152→   152→export function StudioProvider({ children }: { children: React.ReactNode }) {
+   153→   153→  const [config, setConfig] = useState<StudioConfig | null>(null);
+   154→   154→  const [projects, setProjects] = useState<Project[]>([]);
+   155→   155→  const [project, setProject] = useState<Project | null>(null);
+   156→   156→  const [view, setView] = useState<StudioView>("master");
+   157→   157→  const [bundle, setBundle] = useState<Bundle | null>(null);
+   158→   158→  const [boardState, setBoardState] = useState<BoardState | null>(null);
+   159→   159→  const [selected, setSelected] = useState<Set<string>>(new Set());
+   160→   160→  const [placing, setPlacing] = useState(false);
+   161→   161→  const [connectionError, setConnectionError] = useState(false);
+   162→   162→
+   163→   163→  // editable fields
+   164→   164→  const [titleInput, setTitleInput] = useState("New illustrated world");
+   165→   165→  const [briefInput, setBriefInput] = useState("");
+   166→   166→  const [chatInput, setChatInput] = useState("");
+   167→   167→  const [paidConsent, setPaidConsent] = useState(false);
+   168→   168→  const [rightsConfirmed, setRightsConfirmed] = useState(false);
+   169→   169→  const [generationSource, setGenerationSource] = useState<GenerateSource>("brief");
+   170→   170→  const [quality, setQuality] = useState<ImageQuality>("medium");
+   171→   171→  const [editPalette, setEditPalette] = useState("1");
+   172→   172→  const [objectGroup, setObjectGroup] = useState("roof");
+   173→   173→  const [revisionSelect, setRevisionSelect] = useState("");
+   174→   174→  const [buildSettings, setBuildSettings] = useState<BuildSettings>({
+   175→   175→    target_regions: 650,
+   176→   176→    palette_colors: 32,
+   177→   177→    paint_colors: 80,
+   178→   178→    max_edge: 1024,
+   179→   179→    compactness: 10,
+   180→   180→    min_region_pixels: 35,
+   181→   181→    min_label_radius: 3,
+   182→   182→    ink_threshold: 40,
+   183→   183→    backend: "spline-local",
+   184→   184→    curve_tolerance: 1.0,
+   185→   185→    corner_angle_deg: 60,
+   186→   186→  });
+   187→   187→  const [svgPrompt, setSvgPrompt] = useState("");
+   188→   188→  const [svgAspect, setSvgAspect] = useState<"1024x1536" | "1536x1024" | "1024x1024">("1024x1536");
+   189→   189→  const [svgPaidConsent, setSvgPaidConsent] = useState(false);
+   190→   190→
+   191→   191→  // refs mirroring state for closures created once
+   192→   192→  const projectRef = useRef<Project | null>(null);
+   193→   193→  const viewRef = useRef<StudioView>("master");
+   194→   194→  const selectedRef = useRef<Set<string>>(new Set());
+   195→   195→  const placingRef = useRef(false);
+   196→   196→  const boardRef = useRef<VectorBoard | null>(null);
+   197→   197→  const bundleRef = useRef<Bundle | null>(null);
+   198→   198→  const loadedRevisionRef = useRef<string | null>(null);
+   199→   199→  const loadingTokenRef = useRef(0);
+   200→   200→  const pollTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+   201→   201→  const titleRef = useRef(titleInput);
+   202→   202→  const briefRef = useRef(briefInput);
+   203→   203→  const chatRef = useRef(chatInput);
+   204→   204→  const paidRef = useRef(paidConsent);
+   205→   205→  const rightsRef = useRef(rightsConfirmed);
+   206→   206→  const generationSourceRef = useRef(generationSource);
+   207→   207→  const qualityRef = useRef(quality);
+   208→   208→  const buildSettingsRef = useRef(buildSettings);
+   209→   209→  const revisionSelectRef = useRef(revisionSelect);
+   210→   210→  const svgPromptRef = useRef(svgPrompt);
+   211→   211→  const svgAspectRef = useRef(svgAspect);
+   212→   212→  const svgPaidRef = useRef(svgPaidConsent);
+   213→   213→  const configRef = useRef<StudioConfig | null>(null);
+   214→   214→
+   215→   215→  // DOM refs
+   216→   216→  const svgRef = useRef<SVGSVGElement | null>(null);
+   217→   217→  const canvasRef = useRef<HTMLDivElement | null>(null);
+   218→   218→  const zoomRef = useRef<HTMLSpanElement | null>(null);
+   219→   219→  const messagesRef = useRef<HTMLDivElement | null>(null);
+   220→   220→
+   221→   221→  // keep field refs in sync
+   222→   222→  useEffect(() => void (titleRef.current = titleInput), [titleInput]);
+   223→   223→  useEffect(() => void (briefRef.current = briefInput), [briefInput]);
+   224→   224→  useEffect(() => void (chatRef.current = chatInput), [chatInput]);
+   225→   225→  useEffect(() => void (paidRef.current = paidConsent), [paidConsent]);
+   226→   226→  useEffect(() => void (rightsRef.current = rightsConfirmed), [rightsConfirmed]);
+   227→   227→  useEffect(() => void (generationSourceRef.current = generationSource), [generationSource]);
+   228→   228→  useEffect(() => void (qualityRef.current = quality), [quality]);
+   229→   229→  useEffect(() => void (svgPromptRef.current = svgPrompt), [svgPrompt]);
+   230→   230→  useEffect(() => void (svgAspectRef.current = svgAspect), [svgAspect]);
+   231→   231→  useEffect(() => void (svgPaidRef.current = svgPaidConsent), [svgPaidConsent]);
+   232→   232→  useEffect(() => void (configRef.current = config), [config]);
+   233→   233→  useEffect(() => void (buildSettingsRef.current = buildSettings), [buildSettings]);
+   234→   234→  useEffect(() => void (revisionSelectRef.current = revisionSelect), [revisionSelect]);
+   235→   235→
+   236→   236→  const busy = isBusyProject(project);
+   237→   237→  const revision = project?.revisions.find((r) => r.id === project.currentRevision) ?? null;
+   238→   238→  const selectionInfo = selected.size
+   239→   239→    ? `${selected.size} selected · ${[...selected].slice(0, 4).join(", ")}${selected.size > 4 ? "…" : ""}`
+   240→   240→    : "Tap regions to inspect or select them. Drag to pan.";
+   241→   241→
+   242→   242→  // ---------------------------------------------------------------- helpers
+   243→   243→
+   244→   244→  const setProjectSync = useCallback((next: Project | null) => {
+   245→   245→    projectRef.current = next;
+   246→   246→    setProject(next);
+   247→   247→    if (next) {
+   248→   248→      const current = next.revisions.find((r) => r.id === next.currentRevision);
+   249→   249→      const fallback = current?.id ?? next.revisions[0]?.id ?? "";
+   250→   250→      setRevisionSelect((prev) => (prev && next.revisions.some((r) => r.id === prev) ? prev : fallback));
+   251→   251→    } else {
+   252→   252→      setRevisionSelect("");
+   253→   253→    }
+   254→   254→  }, []);
+   255→   255→
+   256→   256→  /** Overwrite editable fields from the server (title / brief). */
+   257→   257→  const syncFields = useCallback((p: Project) => {
+   258→   258→    setTitleInput(p.title);
+   259→   259→    setBriefInput(p.brief);
+   260→   260→  }, []);
+   261→   261→
+   262→   262→  const refreshList = useCallback(async (): Promise<Project[]> => {
+   263→   263→    const items = await listProjects();
+   264→   264→    setProjects(items);
+   265→   265→    return items;
+   266→   266→  }, []);
+   267→   267→
+   268→   268→  /** Pure DOM update — selection text is derived during render from `selected`. */
+   269→   269→  const highlightSelection = useCallback(() => {
+   270→   270→    const board = boardRef.current;
+   271→   271→    if (!board) return;
+   272→   272→    for (const [id, el] of board.elements) el.classList.toggle("selected-region", selectedRef.current.has(id));
+   273→   273→  }, []);
+   274→   274→
+   275→   275→  const clearBoard = useCallback(() => {
+   276→   276→    loadingTokenRef.current++;
+   277→   277→    boardRef.current?.destroy();
+   278→   278→    boardRef.current = null;
+   279→   279→    bundleRef.current = null;
+   280→   280→    setBundle(null);
+   281→   281→    setBoardState(null);
+   282→   282→    loadedRevisionRef.current = null;
+   283→   283→    selectedRef.current = new Set();
+   284→   284→    setSelected(new Set());
+   285→   285→    placingRef.current = false;
+   286→   286→    setPlacing(false);
+   287→   287→  }, []);
+   288→   288→
+   289→   289→  // ------------------------------------------------------------- board view
+   290→   290→
+   291→   291→  const applyBoardView = useCallback(() => {
+   292→   292→    const board = boardRef.current;
+   293→   293→    if (!board) return;
+   294→   294→    board.setPreview(viewRef.current === "colored" || viewRef.current === "inspect");
+   295→   295→    highlightSelection();
+   296→   296→  }, [highlightSelection]);
+   297→   297→
+   298→   298→  const handleBoardChange = useCallback(
+   299→   299→    (state: BoardState, reason: string) => {
+   300→   300→      if (zoomRef.current) zoomRef.current.textContent = `${Math.round(state.zoom * 100)}%`;
+   301→   301→      if (reason !== "viewport") setBoardState(state);
+   302→   302→      if (reason === "wrong-color") toast("That region needs a different palette group.");
+   303→   303→      if (viewRef.current === "inspect") highlightSelection();
+   304→   304→    },
+   305→   305→    [highlightSelection]
+   306→   306→  );
+   307→   307→
+   308→   308→  // runEdit is called from inside the board paint wrapper; declare it via ref
+   309→   309→  // first so the wrapper (created once per board) always calls the latest one.
+   310→   310→  const runEditRef = useRef<(action: EditAction, extra?: Partial<EditPayload>) => Promise<void>>(async () => {
+   311→   311→    /* replaced below */
+   312→   312→  });
+   313→   313→
+   314→   314→  /** Wrap board interactions for authoring mode (selection instead of paint). */
+   315→   315→  const wrapBoard = useCallback(
+   316→   316→    (board: VectorBoard) => {
+   317→   317→      const normalPaint = board.paint.bind(board);
+   318→   318→      board.paint = (id: string | null) => {
+   319→   319→        if (viewRef.current !== "inspect") return normalPaint(id);
+   320→   320→        if (!id) return "ignored";
+   321→   321→        if (placingRef.current) {
+   322→   322→          const p = board.lastTapPoint;
+   323→   323→          if (!p) return "ignored";
+   324→   324→          placingRef.current = false;
+   325→   325→          setPlacing(false);
+   326→   326→          void runEditRef.current("label", { x: p.x, y: p.y }).catch((e: Error) => toast(e.message));
+   327→   327→          return "inspected";
+   328→   328→        }
+   329→   329→        const next = new Set(selectedRef.current);
+   330→   330→        if (next.has(id)) next.delete(id);
+   331→   331→        else next.add(id);
+   332→   332→        selectedRef.current = next;
+   333→   333→        setSelected(next);
+   334→   334→        if (next.size === 1) {
+   335→   335→          const reg = board.regions.get(id);
+   336→   336→          if (reg) {
+   337→   337→            setEditPalette(String(reg.paletteId));
+   338→   338→            setObjectGroup(!reg.objectId || reg.objectId === "unassigned" ? "roof" : reg.objectId);
+   339→   339→          }
+   340→   340→        }
+   341→   341→        highlightSelection();
+   342→   342→        return "inspected";
+   343→   343→      };
+   344→   344→      const convert = board.clientToArt.bind(board);
+   345→   345→      board.clientToArt = (x: number, y: number, matrix?: DOMMatrix | null) => {
+   346→   346→        const pt = convert(x, y, matrix);
+   347→   347→        board.lastTapPoint = pt;
+   348→   348→        return pt;
+   349→   349→      };
+   350→   350→    },
+   351→   351→    [highlightSelection]
+   352→   352→  );
+   353→   353→
+   354→   354→  /** Create the VectorBoard whenever a new bundle arrives (revision change). */
+   355→   355→  useEffect(() => {
+   356→   356→    if (!bundle || !svgRef.current) return;
+   357→   357→    const board = new VectorBoard(svgRef.current, bundle, {
+   358→   358→      persist: false,
+   359→   359→      mode: "number",
+   360→   360→      onChange: handleBoardChange,
+   361→   361→    });
+   362→   362→    boardRef.current = board;
+   363→   363→    wrapBoard(board);
+   364→   364→    applyBoardView();
+   365→   365→    return () => {
+   366→   366→      board.destroy();
+   367→   367→      if (boardRef.current === board) boardRef.current = null;
+   368→   368→    };
+   369→   369→  }, [bundle]);
+   370→   370→
+   371→   371→  // keep board preview/selection in sync with the active view
+   372→   372→  useEffect(() => {
+   373→   373→    applyBoardView();
+   374→   374→  }, [view, bundle, applyBoardView]);
+   375→   375→
+   376→   376→  // auto-scroll chat messages
+   377→   377→  useEffect(() => {
+   378→   378→    const el = messagesRef.current;
+   379→   379→    if (el) el.scrollTop = el.scrollHeight;
+   380→   380→  }, [project?.messages.length, project?.id]);
+   381→   381→
+   382→   382→  // re-measure labels when the canvas resizes
+   383→   383→  useEffect(() => {
+   384→   384→    const el = canvasRef.current;
+   385→   385→    if (!el || typeof ResizeObserver === "undefined") return;
+   386→   386→    const observer = new ResizeObserver(() => boardRef.current?.updateLabelVisibility());
+   387→   387→    observer.observe(el);
+   388→   388→    return () => observer.disconnect();
+   389→   389→  }, []);
+   390→   390→
+   391→   391→  // ----------------------------------------------------------------- polling
+   392→   392→
+   393→   393→  const mountBoard = useCallback(async () => {
+   394→   394→    const p = projectRef.current;
+   395→   395→    const r = p?.revisions.find((x) => x.id === p.currentRevision);
+   396→   396→    if (!p || !r || loadedRevisionRef.current === r.id) return;
+   397→   397→    clearBoard();
+   398→   398→    const token = loadingTokenRef.current;
+   399→   399→    try {
+   400→   400→      const b = await loadBundle(p.id, r.id);
+   401→   401→      if (token !== loadingTokenRef.current) return;
+   402→   402→      bundleRef.current = b;
+   403→   403→      loadedRevisionRef.current = r.id;
+   404→   404→      setBundle(b);
+   405→   405→    } catch (e) {
+   406→   406→      toast((e as Error).message);
+   407→   407→    }
+   408→   408→  }, [clearBoard]);
+   409→   409→
+   410→   410→  const pollRef = useRef<(pid: string) => Promise<void>>(async () => {
+   411→   411→    /* replaced below */
+   412→   412→  });
+   413→   413→  const poll = useCallback(
+   414→   414→    async (pid: string) => {
+   415→   415→      if (pollTimerRef.current) clearTimeout(pollTimerRef.current);
+   416→   416→      try {
+   417→   417→        const next = await getProject(pid);
+   418→   418→        if (projectRef.current?.id !== pid) return;
+   419→   419→        const changed = projectRef.current.currentRevision !== next.currentRevision;
+   420→   420→        setProjectSync(next);
+   421→   421→        if (!isBusyProject(next)) syncFields(next);
+   422→   422→        if (changed && next.currentRevision) {
+   423→   423→          viewRef.current = "colored";
+   424→   424→          setView("colored");
+   425→   425→          await mountBoard();
+   426→   426→          await refreshList();
+   427→   427→        } else if (
+   428→   428→          !isBusyProject(next) &&
+   429→   429→          next.currentRevision &&
+   430→   430→          loadedRevisionRef.current !== next.currentRevision
+   431→   431→        ) {
+   432→   432→          // job finished between the POST response and the first poll — mount the missed revision
+   433→   433→          viewRef.current = "colored";
+   434→   434→          setView("colored");
+   435→   435→          await mountBoard();
+   436→   436→          await refreshList();
+   437→   437→        }
+   438→   438→        if (isBusyProject(next)) {
+   439→   439→          pollTimerRef.current = setTimeout(() => void pollRef.current(pid), 900);
+   440→   440→        } else if (next.job?.status === "failed") {
+   441→   441→          toast(next.job.message || "Job failed");
+   442→   442→        }
+   443→   443→      } catch (e) {
+   444→   444→        toast(`Job polling stopped: ${(e as Error).message}`);
+   445→   445→      }
+   446→   446→    },
+   447→   447→    [mountBoard, refreshList, setProjectSync, syncFields]
+   448→   448→  );
+   449→   449→  useEffect(() => {
+   450→   450→    pollRef.current = poll;
+   451→   451→  }, [poll]);
+   452→   452→
+   453→   453→  const job = useCallback(
+   454→   454→    async (post: () => Promise<{ jobId: string }>) => {
+   455→   455→      const pid = projectRef.current?.id;
+   456→   456→      if (!pid) throw new Error("Create a project first.");
+   457→   457→      await post();
+   458→   458→      setProjectSync(await getProject(pid));
+   459→   459→      void poll(pid);
+   460→   460→    },
+   461→   461→    [poll, setProjectSync]
+   462→   462→  );
+   463→   463→
+   464→   464→  // ---------------------------------------------------------------- projects
+   465→   465→
+   466→   466→  const openProject = useCallback(
+   467→   467→    async (p: Project) => {
+   468→   468→      if (pollTimerRef.current) clearTimeout(pollTimerRef.current);
+   469→   469→      clearBoard();
+   470→   470→      setProjectSync(p);
+   471→   471→      syncFields(p);
+   472→   472→      setChatInput("");
+   473→   473→      setPaidConsent(false);
+   474→   474→      viewRef.current = p.currentRevision ? "colored" : "master";
+   475→   475→      setView(viewRef.current);
+   476→   476→      try {
+   477→   477→        localStorage.setItem(PROJECT_STORAGE_KEY, p.id);
+   478→   478→      } catch {
+   479→   479→        /* storage unavailable */
+   480→   480→      }
+   481→   481→      await refreshList();
+   482→   482→      if (p.currentRevision) await mountBoard();
+   483→   483→      if (isBusyProject(p)) void poll(p.id);
+   484→   484→    },
+   485→   485→    [clearBoard, mountBoard, poll, refreshList, setProjectSync, syncFields]
+   486→   486→  );
+   487→   487→
+   488→   488→  const ensureProject = useCallback(async () => {
+   489→   489→    if (projectRef.current) return projectRef.current;
+   490→   490→    const created = await createProject("New illustrated world");
+   491→   491→    await openProject(created);
+   492→   492→    return created;
+   493→   493→  }, [openProject]);
+   494→   494→
+   495→   495→  const openProjectById = useCallback(
+   496→   496→    async (pid: string) => {
+   497→   497→      await openProject(await getProject(pid));
+   498→   498→    },
+   499→   499→    [openProject]
+   500→   500→  );
+   501→   501→
+   502→   502→  const createNewProject = useCallback(async () => {
+   503→   503→    const created = await createProject("New illustrated world");
+   504→   504→    await openProject(created);
+   505→   505→    toast("New project created.");
+   506→   506→  }, [openProject]);
+   507→   507→
+   508→   508→  // -------------------------------------------------------------------- init
+   509→   509→
+   510→   510→  useEffect(() => {
+   511→   511→    let cancelled = false;
+   512→   512→    (async () => {
+   513→   513→      try {
+   514→   514→        const cfg = await getConfig();
+   515→   515→        if (cancelled) return;
+   516→   516→        setConfig(cfg);
+   517→   517→        const items = await refreshList();
+   518→   518→        let saved: Project | undefined;
+   519→   519→        try {
+   520→   520→          const stored = localStorage.getItem(PROJECT_STORAGE_KEY);
+   521→   521→          saved = stored ? items.find((p) => p.id === stored) : undefined;
+   522→   522→        } catch {
+   523→   523→          /* storage unavailable */
+   524→   524→        }
+   525→   525→        const target = saved ?? items[0];
+   526→   526→        if (target) {
+   527→   527→          await openProject(target);
+   528→   528→        } else {
+   529→   529→          const created = await createProject("Cascade Treehouse", DEFAULT_BRIEF);
+   530→   530→          await openProject(created);
+   531→   531→        }
+   532→   532→      } catch (e) {
+   533→   533→        if (cancelled) return;
+   534→   534→        setConnectionError(true);
+   535→   535→        toast((e as Error).message);
+   536→   536→      }
+   537→   537→    })();
+   538→   538→    return () => {
+   539→   539→      cancelled = true;
+   540→   540→      if (pollTimerRef.current) clearTimeout(pollTimerRef.current);
+   541→   541→    };
+   542→   542→  }, []);
+   543→   543→
+   544→   544→  // ----------------------------------------------------------------- actions
+   545→   545→
+   546→   546→  const saveBrief = useCallback(async () => {
+   547→   547→    const p = projectRef.current;
+   548→   548→    if (!p) throw new Error("Create a project first.");
+   549→   549→    const next = await patchProject(p.id, {
+   550→   550→      title: titleRef.current.trim() || "Untitled artwork",
+   551→   551→      brief: briefRef.current,
+   552→   552→    });
+   553→   553→    setProjectSync(next);
+   554→   554→    await refreshList();
+   555→   555→    return next;
+   556→   556→  }, [refreshList, setProjectSync]);
+   557→   557→
+   558→   558→  const uploadFile = useCallback(
+   559→   559→    async (file: File, role: "reference" | "master") => {
+   560→   560→      const p = await ensureProject();
+   561→   561→      const next = await apiUploadImage(p.id, file, role, rightsRef.current);
+   562→   562→      setProjectSync(next);
+   563→   563→      syncFields(next);
+   564→   564→      if (role === "master") {
+   565→   565→        viewRef.current = "master";
+   566→   566→        setView("master");
+   567→   567→      }
+   568→   568→      toast(
+   569→   569→        role === "master" ? "Master ready. Build a vector draft." : "Reference added. Use chat to develop an original brief."
+   570→   570→      );
+   571→   571→    },
+   572→   572→    [ensureProject, setProjectSync, syncFields]
+   573→   573→  );
+   574→   574→
+   575→   575→  const promoteReference = useCallback(async () => {
+   576→   576→    const p = projectRef.current;
+   577→   577→    if (!p) throw new Error("Create a project first.");
+   578→   578→    const next = await promoteReferenceApi(p.id, rightsRef.current);
+   579→   579→    setProjectSync(next);
+   580→   580→    viewRef.current = "master";
+   581→   581→    setView("master");
+   582→   582→    toast("Reference promoted to master.");
+   583→   583→  }, [setProjectSync]);
+   584→   584→
+   585→   585→  const loadSampleProject = useCallback(async () => {
+   586→   586→    const p = await ensureProject();
+   587→   587→    const next = await loadSample(p.id);
+   588→   588→    setProjectSync(next);
+   589→   589→    viewRef.current = "master";
+   590→   590→    setView("master");
+   591→   591→    toast("Example loaded. Build vector draft to convert it locally.");
+   592→   592→  }, [ensureProject, setProjectSync]);
+   593→   593→
+   594→   594→  const loadSvgSampleProject = useCallback(async () => {
+   595→   595→    const p = await ensureProject();
+   596→   596→    const next = await loadSvgSample(p.id);
+   597→   597→    setProjectSync(next);
+   598→   598→    syncFields(next);
+   599→   599→    viewRef.current = "master";
+   600→   600→    setView("master");
+   601→   601→    toast("Curved SVG master loaded — curves preserved, never rasterized. Build the draft.");
+   602→   602→  }, [ensureProject, setProjectSync, syncFields]);
+   603→   603→
+   604→   604→  const uploadSvgFile = useCallback(
+   605→   605→    async (file: File) => {
+   606→   606→      const p = await ensureProject();
+   607→   607→      const next = await apiUploadSvgMaster(p.id, file, rightsRef.current);
+   608→   608→      setProjectSync(next);
+   609→   609→      syncFields(next);
+   610→   610→      viewRef.current = "master";
+   611→   611→      setView("master");
+   612→   612→      toast("SVG master imported (sanitized, curves preserved). Build the vector draft.");
+   613→   613→    },
+   614→   614→    [ensureProject, setProjectSync, syncFields]
+   615→   615→  );
+   616→   616→
+   617→   617→  const sendChat = useCallback(async () => {
+   618→   618→    const p = projectRef.current;
+   619→   619→    if (!p) throw new Error("Create a project first.");
+   620→   620→    const message = chatRef.current.trim();
+   621→   621→    if (!message) throw new Error("Write a direction for the AI first.");
+   622→   622→    await saveBrief();
+   623→   623→    await job(() => apiSendChat(p.id, { message, include_reference: true, confirm_paid: paidRef.current }));
+   624→   624→    setChatInput("");
+   625→   625→    setPaidConsent(false);
+   626→   626→  }, [job, saveBrief]);
+   627→   627→
+   628→   628→  const generate = useCallback(async () => {
+   629→   629→    const p = projectRef.current;
+   630→   630→    if (!p) throw new Error("Create a project first.");
+   631→   631→    await saveBrief();
+   632→   632→    await job(() =>
+   633→   633→      generateMaster(p.id, {
+   634→   634→        source: generationSourceRef.current,
+   635→   635→        prompt: briefRef.current,
+   636→   636→        quality: qualityRef.current,
+   637→   637→        size: "1024x1536",
+   638→   638→        confirm_paid: paidRef.current,
+   639→   639→      })
+   640→   640→    );
+   641→   641→    setPaidConsent(false);
+   642→   642→    viewRef.current = "master";
+   643→   643→    setView("master");
+   644→   644→  }, [job, saveBrief]);
+   645→   645→
+   646→   646→  const generateSvg = useCallback(async () => {
+   647→   647→    const p = projectRef.current;
+   648→   648→    if (!p) throw new Error("Create a project first.");
+   649→   649→    const prompt = svgPromptRef.current.trim();
+   650→   650→    if (!prompt) throw new Error("Describe the SVG artwork first.");
+   651→   651→    if (!svgPaidRef.current) throw new Error("Tick the paid-request consent first.");
+   652→   652→    if (!configRef.current?.ai?.configured) throw new Error("AI provider is not configured on this server.");
+   653→   653→    await saveBrief();
+   654→   654→    await job(() =>
+   655→   655→      generateSvgMaster(p.id, {
+   656→   656→        prompt,
+   657→   657→        aspect: svgAspectRef.current,
+   658→   658→        include_reference: true,
+   659→   659→        confirm_paid: true,
+   660→   660→      })
+   661→   661→    );
+   662→   662→    setSvgPrompt("");
+   663→   663→    setSvgPaidConsent(false);
+   664→   664→    viewRef.current = "master";
+   665→   665→    setView("master");
+   666→   666→  }, [job, saveBrief]);
+   667→   667→
+   668→   668→  const build = useCallback(async () => {
+   669→   669→    const p = projectRef.current;
+   670→   670→    if (!p) throw new Error("Create a project first.");
+   671→   671→    await saveBrief();
+   672→   672→    await job(() => buildDraft(p.id, buildSettingsRef.current));
+   673→   673→  }, [job, saveBrief]);
+   674→   674→
+   675→   675→  const runEdit = useCallback(
+   676→   676→    async (action: EditAction, extra: Partial<EditPayload> = {}) => {
+   677→   677→      const p = projectRef.current;
+   678→   678→      if (!p) throw new Error("Create a project first.");
+   679→   679→      if (!selectedRef.current.size) throw new Error("Select at least one region in Edit regions.");
+   680→   680→      if (isBusyProject(p)) throw new Error("Wait for the current job.");
+   681→   681→      if (!p.currentRevision) throw new Error("Build the vector regions first.");
+   682→   682→      const body: EditPayload = {
+   683→   683→        base_revision: p.currentRevision,
+   684→   684→        action,
+   685→   685→        region_ids: [...selectedRef.current],
+   686→   686→        ...extra,
+   687→   687→      };
+   688→   688→      await job(() => apiRunEdit(p.id, body));
+   689→   689→      selectedRef.current = new Set();
+   690→   690→      setSelected(new Set());
+   691→   691→      highlightSelection();
+   692→   692→    },
+   693→   693→    [highlightSelection, job]
+   694→   694→  );
+   695→   695→  useEffect(() => {
+   696→   696→    runEditRef.current = runEdit;
+   697→   697→  }, [runEdit]);
+   698→   698→
+   699→   699→  const clearSelection = useCallback(() => {
+   700→   700→    selectedRef.current = new Set();
+   701→   701→    setSelected(new Set());
+   702→   702→    placingRef.current = false;
+   703→   703→    setPlacing(false);
+   704→   704→    highlightSelection();
+   705→   705→  }, [highlightSelection]);
+   706→   706→
+   707→   707→  const startPlacing = useCallback(() => {
+   708→   708→    if (selectedRef.current.size !== 1) {
+   709→   709→      toast("Select exactly one region first.");
+   710→   710→      return;
+   711→   711→    }
+   712→   712→    placingRef.current = true;
+   713→   713→    setPlacing(true);
+   714→   714→    toast("Tap a roomy point inside the selected region.");
+   715→   715→  }, []);
+   716→   716→
+   717→   717→  const activateSelectedRevision = useCallback(async () => {
+   718→   718→    const p = projectRef.current;
+   719→   719→    if (!p) throw new Error("Create a project first.");
+   720→   720→    const target = revisionSelectRef.current;
+   721→   721→    if (!target) throw new Error("No revision selected.");
+   722→   722→    const next = await activateRevision(p.id, target);
+   723→   723→    clearBoard();
+   724→   724→    viewRef.current = "colored";
+   725→   725→    setView("colored");
+   726→   726→    setProjectSync(next);
+   727→   727→    syncFields(next);
+   728→   728→    await mountBoard();
+   729→   729→    toast("Revision restored.");
+   730→   730→  }, [clearBoard, mountBoard, setProjectSync, syncFields]);
+   731→   731→
+   732→   732→  const submitReviewNote = useCallback(
+   733→   733→    async (note: string) => {
+   734→   734→      const p = projectRef.current;
+   735→   735→      if (!p) throw new Error("Create a project first.");
+   736→   736→      const r = p.revisions.find((x) => x.id === p.currentRevision);
+   737→   737→      if (!r) throw new Error("Build a draft first.");
+   738→   738→      const next = await apiSubmitReview(p.id, r.id, note);
+   739→   739→      setProjectSync(next);
+   740→   740→      toast("Visual review recorded.");
+   741→   741→    },
+   742→   742→    [setProjectSync]
+   743→   743→  );
+   744→   744→
+   745→   745→  const switchView = useCallback(
+   746→   746→    (next: StudioView) => {
+   747→   747→      if (next !== "master" && !projectRef.current?.currentRevision) {
+   748→   748→        toast("Build the vector regions first.");
+   749→   749→        return;
+   750→   750→      }
+   751→   751→      viewRef.current = next;
+   752→   752→      setView(next);
+   753→   753→      void mountBoard();
+   754→   754→    },
+   755→   755→    [mountBoard]
+   756→   756→  );
+   757→   757→
+   758→   758→  const setBuildSetting = useCallback((key: keyof BuildSettings, value: number | string) => {
+   759→   759→    setBuildSettings((prev) => ({ ...prev, [key]: value }));
+   760→   760→  }, []);
+   761→   761→
+   762→   762→  const api: StudioApi = {
+   763→   763→    config,
+   764→   764→    projects,
+   765→   765→    project,
+   766→   766→    busy,
+   767→   767→    revision,
+   768→   768→    connectionError,
+   769→   769→    view,
+   770→   770→    bundle,
+   771→   771→    boardState,
+   772→   772→    selected,
+   773→   773→    placing,
+   774→   774→    selectionInfo,
+   775→   775→    setBoardPalette: (id: number) => {
+   776→   776→      boardRef.current?.setPalette(id);
+   777→   777→    },
+   778→   778→    findRegion: () => boardRef.current?.nextRegion(),
+   779→   779→    undoFill: () => boardRef.current?.undo(),
+   780→   780→    resetTest: () => boardRef.current?.reset(),
+   781→   781→    svgRef,
+   782→   782→    canvasRef,
+   783→   783→    zoomRef,
+   784→   784→    messagesRef,
+   785→   785→    titleInput,
+   786→   786→    briefInput,
+   787→   787→    chatInput,
+   788→   788→    paidConsent,
+   789→   789→    rightsConfirmed,
+   790→   790→    generationSource,
+   791→   791→    quality,
+   792→   792→    editPalette,
+   793→   793→    objectGroup,
+   794→   794→    revisionSelect,
+   795→   795→    buildSettings,
+   796→   796→    setTitleInput,
+   797→   797→    setBriefInput,
+   798→   798→    setChatInput,
+   799→   799→    setPaidConsent,
+   800→   800→    setRightsConfirmed,
+   801→   801→    setGenerationSource,
+   802→   802→    setQuality,
+   803→   803→    setEditPalette,
+   804→   804→    setObjectGroup,
+   805→   805→    setRevisionSelect,
+   806→   806→    setBuildSetting,
+   807→   807→    svgPrompt,
+   808→   808→    setSvgPrompt,
+   809→   809→    svgAspect,
+   810→   810→    setSvgAspect,
+   811→   811→    svgPaidConsent,
+   812→   812→    setSvgPaidConsent,
+   813→   813→    openProjectById,
+   814→   814→    createNewProject,
+   815→   815→    saveBrief,
+   816→   816→    uploadFile,
+   817→   817→    uploadSvgFile,
+   818→   818→    promoteReference,
+   819→   819→    loadSampleProject,
+   820→   820→    loadSvgSampleProject,
+   821→   821→    sendChat,
+   822→   822→    generate,
+   823→   823→    generateSvg,
+   824→   824→    build,
+   825→   825→    runEdit,
+   826→   826→    clearSelection,
+   827→   827→    startPlacing,
+   828→   828→    activateSelectedRevision,
+   829→   829→    submitReviewNote,
+   830→   830→    switchView,
+   831→   831→    zoomIn: () => boardRef.current?.zoom(1.4),
+   832→   832→    zoomOut: () => boardRef.current?.zoom(1 / 1.4),
+   833→   833→    fit: () => boardRef.current?.fit(),
+   834→   834→  };
+   835→   835→
+   836→   836→  return <StudioContext.Provider value={api}>{children}</StudioContext.Provider>;
+   837→   837→}
+   838→   838→

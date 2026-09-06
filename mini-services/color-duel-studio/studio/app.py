@@ -10,14 +10,18 @@ from fastapi import FastAPI,UploadFile,File,Form,HTTPException,Request
 from fastapi.responses import FileResponse,JSONResponse,Response
 from fastapi.staticfiles import StaticFiles
 from .models import *
-from .pipeline import clean_image,compile_image,edit_bundle,read_json,write_json,make_export,load_bundle,validate_bundle
+from .pipeline import (BACKENDS, clean_image, compile_image, compile_svg_master,
+                        edit_bundle, read_json, write_json, make_export, load_bundle, validate_bundle,
+                        legacy_geometry)
+from .svg_master import clean_svg
 from .ai import Provider
 
-BASE=Path(__file__).resolve().parents[1]
-load_dotenv(BASE/'.env')
-SAFE=re.compile(r'^[a-zA-Z0-9][a-zA-Z0-9_-]{0,80}$')
-FILES={'artwork.json','regions.json','palette.json','paint.json','colored.svg','numbered.svg','linework.svg',
-       'ink.svg','selected-preview.svg','thumbnail.webp','source-master.png','colored-preview.png','numbered-preview.png','validation.json','build-settings.json'}
+BASE = Path(__file__).resolve().parents[1]
+load_dotenv(BASE / '.env')
+SAFE = re.compile(r'^[a-zA-Z0-9][a-zA-Z0-9_-]{0,80}$')
+FILES = {'artwork.json', 'regions.json', 'palette.json', 'paint.json', 'colored.svg', 'numbered.svg', 'linework.svg',
+         'ink.svg', 'selected-preview.svg', 'thumbnail.webp', 'source-master.png', 'source-master.svg',
+         'colored-preview.png', 'numbered-preview.png', 'validation.json', 'build-settings.json'}
 
 def now(): return datetime.now(timezone.utc).isoformat()
 def ident(): return uuid.uuid4().hex[:16]
@@ -104,7 +108,15 @@ def create_app(workspace: Path|None=None, transport=None):
     @app.exception_handler(ValueError)
     async def bad_value(_,exc): return JSONResponse({'detail':str(exc)},400)
     @app.get('/api/config')
-    def config(): return {'ai':provider.config(),'localOnly':True,'version':'0.1.0','supportedFormat':'color-duel-detailed-vector-1','maxUploadMB':12}
+    def config():
+        ai = provider.config()
+        for backend in BACKENDS:
+            if backend['id'] == 'provider-svg-generation':
+                backend['available'] = bool(ai['configured'])
+            if backend['id'] == 'provider-vectorizer':
+                backend['available'] = bool(os.getenv('VECTORIZER_API_KEY'))
+        return {'ai': ai, 'localOnly': True, 'version': '0.2.0', 'supportedFormat': 'color-duel-detailed-vector-1',
+                'geometrySchema': 2, 'maxUploadMB': 12, 'backends': BACKENDS}
     @app.get('/api/projects')
     def list_projects():
         with lock: return sorted([read_json(f) for f in root.glob('*/project.json')],key=lambda p:p['updatedAt'],reverse=True)
@@ -123,16 +135,55 @@ def create_app(workspace: Path|None=None, transport=None):
         with lock:
             p=project(pid);editable(p);p.update(title=body.title,brief=body.brief);save(p);return p
     @app.post('/api/projects/{pid}/upload')
-    async def upload(pid:str,file:UploadFile=File(...),role:str=Form('reference'),rights_confirmed:bool=Form(False)):
-        if role not in ['reference','master']: raise HTTPException(400,'Invalid upload role.')
-        if role=='master' and not rights_confirmed: raise HTTPException(400,'Confirm ownership or permission before using an image as the master.')
-        raw=await file.read(12*1024*1024+1)
+    async def upload(pid: str, file: UploadFile = File(...), role: str = Form('reference'), rights_confirmed: bool = Form(False)):
+        if role not in ['reference', 'master']: raise HTTPException(400, 'Invalid upload role.')
+        if role == 'master' and not rights_confirmed: raise HTTPException(400, 'Confirm ownership or permission before using an image as the master.')
+        raw = await file.read(12 * 1024 * 1024 + 1)
         with lock:
-            p=project(pid);editable(p);name=f'{role}-{ident()}.png'
-            meta=clean_image(raw,folder(pid)/name)
-            p[role]={'file':name,**meta,'source':'uploaded','rightsConfirmed':rights_confirmed,'createdAt':now()}
-            if role=='master':p['currentRevision']=None
-            save(p);return p
+            p = project(pid); editable(p); name = f'{role}-{ident()}.png'
+            meta = clean_image(raw, folder(pid) / name)
+            p[role] = {'file': name, **meta, 'source': 'uploaded', 'rightsConfirmed': rights_confirmed, 'createdAt': now()}
+            if role == 'master': p['currentRevision'] = None
+            save(p); return p
+
+    @app.post('/api/projects/{pid}/upload-svg')
+    async def upload_svg(pid: str, file: UploadFile = File(...), rights_confirmed: bool = Form(False)):
+        """Sanitized SVG-master import: curves, holes, gradients, transforms and
+        drawing order are preserved; the master is never rasterized or retraced."""
+        if not rights_confirmed:
+            raise HTTPException(400, 'Confirm ownership or permission before using an SVG as the master.')
+        raw = await file.read(12 * 1024 * 1024 + 1)
+        with lock:
+            p = project(pid); editable(p)
+            name = f'master-{ident()}.svg'
+            meta = clean_svg(raw, folder(pid) / name)
+            p['master'] = {'file': name, **meta, 'source': 'uploaded SVG master (sanitized; curves preserved, never rasterized)',
+                           'rightsConfirmed': True, 'createdAt': now()}
+            p['currentRevision'] = None
+            save(p); return p
+
+    @app.get('/api/projects/{pid}/master/svg')
+    def master_svg(pid: str):
+        p = project(pid)
+        m = p.get('master') or {}
+        if m.get('kind') != 'svg': raise HTTPException(404, 'The current master is not an SVG master.')
+        f = folder(pid) / m['file']
+        if not f.is_file(): raise HTTPException(404)
+        return FileResponse(f, media_type='image/svg+xml', headers={'Cache-Control': 'no-store'})
+
+    @app.post('/api/projects/{pid}/sample-svg')
+    def sample_svg(pid: str):
+        """Load the bundled curved SVG example (treehouse-master.svg)."""
+        with lock:
+            p = project(pid); editable(p)
+            src = BASE / 'examples/treehouse-master.svg'
+            if not src.is_file(): raise HTTPException(404, 'Bundled SVG example is missing.')
+            name = f'master-{ident()}.svg'
+            meta = clean_svg(src.read_bytes(), folder(pid) / name)
+            p['master'] = {'file': name, **meta, 'source': 'Bundled studio example (original hand-authored artwork for this tool).',
+                           'rightsConfirmed': True, 'createdAt': now()}
+            p['currentRevision'] = None
+            save(p); return p
     @app.post('/api/projects/{pid}/reference-as-master')
     def promote(pid:str,body:PromoteRequest):
         with lock:
@@ -187,16 +238,51 @@ def create_app(workspace: Path|None=None, transport=None):
             return {'master':{'file':name,**im,'source':'AI-generated via '+meta['model'],'rightsConfirmed':False,'createdAt':now()},
                 'usage':{'kind':'image','at':now(),**meta}}
         return start(pid,'generation',run)
+
+    @app.post('/api/projects/{pid}/generate-svg')
+    def generate_svg(pid: str, body: GenerateSvgRequest):
+        """Separate SVG-generation route for providers that author SVG masters.
+        The paid call is explicit; credentials stay server-side. The result is
+        sanitized and imported with curves preserved — never rasterized."""
+        if not body.confirm_paid:
+            raise HTTPException(400, 'Explicit confirmation required: this sends the brief (and optionally the reference) to the paid AI provider and may incur charges.')
+        if not provider.config()['configured']:
+            raise HTTPException(503, 'AI not configured. Add OPENAI_API_KEY to .env. SVG-master upload and offline conversion work without it.')
+        with lock:
+            p = project(pid)
+            ref = None
+            if body.include_reference and p.get('reference'):
+                ref = folder(pid) / p['reference']['file']
+        def run(tick):
+            tick(.15, 'Requesting an SVG master from the AI provider')
+            svg_text, meta = provider.svg(body.prompt, body.aspect, ref)
+            tick(.55, 'Sanitizing the generated SVG master')
+            name = f'master-{ident()}.svg'
+            im = clean_svg(svg_text.encode('utf-8'), folder(pid) / name)
+            write_json(folder(pid) / (name + '.provenance.json'),
+                       {'prompt': body.prompt, 'request': body.model_dump(exclude={'confirm_paid'}), **meta,
+                        'sanitizerReport': im.get('summary', {}).get('warnings', [])})
+            return {'master': {'file': name, **im, 'source': 'AI-generated SVG via ' + meta.get('model', 'chat') + ' (sanitized; curves preserved)',
+                               'rightsConfirmed': False, 'createdAt': now()},
+                    'usage': {'kind': 'svg-generation', 'at': now(), **meta}}
+        return start(pid, 'svg generation', run)
     @app.post('/api/projects/{pid}/build')
     def build(pid:str,body:BuildSettings):
         with lock:p=project(pid)
-        if not p['master']:raise HTTPException(400,'Upload your own master, load the example, or generate an image first.')
+        if not p['master']:raise HTTPException(400,'Upload your own master, load an example, or generate one first.')
         rev='rev-'+ident();version=f'0.{len(p["revisions"])+1}.0'
+        is_svg=p['master'].get('kind')=='svg'
         def run(tick):
-            result=compile_image(folder(pid)/p['master']['file'],folder(pid)/'revisions'/rev,
-                artwork_id=pid,version=version,title=p['title'],settings=body,
-                provenance={'source':p['master']['source'],'sourceHash':p['master']['sha256'],
-                    'rightsConfirmedByUser':p['master'].get('rightsConfirmed',False),'legalClearanceVerified':False},progress=tick)
+            if is_svg:
+                result=compile_svg_master(folder(pid)/p['master']['file'],folder(pid)/'revisions'/rev,
+                    artwork_id=pid,version=version,title=p['title'],settings=body,
+                    provenance={'source':p['master']['source'],'sourceHash':p['master']['sha256'],
+                        'rightsConfirmedByUser':p['master'].get('rightsConfirmed',False),'legalClearanceVerified':False},progress=tick)
+            else:
+                result=compile_image(folder(pid)/p['master']['file'],folder(pid)/'revisions'/rev,
+                    artwork_id=pid,version=version,title=p['title'],settings=body,
+                    provenance={'source':p['master']['source'],'sourceHash':p['master']['sha256'],
+                        'rightsConfirmedByUser':p['master'].get('rightsConfirmed',False),'legalClearanceVerified':False},progress=tick)
             return {'revision':{'id':rev,'version':version,'createdAt':now(),'kind':'build','sourceHash':p['master']['sha256'],
                 'regionCount':result['manifest']['regionCount'],'qa':result['validation'],
                 'manifestUrl':f'/api/projects/{pid}/revisions/{rev}/files/artwork.json'}}
@@ -241,6 +327,20 @@ def create_app(workspace: Path|None=None, transport=None):
         f=revision_dir(pid,revision)/name
         if not f.is_file():raise HTTPException(404)
         return FileResponse(f)
+
+    @app.get('/api/projects/{pid}/revisions/{revision}/geometry')
+    def geometry_mode(pid:str,revision:str,mode:str='curved'):
+        """Zoom-lab payload. mode=curved returns the authoritative masters;
+        mode=legacy returns the same regions as pre-upgrade pixel-edge
+        polygons (exact for raster builds, simulated snap for SVG masters)."""
+        if mode not in ('curved','legacy'):raise HTTPException(400,'mode must be curved or legacy.')
+        b=load_bundle(revision_dir(pid,revision));g=b['geometry']
+        if mode=='legacy':return legacy_geometry(g)
+        regions=[{'id':r['id'],'paletteId':r['paletteId'],'fillRule':'evenodd',
+                  'd':r['d'],'label':r['label'],'bbox':r['bbox']} for r in g['regions']]
+        out={k:v for k,v in g.items() if k not in ('regions','decorations','detailPaths','importReport')}
+        out['regions']=regions;out['mode']='curved'
+        return out
     @app.get('/api/projects/{pid}/revisions/{revision}/export')
     def export(pid:str,revision:str,authoring:bool=False):
         content=make_export(revision_dir(pid,revision),include_authoring=authoring)

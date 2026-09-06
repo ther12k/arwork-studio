@@ -4,6 +4,7 @@
  * A private, server-to-server OpenAI-compatible shim backed by z-ai-web-dev-sdk.
  * The Python studio's Provider (studio/ai.py) points AI_BASE_URL at this service:
  *   POST /v1/responses            -> art-direction chat (brief refinement, JSON {reply, brief})
+ *   POST /v1/svg                   -> separate SVG-generation route (model authors the master)
  *   POST /v1/images/generations   -> master image generation from the brief
  *   POST /v1/images/edits         -> owned-image / current-master editing (multipart)
  *   GET  /healthz                 -> liveness
@@ -108,13 +109,13 @@ const JSON_CONTRACT =
   'No markdown, no code fences, no commentary outside the JSON.';
 
 /** Responses-API payload -> z-ai chat messages. Returns messages + whether images are present. */
-function toZaiMessages(payload: AnyObj): { messages: AnyObj[]; hasImage: boolean } {
+function toZaiMessages(payload: AnyObj, systemSuffix = JSON_CONTRACT): { messages: AnyObj[]; hasImage: boolean } {
   const instructions = typeof payload.instructions === 'string' ? payload.instructions : '';
   const input = Array.isArray(payload.input) ? (payload.input as ChatMessage[]) : [];
   const messages: AnyObj[] = [];
   if (instructions) {
     // The z-ai chat API expects system prompts in an 'assistant' role message.
-    messages.push({ role: 'assistant', content: `${instructions}\n\n${JSON_CONTRACT}` });
+    messages.push({ role: 'assistant', content: `${instructions}${systemSuffix ? '\n\n' + systemSuffix : ''}` });
   }
   let hasImage = false;
   for (const msg of input) {
@@ -272,6 +273,66 @@ async function handleEdits(req: Request): Promise<Response> {
   }
 }
 
+/** Pull the <svg>…</svg> document out of a model answer (fences tolerated). */
+function extractSvg(text: string): string | null {
+  let t = (text || '').trim();
+  const fence = t.match(/```(?:svg|xml)?\s*([\s\S]*?)```/i);
+  if (fence) t = fence[1].trim();
+  const start = t.indexOf('<svg');
+  const end = t.lastIndexOf('</svg>');
+  if (start === -1 || end === -1 || end <= start) return null;
+  const doc = t.slice(start, end + 6);
+  return doc.length > 100 ? doc : null;
+}
+
+const SVG_CONTRACT =
+  'Respond with ONLY the raw SVG document: a single <svg>…</svg> element, no markdown, ' +
+  'no fences, no commentary outside the SVG.';
+
+/** POST /v1/svg — separate SVG-generation route (provider authors the master). */
+async function handleSvg(req: Request): Promise<Response> {
+  let payload: AnyObj;
+  try {
+    payload = (await req.json()) as AnyObj;
+  } catch {
+    return fail(400, 'invalid_json', 'Request body is not valid JSON.');
+  }
+  const model = typeof payload.model === 'string' ? payload.model : 'glm-4.6';
+  const { messages, hasImage } = toZaiMessages(payload, SVG_CONTRACT);
+  if (!messages.length) return fail(400, 'invalid_request', 'No chat input supplied.');
+  try {
+    const zai = await client();
+    const completion = hasImage
+      ? await zai.chat.completions.createVision({ messages, thinking: { type: 'disabled' } })
+      : await zai.chat.completions.create({ messages, thinking: { type: 'disabled' } });
+    const raw = completion.choices[0]?.message?.content ?? '';
+    let svg = extractSvg(raw);
+    if (!svg) {
+      // One normalization pass: ask the model to re-emit its own art as pure SVG.
+      const repair = await zai.chat.completions.create({
+        messages: [
+          {
+            role: 'assistant',
+            content:
+              'You convert illustration drafts into strict standalone SVG. ' +
+              'Return only the single <svg>…</svg> document, preserving the artwork substance. ' +
+              'Never invent a new artwork.',
+          },
+          { role: 'user', content: raw.slice(0, 60000) },
+        ],
+        thinking: { type: 'disabled' },
+      });
+      svg = extractSvg(repair.choices[0]?.message?.content ?? '');
+    }
+    if (!svg) {
+      return fail(502, 'unparsable_svg', 'The model did not return a usable SVG document.');
+    }
+    return json(responsesApiWrap(svg, model));
+  } catch (err) {
+    return fail(502, 'provider_error', err instanceof Error ? err.message : String(err));
+  }
+}
+
 const server = Bun.serve({
   port: PORT,
   hostname: HOST,
@@ -283,6 +344,7 @@ const server = Bun.serve({
         return json({ ok: true, service: 'color-duel-ai-bridge' });
       }
       if (req.method === 'POST' && url.pathname === '/v1/responses') return await handleResponses(req);
+      if (req.method === 'POST' && url.pathname === '/v1/svg') return await handleSvg(req);
       if (req.method === 'POST' && url.pathname === '/v1/images/generations') return await handleGenerations(req);
       if (req.method === 'POST' && url.pathname === '/v1/images/edits') return await handleEdits(req);
       return fail(404, 'not_found', `No route: ${req.method} ${url.pathname}`);

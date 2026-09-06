@@ -31,6 +31,23 @@ approximate region count independently. Return JSON with reply (short helpful ex
 and brief (complete updated image prompt). Do not claim to have already generated an image.
 '''
 
+SVG_DIRECTION='''You are a vector illustrator inside a coloring-game asset authoring tool.
+Produce ONE complete original flat-illustration SVG (and nothing else outside
+the <svg> element). Requirements:
+- viewBox exactly "0 0 576 768" unless another aspect is requested.
+- ONLY these elements: svg, g, defs, linearGradient, radialGradient, stop,
+  path, rect, circle, ellipse, polygon, polyline, line. No script, style,
+  text, image, filter, mask, clipPath, use, or external references.
+- Hand-tuned coordinates: coherent scene composition, bounded color areas,
+  20-60 shapes, 15-30 distinct flat fills. Some gradients welcome.
+- Curve commands (C/Q) for organic shapes; deliberate straight edges for
+  architecture. fill-rule="evenodd" subpaths may create holes.
+- No numbers, lettering, logos, watermarks. The game adds numbers later.
+Do not claim copyright clearance. Do not wrap the SVG in markdown fences.
+'''
+
+ASPECT_VIEWBOX={'1024x1536':'0 0 576 768','1536x1024':'0 0 768 576','1024x1024':'0 0 640 640'}
+
 class AIUnavailable(ValueError): pass
 
 class Provider:
@@ -98,3 +115,28 @@ class Provider:
         except ValueError: raise ValueError('Provider returned invalid image encoding.')
         return raw, {'provider':'openai','model':payload['model'],'usage':data.get('usage',{}),
                      'quality':quality,'size':size,'sourceMode':'edit' if source else 'generation'}
+
+    def svg(self, prompt: str, aspect: str, reference: Path|None=None):
+        """Separate SVG-generation capability: the provider authors an SVG
+        master. The reply is sanitized downstream; never rasterized."""
+        view_box=ASPECT_VIEWBOX.get(aspect,'0 0 576 768')
+        instructions=SVG_DIRECTION+f'\nRequested viewBox: "{view_box}".\n'
+        content=[{'type':'input_text','text':'ARTWORK REQUEST:\n'+prompt}]
+        if reference:
+            content.append({'type':'input_image','image_url':self.data_url(reference)})
+            instructions+=' A reference image is attached: reuse only its broad mood, palette and subject categories, not its composition.'
+        payload={'model':self.config()['chatModel'],'instructions':instructions,
+                 'input':[{'role':'user','content':content}],'store':False,'max_output_tokens':8000}
+        with self._client() as client:
+            data=self._result(client.post('svg',json=payload))
+        text=''.join(c.get('text','') for output in data.get('output',[]) for c in output.get('content',[]) if c.get('type')=='output_text')
+        start=text.find('<svg')
+        end=text.rfind('</svg>')
+        if start==-1 or end==-1 or end<=start:
+            raise ValueError('The provider did not return an SVG master. Nothing was saved; retry explicitly if you want to spend again.')
+        svg_text=text[start:end+6]
+        if len(svg_text)>1_500_000:
+            raise ValueError('The generated SVG exceeds the size budget. Nothing was saved.')
+        return svg_text, {'provider':'openai','model':payload['model'],'usage':data.get('usage',{}),
+                          'sourceMode':'reference-guided' if reference else 'generation',
+                          'aspect':aspect,'kind':'svg'}

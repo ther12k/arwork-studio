@@ -1,0 +1,748 @@
+```html
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Color Duel Art Studio - Zoom Lab</title>
+    <style>
+        :root {
+            --bg-app: #f9f9f7;
+            --bg-panel: #ffffff;
+            --text-main: #111827;
+            --text-muted: #6b7280;
+            --primary: #0f766e; /* Teal-700 */
+            --primary-light: #ccfbf1;
+            --border-color: #e5e7eb;
+            --font-sans: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+        }
+
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+        }
+
+        body {
+            font-family: var(--font-sans);
+            background-color: var(--bg-app);
+            color: var(--text-main);
+            height: 100vh;
+            display: flex;
+            flex-direction: column;
+            overflow: hidden; /* App-like feel */
+        }
+
+        /* --- Header --- */
+        header {
+            height: 56px;
+            background: var(--bg-panel);
+            border-bottom: 1px solid var(--border-color);
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 0 20px;
+            flex-shrink: 0;
+            z-index: 10;
+        }
+
+        .brand {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            font-weight: 700;
+            font-size: 18px;
+        }
+        
+        .brand-icon {
+            width: 24px;
+            height: 24px;
+            background: var(--primary);
+            color: white;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            transform: rotate(45deg);
+            font-size: 14px;
+        }
+
+        .header-actions {
+            display: flex;
+            gap: 12px;
+            font-size: 13px;
+            color: var(--text-muted);
+        }
+
+        .badge {
+            background: #e5e7eb;
+            padding: 4px 8px;
+            border-radius: 4px;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+            font-size: 10px;
+            margin-left: 8px;
+        }
+
+        .btn {
+            cursor: pointer;
+            padding: 6px 12px;
+            border-radius: 4px;
+            border: 1px solid transparent;
+            font-weight: 500;
+            transition: all 0.2s;
+        }
+        .btn-outline { border-color: var(--border-color); background: white; }
+        .btn-primary { background: var(--primary); color: white; }
+        .btn-sm { font-size: 12px; padding: 4px 8px; }
+
+        /* --- Main Layout --- */
+        .layout {
+            display: grid;
+            grid-template-columns: 280px 1fr 300px;
+            flex: 1;
+            overflow: hidden;
+        }
+
+        /* Scrollable areas */
+        .panel {
+            overflow-y: auto;
+            padding: 16px;
+            border-right: 1px solid var(--border-color);
+        }
+        .panel-right {
+            border-left: 1px solid var(--border-color);
+            border-right: none;
+        }
+        .main-content {
+            overflow-y: auto;
+            background: var(--bg-app);
+            position: relative;
+        }
+
+        /* --- Left Panel Styles --- */
+        h3.section-title {
+            font-size: 11px;
+            text-transform: uppercase;
+            color: var(--text-muted);
+            font-weight: 700;
+            margin-bottom: 12px;
+            letter-spacing: 0.05em;
+        }
+
+        .form-group { margin-bottom: 16px; }
+        label { display: block; font-size: 13px; font-weight: 600; margin-bottom: 4px; }
+        input[type="text"], select, textarea {
+            width: 100%;
+            padding: 8px;
+            border: 1px solid var(--border-color);
+            border-radius: 6px;
+            font-size: 13px;
+            background: white;
+        }
+        textarea { resize: vertical; min-height: 80px; }
+
+        .upload-zone {
+            border: 2px dashed var(--border-color);
+            border-radius: 8px;
+            padding: 24px;
+            text-align: center;
+            background: #fafafa;
+            margin-bottom: 16px;
+            cursor: pointer;
+        }
+        .upload-icon { font-size: 24px; margin-bottom: 8px; color: var(--primary); }
+        .upload-text { font-size: 13px; font-weight: 600; }
+        .upload-sub { font-size: 11px; color: var(--text-muted); margin-top: 4px; }
+
+        .action-card {
+            background: #ecfdf5; /* Light teal */
+            border: 1px solid #a7f3d0;
+            padding: 12px;
+            border-radius: 8px;
+            margin-bottom: 12px;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            cursor: pointer;
+        }
+        .action-card:hover { background: #d1fae5; }
+        .card-title { font-size: 13px; font-weight: 600; color: #065f46; }
+        .card-desc { font-size: 11px; color: #047857; opacity: 0.8; }
+
+        .chat-bubble {
+            background: #f3f4f6;
+            padding: 12px;
+            border-radius: 8px;
+            font-size: 12px;
+            line-height: 1.4;
+            color: #374151;
+            margin-bottom: 12px;
+            font-style: italic;
+        }
+
+        /* --- Center Content (Zoom Lab) --- */
+        .workspace-header {
+            margin-bottom: 24px;
+        }
+        .workspace-header h1 { font-size: 22px; margin-bottom: 4px; }
+        .version-tag { 
+            display: inline-block; 
+            background: #e0f2fe; 
+            color: #0369a1; 
+            font-size: 11px; 
+            padding: 2px 6px; 
+            border-radius: 4px; 
+            font-weight: 600;
+        }
+
+        .brief-box {
+            background: white;
+            border: 1px solid var(--border-color);
+            padding: 16px;
+            border-radius: 8px;
+            margin-bottom: 24px;
+        }
+        .brief-label { font-size: 12px; font-weight: 700; margin-bottom: 4px; }
+        .brief-text { font-size: 14px; color: #374151; line-height: 1.5; }
+
+        .tabs {
+            display: flex;
+            gap: 16px;
+            border-bottom: 1px solid var(--border-color);
+            margin-bottom: 20px;
+        }
+        .tab {
+            padding: 8px 0;
+            font-size: 13px;
+            color: var(--text-muted);
+            cursor: pointer;
+            border-bottom: 2px solid transparent;
+        }
+        .tab.active { color: var(--text-main); border-bottom-color: var(--primary); font-weight: 600; }
+
+        /* Zoom Lab Specifics */
+        .zoom-lab-container {
+            background: #f3f4f6;
+            border-radius: 12px;
+            padding: 20px;
+            border: 1px solid var(--border-color);
+        }
+        
+        .lab-intro {
+            display: flex;
+            gap: 24px;
+            margin-bottom: 24px;
+        }
+        
+        .crop-preview {
+            width: 160px;
+            height: 200px;
+            background: white;
+            border: 1px solid var(--border-color);
+            border-radius: 8px;
+            position: relative;
+            flex-shrink: 0;
+            overflow: hidden;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+        /* Simulated Treehouse Drawing */
+        .treehouse-svg {
+            width: 90%;
+            height: 90%;
+            stroke: #9ca3af;
+            stroke-width: 1.5;
+            fill: none;
+        }
+        /* The Teal Crop Rectangle */
+        .crop-rect {
+            position: absolute;
+            top: 30%;
+            left: 25%;
+            width: 50%;
+            height: 40%;
+            border: 2px solid #14b8a6; /* Teal-500 */
+            box-shadow: 0 0 0 9999px rgba(20, 184, 166, 0.15); /* Dimming outside */
+            pointer-events: none;
+        }
+
+        .lab-text h2 { font-size: 16px; margin-bottom: 8px; }
+        .lab-text p { font-size: 13px; color: var(--text-muted); line-height: 1.5; max-width: 500px; }
+
+        /* Comparison Grid */
+        .comparison-grid {
+            display: grid;
+            grid-template-columns: 120px 1fr 1fr;
+            gap: 16px;
+            margin-top: 20px;
+        }
+        
+        .grid-header { font-size: 12px; font-weight: 700; color: var(--text-muted); padding-top: 8px; }
+        .col-header { font-size: 13px; font-weight: 600; margin-bottom: 8px; }
+        .col-sub { font-size: 11px; color: var(--text-muted); margin-bottom: 16px; display: block;}
+
+        .zoom-row {
+            display: contents; /* Allows children to participate in parent grid */
+        }
+
+        .zoom-badge {
+            font-size: 11px;
+            font-weight: 700;
+            color: #0d9488;
+            background: #ccfbf1;
+            padding: 4px 8px;
+            border-radius: 4px;
+            align-self: start;
+            margin-top: 4px;
+            width: fit-content;
+        }
+
+        .cell-preview {
+            background: white;
+            border: 1px solid var(--border-color);
+            border-radius: 6px;
+            height: 180px; /* Fixed height for consistency */
+            position: relative;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            overflow: hidden;
+        }
+        
+        /* SVG inside cells to simulate the drawing style */
+        .cell-svg {
+            width: 100%;
+            height: 100%;
+        }
+
+        .footer-note {
+            grid-column: 1 / -1;
+            margin-top: 16px;
+            font-size: 11px;
+            color: #9ca3af;
+            text-align: center;
+            border-top: 1px solid #e5e7eb;
+            padding-top: 12px;
+        }
+
+        /* --- Right Panel Styles --- */
+        .stat-grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr 1fr;
+            gap: 8px;
+            margin-bottom: 20px;
+            text-align: center;
+        }
+        .stat-val { font-size: 20px; font-weight: 800; color: var(--text-main); }
+        .stat-label { font-size: 10px; color: var(--text-muted); text-transform: uppercase; }
+
+        .control-group { margin-bottom: 16px; }
+        .slider-container { display: flex; align-items: center; gap: 10px; margin-top: 4px; }
+        input[type=range] { flex: 1; accent-color: var(--primary); }
+        .range-val { font-size: 12px; font-weight: 600; color: var(--primary); min-width: 40px; text-align: right; }
+
+        .warning-box {
+            background: #fffbeb;
+            border: 1px solid #fcd34d;
+            padding: 12px;
+            border-radius: 6px;
+            font-size: 12px;
+            color: #92400e;
+            margin-bottom: 16px;
+            line-height: 1.4;
+        }
+        .warning-title { font-weight: 700; margin-bottom: 4px; display: block; }
+
+        .check-list li {
+            font-size: 12px;
+            color: #4b5563;
+            margin-bottom: 6px;
+            list-style-type: none;
+            display: flex;
+            gap: 6px;
+        }
+        .check-list li::before { content: "✓"; color: var(--primary); font-weight: bold; }
+
+        /* Utility for SVG strokes */
+        .stroke-curve { vector-effect: non-scaling-stroke; } /* Keeps stroke consistent on zoom if scaled via CSS, but here we draw paths */
+        .stroke-pixel { shape-rendering: crispEdges; }
+
+    </style>
+</head>
+<body>
+
+<header>
+    <div class="brand">
+        <div class="brand-icon">◆</div>
+        Color Duel
+        <span style="font-weight:400; font-size: 14px; color:#666; margin-left:4px;">ART STUDIO</span>
+        <span class="badge">Local MVP</span>
+    </div>
+    <div class="header-actions">
+        <span>🌐 Local compiler + AI connected</span>
+        <button class="btn btn-outline">How it works</button>
+    </div>
+</header>
+
+<div class="layout">
+
+    <!-- LEFT PANEL -->
+    <aside class="panel">
+        <h3 class="section-title">01 / Art Direction</h3>
+        
+        <div class="form-group">
+            <label>Workspace</label>
+            <select><option>Treehouse SVG Master (curves)</option></select>
+        </div>
+
+        <div class="form-group">
+            <label>Artwork title</label>
+            <input type="text" value="Treehouse SVG Master (curves pr...">
+        </div>
+
+        <div class="upload-zone">
+            <div class="upload-icon">⬆</div>
+            <div class="upload-text">Start with an image</div>
+            <div class="upload-sub">PNG, JPEG or WebP • up to 12 MB</div>
+        </div>
+
+        <div style="display:flex; gap:8px; margin-bottom:16px;">
+            <button class="btn btn-outline" style="flex:1;">📎 Add reference</button>
+            <button class="btn btn-outline" style="flex:1;">⬆ Upload master</button>
+        </div>
+
+        <div class="action-card">
+            <span style="font-size:20px;">🌲</span>
+            <div>
+                <div class="card-title">Try the bundled treehouse</div>
+                <div class="card-desc">No AI key needed</div>
+            </div>
+        </div>
+
+        <h3 class="section-title" style="margin-top:24px;">SVG master (curves preserved)</h3>
+        <div class="action-card" style="background:white; border-color:var(--border-color);">
+             <span style="color:var(--primary)">✏️</span>
+            <div>
+                <div class="card-title" style="color:var(--text-main)">Load curved SVG example</div>
+                <div class="card-desc" style="color:var(--text-muted)">Curves, holes, gradients • no AI key</div>
+            </div>
+        </div>
+        <button class="btn btn-outline" style="width:100%; margin-bottom:16px;">⬇ Import SVG master...</button>
+        
+        <p style="font-size:11px; color:var(--text-muted); margin-bottom:16px; line-height:1.4;">
+            Imported SVG masters keep curves, holes, gradients, transforms and drawing order — nothing is rasterized or retraced.
+        </p>
+
+        <h3 class="section-title">AI SVG generation (paid)</h3>
+        <textarea placeholder="Describe a clean vector-style illustration to author as SVG..."></textarea>
+        
+        <div class="form-group">
+            <select><option>trait 576x768</option></select>
+        </div>
+        <button class="btn btn-primary" style="width:100%;">✨ Generate SVG master</button>
+
+        <h3 class="section-title" style="margin-top:24px;">Art direction chat <span style="float:right; font-weight:400; color:var(--text-muted);">glm-4.6</span></h3>
+        <div class="chat-bubble">
+            "A lantern-lit treehouse beside a waterfall. Keep the detailed scene, but use larger colorable shapes."
+        </div>
+        <textarea placeholder="Describe an idea or refine the current brief..." style="height:60px;"></textarea>
+        <button class="btn btn-primary" style="width:100%; margin-top:8px;">↑</button>
+    </aside>
+
+
+    <!-- CENTER CONTENT (ZOOM LAB) -->
+    <main class="main-content">
+        <div style="padding: 24px;">
+            
+            <h3 class="section-title">Artwork Workspace</h3>
+            <div class="workspace-header">
+                <h1>Treehouse SVG Master (curves preserved)</h1>
+                <span class="version-tag">v0.2.0 · build</span>
+            </div>
+
+            <div class="brief-box">
+                <div class="brief-label">Approved image brief</div>
+                <div class="brief-text">Hand-authored SVG master: curves, holes, gradients, transforms, shading and hidden shapes for the curve-preserving import demo.</div>
+                <div style="display:flex; justify-content:flex-end; gap:8px; margin-top:12px;">
+                    <button class="btn btn-outline btn-sm">Save brief</button>
+                    <button class="btn btn-outline btn-sm">Generate from brief ▾</button>
+                    <button class="btn btn-primary btn-sm">✨ Generate master</button>
+                </div>
+            </div>
+
+            <div class="tabs">
+                <div class="tab">Master</div>
+                <div class="tab">Vector</div>
+                <div class="tab">Numbered</div>
+                <div class="tab">Play test</div>
+                <div class="tab">Edit regions</div>
+                <div class="tab active">Zoom lab</div>
+                
+                <div style="margin-left:auto; display:flex; gap:12px; font-size:12px; color:var(--text-muted);">
+                    <span>🔍 100%</span>
+                    <span>⊞ Fit</span>
+                </div>
+            </div>
+
+            <!-- ZOOM LAB SECTION -->
+            <div class="zoom-lab-container">
+                <div class="lab-intro">
+                    <!-- Overview with Crop Picker -->
+                    <div class="crop-preview">
+                        <!-- Simple Treehouse Sketch SVG -->
+                        <svg class="treehouse-svg" viewBox="0 0 100 120">
+                            <!-- Clouds -->
+                            <path d="M10,20 Q20,10 30,20 T50,20" />
+                            <path d="M60,15 Q70,5 80,15 T95,15" />
+                            <!-- Leaves -->
+                            <circle cx="30" cy="40" r="15" />
+                            <circle cx="65" cy="35" r="18" />
+                            <circle cx="45" cy="55" r="20" />
+                            <!-- House Body -->
+                            <rect x="38" y="55" width="24" height="30" rx="2" />
+                            <!-- Roof -->
+                            <path d="M34,58 L50,42 L66,58" />
+                            <!-- Window -->
+                            <rect x="44" y="62" width="6" height="8" />
+                            <!-- Ladder -->
+                            <line x1="62" y1="85" x2="68" y2="115" />
+                            <line x1="64" y1="90" x2="69" y2="90" />
+                            <line x1="65" y1="98" x2="70" y2="98" />
+                            <!-- Trunk -->
+                            <path d="M46,85 L44,115 M54,85 L56,115" />
+                        </svg>
+                        <!-- Teal Crop Rect -->
+                        <div class="crop-rect"></div>
+                    </div>
+
+                    <div class="lab-text">
+                        <h2>Zoom lab — one crop, two geometries</h2>
+                        <p>Drag the crop box on the overview. Every row below shows the same crop at a higher zoom. Left column reconstructed from the authoritative curved masters; right column the same regions as pre-upgrade pixel-edge polygons.</p>
+                    </div>
+                </div>
+
+                <!-- Grid -->
+                <div class="comparison-grid">
+                    
+                    <!-- Headers -->
+                    <div></div> <!-- Empty corner -->
+                    <div>
+                        <div class="col-header">Curved masters (authoritative)</div>
+                    </div>
+                    <div>
+                        <div class="col-header">Legacy pixel-edge polygons</div>
+                        <span class="col-sub">Pre-upgrade tracer output – staircase edges at zoom</span>
+                    </div>
+
+                    <!-- Row 1: 100% -->
+                    <div class="zoom-row">
+                        <div class="zoom-badge">100% zoom</div>
+                        
+                        <!-- Curved Cell 100% -->
+                        <div class="cell-preview">
+                            <svg viewBox="0 0 100 100" class="cell-svg">
+                                <!-- Smooth outlines simulating region 9 and neighbors -->
+                                <rect x="10" y="10" width="15" height="20" fill="#fff" stroke="#333" stroke-width="1"/>
+                                <rect x="35" y="15" width="10" height="25" rx="2" fill="#fff" stroke="#333" stroke-width="1"/> <!-- Slight curve hint -->
+                                <rect x="55" y="20" width="12" height="30" fill="#fff" stroke="#333" stroke-width="1"/>
+                                <rect x="78" y="25" width="10" height="35" fill="#fff" stroke="#333" stroke-width="1"/>
+                                <text x="88" y="48" font-size="8" fill="#333">9</text>
+                            </svg>
+                        </div>
+
+                        <!-- Legacy Cell 100% -->
+                        <div class="cell-preview">
+                             <svg viewBox="0 0 100 100" class="cell-svg" shape-rendering="crispEdges">
+                                <rect x="10" y="10" width="15" height="20" fill="#fff" stroke="#333" stroke-width="1"/>
+                                <rect x="35" y="15" width="10" height="25" fill="#fff" stroke="#333" stroke-width="1"/>
+                                <rect x="55" y="20" width="12" height="30" fill="#fff" stroke="#333" stroke-width="1"/>
+                                <rect x="78" y="25" width="10" height="35" fill="#fff" stroke="#333" stroke-width="1"/>
+                                <text x="88" y="48" font-size="8" fill="#333">9</text>
+                            </svg>
+                        </div>
+                    </div>
+
+                    <!-- Row 2: 400% -->
+                    <div class="zoom-row">
+                        <div class="zoom-badge">400% zoom</div>
+                        
+                        <!-- Curved Cell 400% (Smooth) -->
+                        <div class="cell-preview">
+                            <svg viewBox="0 0 100 100" class="cell-svg">
+                                <!-- Region 9 with smooth corners -->
+                                <path d="M20,10 L75,10 Q80,10 80,15 L80,85 Q80,90 75,90 L25,90 Q20,90 20,85 Z" fill="#fff" stroke="#000" stroke-width="1.5" />
+                                <text x="45" y="55" font-size="20" font-family="sans-serif" fill="#000" text-anchor="middle">9</text>
+                            </svg>
+                        </div>
+
+                        <!-- Legacy Cell 400% (Jagged) -->
+                        <div class="cell-preview">
+                            <svg viewBox="0 0 100 100" class="cell-svg" shape-rendering="crispEdges">
+                                <!-- Staircase approximation of the rect above -->
+                                <path d="M20,10 L76,10 L76,12 L79,12 L79,15 L80,15 L80,86 L79,86 L79,89 L76,89 L76,90 L24,90 L24,89 L21,89 L21,86 L20,86 Z" fill="#fff" stroke="#000" stroke-width="1.5" />
+                                <text x="45" y="55" font-size="20" font-family="sans-serif" fill="#000" text-anchor="middle">9</text>
+                            </svg>
+                        </div>
+                    </div>
+
+                    <!-- Row 3: 1000% -->
+                    <div class="zoom-row">
+                        <div class="zoom-badge">1000% zoom</div>
+                        
+                         <!-- Curved Cell 1000% (Very Smooth Line) -->
+                        <div class="cell-preview">
+                            <svg viewBox="0 0 100 100" class="cell-svg">
+                                <!-- Just a thick smooth vertical line representing edge -->
+                                <line x1="50" y1="5" x2="50" y2="95" stroke="#000" stroke-width="2" />
+                                <line x1="70" y1="5" x2="70" y2="95" stroke="#000" stroke-width="2" />
+                            </svg>
+                        </div>
+
+                        <!-- Legacy Cell 1000% (Very Jagged) -->
+                        <div class="cell-preview">
+                            <svg viewBox="0 0 100 100" class="cell-svg" shape-rendering="crispEdges">
+                                <!-- Pixel staircase line -->
+                                <path d="M50,5 L52,5 L52,8 L54,8 L54,12 L56,12 L56,15 L58,15 ... L70,95" stroke="#000" stroke-width="2" fill="none" />
+                                <!-- Simplified jagged path for visual effect -->
+                                <polyline points="50,5 53,5 53,9 57,9 57,14 61,14 61,19 65,19 65,24 69,24 69,29 70,29 70,95" fill="none" stroke="#000" stroke-width="2" />
+                                <polyline points="70,5 67,5 67,10 63,10 63,15 59,15 59,20 55,20 55,25 51,25 51,30 50,30 50,95" fill="none" stroke="#000" stroke-width="2" />
+                            </svg>
+                        </div>
+                    </div>
+
+                    <!-- Footer Note -->
+                    <div class="footer-note">
+                        Same crop, same regions, same numbers. No blur, no rasterized images, no strokejoin tricks — reconstructed vector geometry only.
+                    </div>
+
+                </div>
+            </div>
+            
+            <div style="margin-top: 20px; font-size: 12px; color: var(--text-muted);">Ready</div>
+            <div style="height: 4px; background: var(--primary); width: 100%; margin-top: 8px;"></div>
+
+        </div>
+    </main>
+
+
+    <!-- RIGHT PANEL -->
+    <aside class="panel panel-right">
+        <h3 class="section-title">01 / Region Compiler</h3>
+        <h2 style="font-size:18px; margin-bottom:8px;">Detail, without busywork.</h2>
+        <p style="font-size:12px; color:var(--text-muted); margin-bottom:20px;">Visual shading and player tap regions are two different layers.</p>
+
+        <div class="control-group">
+            <div style="display:flex; justify-content:space-between; margin-bottom:4px;">
+                <label style="margin:0; font-size:12px;">Target regions</label>
+                <span style="color:var(--primary); font-weight:700;">650</span>
+            </div>
+            <input type="range" value="65">
+            <div style="font-size:10px; color:var(--text-muted);">An approximate target, not a guaranteed count.</div>
+        </div>
+
+        <div class="control-group" style="display:grid; grid-template-columns:1fr 1fr; gap:8px;">
+            <div>
+                <label style="font-size:11px;">Palette groups</label>
+                <input type="text" value="32" style="padding:4px;">
+            </div>
+            <div>
+                <label style="font-size:11px;">Paint tones</label>
+                <input type="text" value="80" style="padding:4px;">
+            </div>
+        </div>
+
+        <div class="control-group">
+            <label style="font-size:12px;">Vector sampling resolution</label>
+            <select style="font-size:12px;"><option>1024 px • balanced</option></select>
+        </div>
+
+        <div class="control-group">
+            <label style="font-size:12px;">Geometry backend</label>
+            <select style="font-size:12px;"><option>Curved masters (spline fit)</option></select>
+        </div>
+
+        <div class="control-group">
+            <div style="display:flex; justify-content:space-between; margin-bottom:4px;">
+                <label style="margin:0; font-size:12px;">Curve fit tolerance</label>
+                <span style="color:var(--primary); font-weight:700;">±1.0 px</span>
+            </div>
+            <input type="range" value="80">
+            <div style="font-size:10px; color:var(--text-muted);">How far the spline fit may deviate from traced pixel edges.</div>
+        </div>
+
+        <details style="margin-bottom:20px; font-size:12px; color:var(--text-muted); cursor:pointer;">
+            <summary>▸ Advanced settings</summary>
+        </details>
+
+        <button class="btn btn-primary" style="width:100%; margin-bottom:24px;">Build vector draft →</button>
+
+        <h3 class="section-title">02 / Review & Export</h3>
+        <div class="stat-grid">
+            <div>
+                <div class="stat-val">40</div>
+                <div class="stat-label">tap regions</div>
+            </div>
+            <div>
+                <div class="stat-val">22</div>
+                <div class="stat-label">color groups</div>
+            </div>
+            <div>
+                <div class="stat-val">49</div>
+                <div class="stat-label">paint paths</div>
+            </div>
+        </div>
+
+        <div class="warning-box">
+            <span class="warning-title">✓ Geometry checks passed</span>
+            <strong>Geometry (schema 2)</strong><br>
+            156 / 339 curved commands (46%)<br>
+            hit-test: 210 probes • 0 conflicts<br>
+            flattened rings derived at ±0.25 px partition band 46763.24 px²
+        </div>
+
+        <div class="warning-box" style="background:#fef3c7; border-color:#fcd34d; color:#92400e;">
+            <span class="warning-title">⚠ Visual review (separate from geometry tests)</span>
+            Required — geometry tests cannot detect:
+            <ul style="margin-left:16px; margin-top:4px; font-size:11px;">
+                <li>Water tightness & containment</li>
+                <li>Documented flatten alignment</li>
+                <li>Intended object edges (semantic quality)</li>
+            </ul>
+        </div>
+
+        <ul class="check-list" style="margin-bottom:20px;">
+            <li>SVG-master regions overlap by 46994.6 1px²</li>
+            <li>Hit-test alignment: 210/210 interior probes lie within higher z-order regions</li>
+            <li>Automatic regions are drafts, not guaranteed to follow semantic object</li>
+        </ul>
+
+        <div class="control-group">
+            <label style="font-size:12px;">Revision History</label>
+            <select style="font-size:12px;"><option>v0.2.0 · build · 40 regions</option></select>
+        </div>
+        <a href="#" style="font-size:12px; color:var(--primary); text-decoration:none; display:block; margin-bottom:16px;">Restore selected revision</a>
+
+        <button class="btn btn-outline" style="width:100%; margin-bottom:8px; background:#d1fae5; border-color:#10b981; color:#065f46;">✓ Mark visually reviewed</button>
+        <button class="btn btn-primary" style="width:100%;">💾 Export game bundle .zip ⬇</button>
+
+        <h3 class="section-title" style="margin-top:24px;">Include source & authoring files</h3>
+        <div style="font-size:12px; color:var(--primary); margin-bottom:8px; display:flex; align-items:center; gap:4px;">
+            🖼 Render 2048px PNG from vector
+        </div>
+        <p style="font-size:11px; color:var(--text-muted); line-height:1.4;">
+            Export contains SVG + region, paint and palette JSON. Automatic output is a reviewable draft — not a guaranteed publish-ready asset.
+        </p>
+
+    </aside>
+
+</div>
+
+<footer style="background:white; border-top:1px solid var(--border-color); padding:12px; text-align:center; font-size:11px; color:var(--text-muted);">
+    Color Duel Art Studio - local authoring MVP - automatic output is a reviewable draft — not a guaranteed publish-ready asset
+</footer>
+
+</body>
+</html>
+```

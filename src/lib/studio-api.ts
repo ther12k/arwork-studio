@@ -12,12 +12,37 @@ export interface AiConfig {
   imageModel: string;
 }
 
+export interface BackendInfo {
+  id: string;
+  name: string;
+  kind: string;
+  paid: boolean;
+  available: boolean;
+  notes: string;
+}
+
 export interface StudioConfig {
   ai: AiConfig;
   localOnly: boolean;
   version: string;
   supportedFormat: string;
+  geometrySchema?: number;
   maxUploadMB: number;
+  backends?: BackendInfo[];
+}
+
+export interface SvgMasterSummary {
+  viewBox: number[];
+  shapes: number;
+  inkShapes: number;
+  gradients: number;
+  curvedShapes: number;
+  commands: number;
+  curvedCommands: number;
+  hiddenShapes: number;
+  removed: string[];
+  warnings: string[];
+  rasterized: boolean;
 }
 
 export interface ImageAsset {
@@ -28,6 +53,8 @@ export interface ImageAsset {
   source: string;
   rightsConfirmed: boolean;
   createdAt: string;
+  kind?: "image" | "svg";
+  summary?: SvgMasterSummary;
 }
 
 export interface QaReport {
@@ -43,6 +70,28 @@ export interface QaReport {
   precoloredAreaPercent?: number;
   humanReviewed: boolean;
   checkScope?: string;
+  missingArea?: number;
+  overlapArea?: number;
+  roundtripEmptyPixels?: number | null;
+  geometry?: {
+    schema: number;
+    masterAuthority: string;
+    flattenedDerivation: string;
+    backend: string;
+    curveFitTolerance: number | null;
+    curvedCommands: number;
+    totalCommands: number;
+    curvedCommandRatio: number;
+    hitTestProbes: number;
+    hitTestConflicts: number;
+    hitTestZOverlaps?: number;
+    partitionToleranceAllowance: number;
+  };
+  visualReview?: {
+    required: boolean;
+    separateFromGeometryTests: boolean;
+    limitations: string[];
+  };
   [key: string]: unknown;
 }
 
@@ -99,9 +148,43 @@ export interface BuildSettings {
   min_region_pixels: number;
   min_label_radius: number;
   ink_threshold: number;
+  backend?: "spline-local" | "polygon-legacy";
+  curve_tolerance?: number;
+  corner_angle_deg?: number;
 }
 
-export type EditAction = "merge" | "group" | "palette" | "label" | "decorate";
+export type EditAction = "merge" | "group" | "palette" | "label" | "decorate" | "split";
+
+export type GeometryMode = "curved" | "legacy";
+
+export interface RegionLabel {
+  x: number;
+  y: number;
+  fontSize: number;
+  minScreenPx: number;
+  clearance: number;
+}
+
+export interface ModeRegion {
+  id: string;
+  paletteId: number;
+  fillRule: "evenodd";
+  d: string;
+  label: RegionLabel;
+  bbox: number[];
+}
+
+export interface GeometryModePayload {
+  mode: GeometryMode;
+  viewBox: number[];
+  stroke?: string;
+  strokeWidth?: number;
+  regions: ModeRegion[];
+  backend?: string;
+  flattenTolerance?: number;
+  curveFitTolerance?: number | null;
+  [key: string]: unknown;
+}
 
 export interface EditPayload {
   base_revision: string;
@@ -126,8 +209,12 @@ export function studioUrl(path: string, extraQuery?: Record<string, string | num
   return qs ? `${url}&${qs}` : url;
 }
 
-async function api<T>(path: string, options: RequestInit = {}): Promise<T> {
-  const res = await fetch(studioUrl(path), {
+async function api<T>(
+  path: string,
+  options: RequestInit = {},
+  query?: Record<string, string | number | boolean | undefined>
+): Promise<T> {
+  const res = await fetch(studioUrl(path, query), {
     ...options,
     headers: {
       "X-Studio-Request": "1",
@@ -188,6 +275,24 @@ export const promoteReference = (pid: string, rightsConfirmed: boolean): Promise
 
 export const loadSample = (pid: string): Promise<Project> => post<Project>(`/projects/${pid}/sample`, {});
 
+export const loadSvgSample = (pid: string): Promise<Project> =>
+  post<Project>(`/projects/${pid}/sample-svg`, {});
+
+export const uploadSvgMaster = (pid: string, file: File, rightsConfirmed: boolean): Promise<Project> => {
+  const form = new FormData();
+  form.append("file", file);
+  form.append("rights_confirmed", String(rightsConfirmed));
+  return api<Project>(`/projects/${pid}/upload-svg`, { method: "POST", body: form });
+};
+
+export const generateSvgMaster = (
+  pid: string,
+  body: { prompt: string; aspect: "1024x1536" | "1536x1024" | "1024x1024"; include_reference: boolean; confirm_paid: boolean }
+): Promise<{ jobId: string; projectId: string }> => post(`/projects/${pid}/generate-svg`, body);
+
+export const fetchGeometryMode = (pid: string, rev: string, mode: GeometryMode): Promise<GeometryModePayload> =>
+  api<GeometryModePayload>(`/projects/${pid}/revisions/${rev}/geometry`, {}, { mode });
+
 export const sendChat = (
   pid: string,
   body: { message: string; include_reference: boolean; confirm_paid: boolean }
@@ -220,6 +325,9 @@ export const submitReview = (pid: string, revision: string, note: string): Promi
 
 export const imageUrl = (pid: string, role: "master" | "reference", sha256: string): string =>
   studioUrl(`/projects/${pid}/image/${role}`, { v: sha256 });
+
+export const masterSvgUrl = (pid: string, sha256: string): string =>
+  studioUrl(`/projects/${pid}/master/svg`, { v: sha256 });
 
 export const revisionFileUrl = (pid: string, rev: string, name: string): string =>
   studioUrl(`/projects/${pid}/revisions/${rev}/files/${name}`);

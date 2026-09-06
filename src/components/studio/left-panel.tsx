@@ -47,16 +47,26 @@ export function LeftPanel() {
     setPaidConsent,
     rightsConfirmed,
     setRightsConfirmed,
+    svgPrompt,
+    setSvgPrompt,
+    svgAspect,
+    setSvgAspect,
+    svgPaidConsent,
+    setSvgPaidConsent,
     messagesRef,
     createNewProject,
     openProjectById,
     uploadFile,
     promoteReference,
     loadSampleProject,
+    loadSvgSampleProject,
+    uploadSvgFile,
+    generateSvg,
     sendChat,
   } = studio;
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const uploadRole = useRef<"reference" | "master">("reference");
+  const svgFileInputRef = useRef<HTMLInputElement | null>(null);
   const [referenceError, setReferenceError] = useState<string | null>(null);
 
   const aiConfigured = config?.ai.configured ?? false;
@@ -77,6 +87,21 @@ export function LeftPanel() {
     e.target.value = "";
     if (!file) return;
     await withToast(() => uploadFile(file, uploadRole.current));
+  };
+
+  const pickSvgFile = () => {
+    if (!rightsConfirmed) {
+      toast("Confirm ownership or permission before importing a master.");
+      return;
+    }
+    svgFileInputRef.current?.click();
+  };
+
+  const onSvgFileChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    e.target.value = "";
+    if (!file) return;
+    await withToast(() => uploadSvgFile(file));
   };
 
 
@@ -210,6 +235,111 @@ export function LeftPanel() {
           <span className="mt-0.5 block text-[9px] font-normal text-[#778481]">No AI key needed</span>
         </span>
       </Button>
+
+      {/* SVG master card — curve-preserving import route */}
+      <div className="mt-2.5 rounded-xl border border-[#d4e6d8] bg-white p-3">
+        <strong className="block text-xs font-semibold text-[#183837]">SVG master (curves preserved)</strong>
+        <Button
+          variant="outline"
+          className="mt-2 h-auto w-full justify-start whitespace-normal rounded-lg border-[#d4e6d8] bg-[#edf6f0] px-2.5 py-2 text-left text-[11px] font-semibold hover:border-[#65a89b] hover:bg-[#e2f0e8]"
+          disabled={busy}
+          onClick={() => void withToast(() => loadSvgSampleProject())}
+        >
+          <Wand2 className="size-3.5 shrink-0 text-[#087f74]" aria-hidden />
+          <span className="leading-tight">
+            Load curved SVG example
+            <span className="mt-0.5 block text-[9px] font-normal text-[#778481]">
+              Curves, holes, gradients · no AI key
+            </span>
+          </span>
+        </Button>
+        <Button
+          variant="outline"
+          size="sm"
+          className="mt-1.5 h-8 w-full rounded-lg border-[#e1e5df] bg-white px-2 text-[10px] hover:border-[#65a89b] hover:bg-[#f0f7f3]"
+          disabled={busy}
+          onClick={pickSvgFile}
+        >
+          <Upload className="size-3.5" aria-hidden />
+          Import SVG master…
+        </Button>
+        <input
+          ref={svgFileInputRef}
+          type="file"
+          accept=".svg,image/svg+xml"
+          className="hidden"
+          onChange={(e) => void onSvgFileChange(e)}
+          aria-hidden
+          tabIndex={-1}
+        />
+        <MicroCaption className="mt-1.5">
+          Imported SVG masters keep curves, holes, gradients, transforms and drawing order — nothing is rasterized
+          or retraced. Uses the rights confirmation above.
+        </MicroCaption>
+
+        {/* AI SVG generation (paid) */}
+        <div className="mt-3 border-t border-[#eef1eb] pt-2.5">
+          <div className="flex items-center justify-between">
+            <span className="text-[10px] font-semibold text-[#657671]">AI SVG generation (paid)</span>
+            <span className="text-[9px] text-[#778481]" title={aiConfigured ? config?.ai.imageModel : undefined}>
+              {aiConfigured ? config?.ai.imageModel : "API key required"}
+            </span>
+          </div>
+          <Textarea
+            value={svgPrompt}
+            onChange={(e) => setSvgPrompt(e.target.value)}
+            placeholder="Describe a clean vector-style illustration to author as SVG…"
+            maxLength={3000}
+            rows={2}
+            className="mt-1.5 resize-none rounded-lg bg-white text-[11px]"
+            aria-label="SVG generation prompt"
+          />
+          <div className="mt-1.5 flex items-center gap-1.5">
+            <Select
+              value={svgAspect}
+              onValueChange={(v) => setSvgAspect(v as typeof svgAspect)}
+              disabled={busy}
+            >
+              <SelectTrigger
+                className="h-8 flex-1 rounded-md border-[#e1e5df] bg-white text-[10px]"
+                aria-label="SVG master aspect ratio"
+              >
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="1024x1536">Portrait 576×768</SelectItem>
+                <SelectItem value="1536x1024">Landscape 768×576</SelectItem>
+                <SelectItem value="1024x1024">Square 640×640</SelectItem>
+              </SelectContent>
+            </Select>
+          </div>
+          <label className="mt-1.5 flex items-start gap-1.5 text-[10px] font-normal text-[#657671]">
+            <Checkbox
+              checked={svgPaidConsent}
+              onCheckedChange={(v) => setSvgPaidConsent(v === true)}
+              className="mt-0.5 size-3.5"
+              aria-label="Allow this paid AI request, including provider charges"
+            />
+            Allow this paid request.
+          </label>
+          <Button
+            size="sm"
+            className="mt-1.5 h-9 w-full rounded-lg bg-[#087f74] text-[10px] font-semibold text-white hover:bg-[#056c62]"
+            disabled={!aiConfigured || busy}
+            title={aiConfigured ? "Generate an SVG master with AI (paid)" : "API key required"}
+            onClick={() => void withToast(() => generateSvg())}
+          >
+            <Sparkles className="size-3.5" aria-hidden />
+            Generate SVG master
+          </Button>
+          {!aiConfigured && (
+            <MicroCaption className="mt-1.5 flex items-center gap-1 text-[#a77627]">
+              <Sparkles className="size-3" aria-hidden />
+              AI SVG generation needs an API key. Import a hand-made SVG instead.
+            </MicroCaption>
+          )}
+        </div>
+      </div>
 
       {/* Chat */}
       <div className="mt-6 mb-3 flex items-center justify-between">

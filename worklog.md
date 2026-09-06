@@ -186,3 +186,160 @@ Stage Summary:
 - Known gaps: AI chat/generate disabled until Task 3 flips config.ai.configured; merge/place-number
   etc. depend on backend validation (errors surfaced as toasts); board test progress is in-memory
   only (never written to player progress).
+
+---
+Task ID: 2-a
+Agent: asset-author (subagent)
+Task: Author examples/treehouse-master.svg curved SVG demo master
+
+Work Log:
+- Read worklog + inspected `mini-services/color-duel-studio/` layout; confirmed render
+  tooling (cairosvg + Pillow) available in /home/z/.venv.
+- Hand-planned a 576x768 portrait scene with layered z-order: gradient sky / radial sun
+  halo / 2 cubic clouds / 2 rolling hill layers / curved trunk with quadratic root flares /
+  4+1 layered canopy blobs / straight-edge treehouse (platform, walls, triangular roof,
+  evenodd window with cut-out hole + glass, attic porthole, door, flag) / catenary rope
+  bridge to a post / straight ladder with ink rungs / 3 identical transform-translated
+  flowers / same-document `use` leaf / translate+rotate songbird group in local coords.
+- Authored `/home/z/my-project/mini-services/color-duel-studio/examples/treehouse-master.svg`
+  using ONLY the sanitizer-supported element set (svg/g/defs/linearGradient/radialGradient/
+  stop/path/rect/circle/ellipse/polygon/polyline/line/use) and presentation attributes
+  (fill, fill-opacity, fill-rule, stroke, stroke-width, transform, id, data-*).
+- Verification: ET.parse well-formed OK; grep confirmed 124 `C` + 12 `Q` commands,
+  2 gradients referenced via url(#), 2 evenodd holes, 5 transforms, 4 shading shapes,
+  exact viewBox, 0 forbidden elements (style/image/text/script/filter/mask/clip/pattern/
+  DOCTYPE); 24 flat fill colors + 5 gradient stop colors = 29 distinct.
+- Rendered via cairosvg to PNG and ran 40+ PIL pixel probes (sun, clouds, hills, trunk,
+  knot ring + hole, canopy layers, ropes, planks, post, platform, walls, roof + shading
+  blend, window/attic glass, door, flag, rails, rungs, tufts, flowers, leaf, bird body/
+  wing/beak). Occlusion test: all 361 pixels of the hidden rock ellipse are exactly trunk
+  color, and rock-gray appears nowhere in the render -> FULLY HIDDEN.
+- First VLM review (z-ai vision) flagged: ladder floating left of trunk, bridge ending in
+  mid-air (thin post), grass tufts reading as scribbles, canopy gap above platform. Fixed:
+  ladder moved to x 184–224 with rails hooking over the platform edge and leaning on the
+  trunk base; post widened to 16px and extended 27px into the grass; tufts restyled as 5
+  short blades; canopy back blob bottom deepened to y~355 so the house reads nestled in
+  the tree; bird nudged to clear the sun halo. Re-rendered, re-probed (all OK), second VLM
+  review confirms ladder/bridge/grass/composition all clean.
+
+Stage Summary:
+- Produced: `mini-services/color-duel-studio/examples/treehouse-master.svg` (8088 bytes,
+  well-formed, ~53 drawn shapes) — ready as the test fixture for the parallel sanitized
+  SVG-master import route.
+- Checklist coverage: (1) many C + Q curves; (2) 2 evenodd holes (window frame with
+  cut-out + hollow trunk-knot donut); (3) linearGradient sky + radialGradient sun glow,
+  3 stops each, referenced via url(#); (4) bird g translate(498,212) rotate(-10) with 4
+  local-coord shapes (+3 flower translate groups + transform on use); (5) pure
+  straight-line architecture (walls/roof/door/platform/ladder rails/planks); (6) 4
+  data-cd-role="shading" shapes with fill-opacity 0.2–0.32 (the only semi-transparent
+  shapes); (7) many disconnected same-fill groups (4x #E8604C petals+flag, 3x #FFC94D
+  centers, 2x #F6E7C8 window frames, 2x #A8DDE8 glass, 2x #FFFDF7 clouds, 2x #79B258
+  canopy+leaf, 2x #B58A5A ropes, 2x #B3763F rails, 3x #8B5E3C trunk/roots/post); (8) one
+  role-less rock ellipse drawn early, geometrically proven 100% covered by the trunk;
+  (9) 3 stroke-only ink elements (#29383E, width 2–2.5: flagpole `<line>`, rungs path,
+  grass `<polyline>`); (10) background→midground→tree/house→details order, every gameplay
+  shape pixel-verified partially visible except the hidden rock.
+- Note: 24 flat fill colors (29 incl. gradient stops) and 54 shape elements (incl. the
+  defs leaf) — one notch above the 50-shape guide in exchange for covering every supported
+  element type (line, polyline, ellipse, polygon, use all exercised).
+
+---
+Task ID: 2-b
+Agent: frontend-ui (subagent, completed by main agent after context timeout)
+Task: Zoom lab comparison view, SVG master import card, backend settings, split button, validation fields
+
+Work Log:
+- Created `src/components/studio/zoom-lab.tsx` (354 lines): crop-picker overview SVG with
+  pointer-draggable + keyboard-nudgeable crop rect, 3x2 comparison grid (100%/400%/1000% x
+  curved/legacy) fed by fetchGeometryMode(pid, rev, mode), skeletons, error card.
+- `canvas-workspace.tsx`: added "zoomlab" to VIEW_ORDER + canvasTag, renders <ZoomLab/>
+  instead of the board for that view; master view renders masterSvgUrl(img) when
+  project.master.kind === 'svg' plus the sanitize-summary figcaption.
+- `left-panel.tsx`: new "SVG master (curves preserved)" card — load curved SVG example,
+  Import SVG master file input (rights-gated), AI SVG generation (paid consent gate,
+  prompt textarea, aspect select) wired to generateSvg().
+- `right-panel.tsx`: Geometry backend Select (spline-local / polygon-legacy), Curve fit
+  tolerance slider, Corner threshold slider (advanced), Split button in the edit actions,
+  QA geometry row set (curved commands, hit-test probes/conflicts, flatten tolerance,
+  partition band) and the amber "Visual review" limitations block separated from
+  geometry tests.
+- (main agent) fixed: view tab row now flex-wrap (mobile 390px overflow 438->390),
+  detailed-board ink paths accept open stroke line art (strokeWidth/filled fields).
+
+Stage Summary:
+- All four UI features live and browser-verified; lint 0 problems; mobile wraps cleanly.
+
+---
+Task ID: 5/6/7/8/9/10 (main agent)
+Agent: main (Z.ai Code)
+Task: Curve-preserving SVG workflow upgrade — geometry kernel, sanitized SVG-master import,
+pluggable backends, authoritative curved region masters, curve-preserving edits, smooth
+paint/ink/gameplay masks, shading separation, validation/versioning/labels/hit-testing,
+save compatibility, exports, API routes, E2E verification
+
+Work Log:
+- Inspected studio/pipeline.py: confirmed pixel-edge polygon output (path_of M/L/Z only,
+  rasterio shapes, rings authoritative) as the staircase source.
+- NEW studio/curves.py (~700 lines): robust SVG path parser (relative/S/T/A flags,
+  arc->cubic), formatter, adaptive flatten with explicit tolerance, even-odd point/area,
+  RDP, windowed corner detection (adaptive window, adjacent-merge), Schneider cubic
+  fitting with robust min-distance end tangents + control-hull degeneracy guard,
+  fit_polyline/fit_ring, exact chain reversal, affine transforms. Smoke-tested.
+- NEW studio/svg_master.py (~640 lines): sanitized SVG import — whitelisted elements only,
+  DTD/entity rejection, script/image/foreignObject stripping with report, curve/hole/
+  gradient/transform/drawing-order preservation, per-shape resolved userSpace gradients,
+  hidden-shape occlusion exclusion, never rasterizes. clean_svg upload entry.
+- REWROTE studio/pipeline.py: crack-edge shared-boundary chains (pair-constant walks with
+  forced breaks at component-degree!=2 vertices, rotated Euler cycles, whole-chain
+  segment assembly with two safety passes) -> each chain fitted ONCE and reused by both
+  neighbouring regions (reversed), so the curved partition is watertight by construction;
+  regions/paint/ink all curved (trace_paint via the same chain machinery); polygon-legacy
+  backend reproduces the pre-upgrade output exactly (fit=False pack); compile_svg_master
+  (shading/gameplay separation by role+opacity, disconnected tap-target splitting,
+  palette from master fills, gradients in paint.json, partitionTolerance from measured
+  overlap); pack_region dual-signature (commands or polygon w/ corner-preserving refit);
+  solid_polygons even-odd nesting (boundary-vertex depth parity); validate_bundle with
+  master re-parse + flatten consistency, partition checks with documented band, raster
+  roundtrip, hit-test probe alignment (z-order aware for stacked masters), curve stats,
+  separate visualReview limitations block; edit_bundle merge with measured
+  symmetric-difference partition allowance, split action, label/palette/group; load_bundle
+  migrates legacy v1 polygon bundles in memory; legacy_geometry zoom-lab payload;
+  BACKENDS registry. models.py: backend/curve_tolerance/corner_angle_deg + GenerateSvgRequest
+  + split action.
+- app.py: /upload-svg, /master/svg, /sample-svg, /generate-svg (paid, Provider.svg ->
+  bridge), geometry?mode=curved|legacy endpoint, config backends registry (v0.2.0,
+  geometrySchema 2), build dispatch by master kind, source-master.svg in FILES.
+  ai.py: SVG_DIRECTION + Provider.svg (parses <svg>…</svg>, size budget).
+  ai-bridge: new POST /v1/svg route (chat -> raw SVG extraction + one normalization
+  retry; toZaiMessages parameterized contract).
+- Frontend: studio-api.ts (backends, SvgMasterSummary, ModeRegion/GeometryModePayload,
+  uploadSvgMaster/loadSvgSample/generateSvgMaster/fetchGeometryMode/masterSvgUrl,
+  QaReport geometry/visualReview fields); detailed-board.ts (SAFE_PATH +C/Q,
+  gradient defs + url(#g-*) paint fills, open stroke ink paths, reversed topmost-wins
+  hitTest); use-studio.tsx (backend settings state, SVG master actions, zoomlab view).
+- Studio service runs detached via double-fork (plain background spawns are reaped
+  between tool commands in this sandbox).
+- Rebuilt demo: Cascade Treehouse raster curved build (552 regions, 551 curved, QA pass,
+  missing 0.0 / overlap 0.39px2 band / roundtrip 0 / 1754 probes 0 conflicts) + new
+  "Treehouse SVG Master (curves preserved)" project (40 regions from treehouse-master.svg).
+- E2E (agent-browser, gateway :81): page clean; SVG master preview (img 576px) + sanitize
+  summary; Zoom lab renders 3x2 grid, crop drag verified with art-unit mapping; play test
+  tap-to-fill on curved geometry (1/40 filled, 0 incorrect after swatch select; z-order
+  topmost resolution observed live); QA panel fields; export ZIP has all 8 required files
+  with schema-2 masters; mobile 390px no overflow (tab row wraps); sticky footer OK;
+  lint 0.
+- VLM visual review (separate from geometry tests): zoom-lab 400%/1000% screenshots —
+  curved column smooth vs legacy staircase confirmed, numbers readable, no glaring
+  defects; numbered view — numbers inside regions, smooth boundaries, no defects.
+- Existing suite: 31/31 pytest tests pass (incl. exact 0.0/0.0 partition + roundtrip
+  assertions on the fresh fixture).
+
+Stage Summary:
+- Curve-preserving workflow is live end-to-end: SVG-master import (never rasterized),
+  local spline tracing (default), legacy polygon backend (comparison), separate paid
+  AI SVG-generation route; curved masters authoritative with documented ±0.25px derived
+  rings; merge/split/label edits keep geometry curved with measured partition allowance;
+  versioning + contentHash unchanged; exports carry schema 2 + visualReview separation.
+- Known gaps: external image-to-SVG provider listed but unavailable without server-side
+  credentials (by design); curve fit tolerance 1.0px leaves a documented sub-px
+  partition band on 1px raster features.

@@ -81,8 +81,33 @@ export interface Geometry {
 }
 
 export interface PaintPath {
-  fill: string;
+  fill: string; // #RRGGBB or url(#gradient-id)
   d: string;
+  strokeWidth?: number; // present on stroked ink paths (open line art)
+  filled?: boolean; // false = stroke-rendered ink, not a closed fill
+}
+
+export interface PaintGradientStop {
+  offset: number;
+  color: string;
+  opacity?: number;
+}
+
+export interface PaintGradient {
+  id: string;
+  type: "linear" | "radial";
+  stops: PaintGradientStop[];
+  // linear params
+  x1?: number;
+  y1?: number;
+  x2?: number;
+  y2?: number;
+  // radial params
+  cx?: number;
+  cy?: number;
+  r?: number;
+  fx?: number;
+  fy?: number;
 }
 
 export interface PaintLayer {
@@ -91,6 +116,7 @@ export interface PaintLayer {
   viewBox?: number[];
   paths: PaintPath[];
   inkPaths: PaintPath[];
+  gradients?: PaintGradient[];
 }
 
 export interface ObjectGroup {
@@ -123,8 +149,10 @@ export interface Bundle {
 // Validation
 // ---------------------------------------------------------------------------
 
-const SAFE_PATH = /^M[\s\d.,eE+\-MLZ]+Z$/;
+const SAFE_PATH = /^M[\s\d.,eE+\-MLQCZ]+Z$/;
+const SAFE_PATH_OPEN = /^M[\s\d.,eE+\-MLQCZ]+$/;
 const SAFE_HEX = /^#[0-9A-Fa-f]{6}$/;
+const SAFE_GRADIENT_REF = /^url\(#g-[a-zA-Z0-9_-]+\)$/;
 
 export function validateBundle(bundle: Bundle): Bundle {
   const { manifest: m, geometry: g } = bundle || ({} as Bundle);
@@ -154,8 +182,18 @@ export function validateBundle(bundle: Bundle): Bundle {
     const paint = bundle.paint;
     if (!paint || paint.artworkId !== m.id || !Array.isArray(paint.paths) || !Array.isArray(paint.inkPaths))
       throw new Error("Missing detailed vector paint");
-    for (const path of [...paint.paths, ...paint.inkPaths]) {
-      if (!SAFE_HEX.test(path.fill) || !SAFE_PATH.test(path.d)) throw new Error("Invalid paint path");
+    const gradientIds = new Set((paint.gradients ?? []).map((x) => x.id));
+    for (const path of paint.paths) {
+      const okFill = SAFE_HEX.test(path.fill) ||
+        (SAFE_GRADIENT_REF.test(path.fill) && gradientIds.has(path.fill.slice(5, -1)));
+      if (!okFill || !SAFE_PATH.test(path.d)) throw new Error("Invalid paint path");
+    }
+    // Ink layer holds closed filled shapes OR open stroke line art.
+    for (const path of paint.inkPaths) {
+      const okFill = SAFE_HEX.test(path.fill) ||
+        (SAFE_GRADIENT_REF.test(path.fill) && gradientIds.has(path.fill.slice(5, -1)));
+      const okPath = path.strokeWidth != null || path.filled === false ? SAFE_PATH_OPEN.test(path.d) : SAFE_PATH.test(path.d);
+      if (!okFill || !okPath) throw new Error("Invalid ink path");
     }
   }
   return bundle;
@@ -334,6 +372,21 @@ export class VectorBoard {
       for (const stop of p.paint.stops) grad.append(svgNode("stop", { offset: stop.offset, "stop-color": stop.color }));
       defs.append(grad);
     }
+    if (this.detailed && this.bundle.paint?.gradients) {
+      for (const g of this.bundle.paint.gradients) {
+        const attrs: Attrs =
+          g.type === "linear"
+            ? { id: g.id, gradientUnits: "userSpaceOnUse", x1: g.x1, y1: g.y1, x2: g.x2, y2: g.y2 }
+            : { id: g.id, gradientUnits: "userSpaceOnUse", cx: g.cx, cy: g.cy, r: g.r, fx: g.fx, fy: g.fy };
+        const node = svgNode(g.type === "linear" ? "linearGradient" : "radialGradient", attrs);
+        for (const stop of g.stops) {
+          const stopAttrs: Attrs = { offset: stop.offset, "stop-color": stop.color };
+          if (stop.opacity != null && stop.opacity !== 1) stopAttrs["stop-opacity"] = stop.opacity;
+          node.append(svgNode("stop", stopAttrs));
+        }
+        defs.append(node);
+      }
+    }
     const hatch = svgNode("pattern", {
       id: this.prefix + "selected",
       width: 12,
@@ -349,17 +402,17 @@ export class VectorBoard {
     const g = this.bundle.geometry;
     if (this.detailed && this.bundle.paint) {
       const art = svgNode("g", { "data-layer": "vector-paint", "pointer-events": "none" });
-      for (const p of this.bundle.paint.paths)
+      for (const p of this.bundle.paint.paths) {
+        const gradientFill = p.fill.startsWith("url(#");
         art.append(
           svgNode("path", {
             d: p.d,
             fill: p.fill,
-            stroke: p.fill,
-            "stroke-width": 0.55,
-            "stroke-linejoin": "round",
+            ...(gradientFill ? {} : { stroke: p.fill, "stroke-width": 0.55, "stroke-linejoin": "round" }),
             "fill-rule": "evenodd",
           })
         );
+      }
       this.svg.append(art);
     }
     const regions = svgNode("g", {
@@ -394,7 +447,17 @@ export class VectorBoard {
     this.svg.append(details);
     if (this.detailed && this.bundle.paint) {
       const ink = svgNode("g", { "data-layer": "ink", "pointer-events": "none" });
-      for (const p of this.bundle.paint.inkPaths) ink.append(svgNode("path", { d: p.d, fill: p.fill, "fill-rule": "evenodd" }));
+      for (const p of this.bundle.paint.inkPaths) {
+        if (p.strokeWidth != null || p.filled === false) {
+          ink.append(svgNode("path", {
+            d: p.d, fill: "none", stroke: p.fill,
+            "stroke-width": p.strokeWidth ?? 1.5,
+            "stroke-linecap": "round", "stroke-linejoin": "round",
+          }));
+        } else {
+          ink.append(svgNode("path", { d: p.d, fill: p.fill, "fill-rule": "evenodd" }));
+        }
+      }
       this.svg.append(ink);
     }
     const labels = svgNode("g", {
@@ -539,7 +602,9 @@ export class VectorBoard {
   }
 
   private hitTest(x: number, y: number): string | null {
-    for (const [id, r] of this.regions) {
+    // Iterate in reverse document order: the topmost region wins, which
+    // matches how stacked SVG-master masks resolve overlaps (z-order).
+    for (const [id, r] of [...this.regions].reverse()) {
       const b = r.bbox;
       if (x >= b[0] && x <= b[2] && y >= b[1] && y <= b[3] && this.ctx!.isPointInPath(this.paths.get(id)!, x, y, "evenodd"))
         return id;
