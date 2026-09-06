@@ -1,0 +1,537 @@
+"use client";
+
+/** Right panel — 01 / REGION COMPILER + 02 / REVIEW & EXPORT. */
+
+import { useState } from "react";
+import {
+  AlertTriangle,
+  CheckCircle2,
+  ChevronDown,
+  Download,
+  FileArchive,
+  Image as ImageIcon,
+  Loader2,
+  Merge,
+  Tag,
+  Layers,
+  Crosshair,
+  Palette as PaletteIcon,
+  Trash2,
+} from "lucide-react";
+import { toast } from "sonner";
+
+import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
+import { Slider } from "@/components/ui/slider";
+import { exportUrl, renderUrl, type ImageQuality } from "@/lib/studio-api";
+import { useStudioContext } from "./use-studio";
+import { ReviewDialog } from "./review-dialog";
+
+function MicroCaption({ children, className = "" }: { children: React.ReactNode; className?: string }) {
+  return <p className={`text-[10px] leading-relaxed text-[#778481] ${className}`}>{children}</p>;
+}
+
+function NumberField({
+  id,
+  label,
+  value,
+  min,
+  max,
+  step = 1,
+  onCommit,
+}: {
+  id: string;
+  label: string;
+  value: number;
+  min: number;
+  max: number;
+  step?: number;
+  onCommit: (v: number) => void;
+}) {
+  return (
+    <div>
+      <Label htmlFor={id} className="text-[10px] leading-snug text-[#657671]">
+        {label}
+      </Label>
+      <Input
+        id={id}
+        type="number"
+        min={min}
+        max={max}
+        step={step}
+        value={value}
+        className="mt-1 h-8 rounded-md bg-white text-xs"
+        onChange={(e) => {
+          const v = Number(e.target.value);
+          if (e.target.value !== "" && Number.isFinite(v)) onCommit(v);
+        }}
+        onBlur={(e) => {
+          const v = Number(e.target.value);
+          if (!Number.isFinite(v) || v < min || v > max) onCommit(Math.min(max, Math.max(min, Number.isFinite(v) ? v : min)));
+        }}
+      />
+    </div>
+  );
+}
+
+export function RightPanel() {
+  const studio = useStudioContext();
+  const {
+    config,
+    project,
+    revision,
+    bundle,
+    view,
+    busy,
+    buildSettings,
+    setBuildSetting,
+    quality,
+    setQuality,
+    editPalette,
+    setEditPalette,
+    objectGroup,
+    setObjectGroup,
+    revisionSelect,
+    setRevisionSelect,
+    selected,
+    placing,
+    selectionInfo,
+    startPlacing,
+    clearSelection,
+    runEdit,
+    build,
+    activateSelectedRevision,
+  } = studio;
+  const [advancedOpen, setAdvancedOpen] = useState(false);
+
+  const canBuild = !!project?.master && !busy;
+  const qa = revision?.qa;
+
+  const doEdit = (action: Parameters<typeof runEdit>[0], extra?: Parameters<typeof runEdit>[1]) =>
+    void runEdit(action, extra).catch((e: Error) => toast(e.message));
+
+  const stats: Array<{ value: number | string; label: string }> = [
+    { value: revision?.regionCount ?? "—", label: "tap regions" },
+    { value: qa?.paletteGroups ?? "—", label: "color groups" },
+    { value: qa?.paintPaths ?? "—", label: "paint paths" },
+  ];
+
+  return (
+    <aside className="studio-right-panel" aria-label="Region compiler and export">
+      {/* ---------------------------------------------------- 01 / COMPILER */}
+      <div className="rp-wide">
+        <span className="mb-2 block text-[9px] font-semibold uppercase tracking-[0.16em] text-[#80908a]">
+          01 / REGION COMPILER
+        </span>
+        <h2 className="mb-2 text-[17px] font-bold tracking-tight text-[#183837]">Detail, without busywork.</h2>
+        <p className="mb-4 text-[11px] leading-relaxed text-[#778481]">
+          Visual shading and player tap regions are two different layers.
+        </p>
+      </div>
+
+      <div className="flex items-baseline justify-between">
+        <Label htmlFor="studio-target-regions" className="studio-label mb-1.5 mt-0">
+          Target regions
+        </Label>
+        <output htmlFor="studio-target-regions" className="text-sm font-bold text-[#087f74]">
+          {buildSettings.target_regions}
+        </output>
+      </div>
+      <Slider
+        id="studio-target-regions"
+        min={100}
+        max={1600}
+        step={50}
+        value={[buildSettings.target_regions]}
+        onValueChange={(v) => setBuildSetting("target_regions", v[0] ?? 650)}
+        className="py-1 [&_.bg-primary]:bg-[#087f74] [&_[data-slot=slider-range]]:bg-[#087f74] [&_[data-slot=slider-thumb]]:border-[#087f74]"
+        aria-label="Target regions"
+      />
+      <MicroCaption>An approximate target, not a guaranteed count.</MicroCaption>
+
+      <div className="mt-3 grid grid-cols-2 gap-2">
+        <NumberField
+          id="studio-palette-colors"
+          label="Palette groups"
+          value={buildSettings.palette_colors}
+          min={4}
+          max={80}
+          onCommit={(v) => setBuildSetting("palette_colors", v)}
+        />
+        <NumberField
+          id="studio-paint-colors"
+          label="Paint tones"
+          value={buildSettings.paint_colors}
+          min={16}
+          max={160}
+          onCommit={(v) => setBuildSetting("paint_colors", v)}
+        />
+      </div>
+
+      <Label htmlFor="studio-max-edge" className="studio-label mb-1.5">
+        Vector sampling resolution
+      </Label>
+      <Select
+        value={String(buildSettings.max_edge)}
+        onValueChange={(v) => setBuildSetting("max_edge", Number(v))}
+        disabled={busy}
+      >
+        <SelectTrigger id="studio-max-edge" className="h-8 w-full rounded-md bg-white text-xs">
+          <SelectValue />
+        </SelectTrigger>
+        <SelectContent>
+          <SelectItem value="768">768 px · quick draft</SelectItem>
+          <SelectItem value="1024">1024 px · balanced</SelectItem>
+          <SelectItem value="1536">1536 px · detailed / heavier</SelectItem>
+        </SelectContent>
+      </Select>
+
+      {/* Advanced settings */}
+      <button
+        type="button"
+        onClick={() => setAdvancedOpen((o) => !o)}
+        aria-expanded={advancedOpen}
+        className="mt-3.5 flex w-full items-center gap-1.5 rounded-md py-1.5 text-left text-[11px] font-medium text-[#778481] hover:text-[#183837]"
+      >
+        <ChevronDown className={`size-3.5 transition-transform ${advancedOpen ? "" : "-rotate-90"}`} aria-hidden />
+        Advanced settings
+      </button>
+      {advancedOpen && (
+        <div className="mt-1 grid grid-cols-2 gap-2">
+          <NumberField
+            id="studio-compactness"
+            label="Shape compactness (lower = less regular)"
+            value={buildSettings.compactness}
+            min={1}
+            max={25}
+            onCommit={(v) => setBuildSetting("compactness", v)}
+          />
+          <NumberField
+            id="studio-min-area"
+            label="Merge fragments below (pixels)"
+            value={buildSettings.min_region_pixels}
+            min={4}
+            max={600}
+            onCommit={(v) => setBuildSetting("min_region_pixels", v)}
+          />
+          <NumberField
+            id="studio-min-radius"
+            label="Minimum number clearance"
+            value={buildSettings.min_label_radius}
+            min={1}
+            max={12}
+            step={0.5}
+            onCommit={(v) => setBuildSetting("min_label_radius", v)}
+          />
+          <NumberField
+            id="studio-ink"
+            label="Dark-ink threshold (0 disables)"
+            value={buildSettings.ink_threshold}
+            min={0}
+            max={80}
+            onCommit={(v) => setBuildSetting("ink_threshold", v)}
+          />
+          <div className="col-span-2">
+            <Label htmlFor="studio-quality" className="studio-label mb-1.5">
+              AI image quality
+            </Label>
+            <Select
+              value={quality}
+              onValueChange={(v) => setQuality(v as ImageQuality)}
+              disabled={!(config?.ai.configured ?? false)}
+            >
+              <SelectTrigger id="studio-quality" className="h-8 w-full rounded-md bg-white text-xs">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="low">low</SelectItem>
+                <SelectItem value="medium">medium</SelectItem>
+                <SelectItem value="high">high</SelectItem>
+              </SelectContent>
+            </Select>
+          </div>
+        </div>
+      )}
+
+      <Button
+        className="rp-wide mt-3.5 w-full justify-between rounded-xl bg-[#087f74] py-3 text-[11px] font-semibold text-white hover:bg-[#056c62]"
+        disabled={!canBuild}
+        onClick={() => void build().catch((e: Error) => toast(e.message))}
+      >
+        {busy && project?.job?.kind === "vector compilation" ? (
+          <>
+            <Loader2 className="size-4 animate-spin" aria-hidden />
+            Building…
+          </>
+        ) : (
+          <>
+            Build vector draft
+            <span aria-hidden>→</span>
+          </>
+        )}
+      </Button>
+      {!project?.master && (
+        <MicroCaption className="rp-wide mt-1.5">
+          Load a master image first — upload one or try the bundled treehouse.
+        </MicroCaption>
+      )}
+
+      <div className="rp-wide my-5 h-px bg-[#e1e5df]" />
+
+      {/* ------------------------------------------------ 02 / REVIEW & EXPORT */}
+      <div className="rp-wide">
+        <span className="mb-2 block text-[9px] font-semibold uppercase tracking-[0.16em] text-[#80908a]">
+          02 / REVIEW &amp; EXPORT
+        </span>
+
+        <div className="mb-4 mt-3 flex justify-between gap-2.5">
+          {stats.map((s) => (
+            <div key={s.label} className="flex-1 text-center">
+              <strong className="block text-[23px] font-bold tracking-tight text-[#183837]">{s.value}</strong>
+              <span className="text-[9px] text-[#778481]">{s.label}</span>
+            </div>
+          ))}
+        </div>
+      </div>
+
+      {/* QA box */}
+      <div
+        className={`rp-wide rounded-[10px] border px-3 py-2.5 text-[10px] leading-relaxed ${
+          qa ? "border-[#dfe6d8] bg-[#eff3ec] text-[#6c7c6b]" : "border-[#e1e5df] bg-[#f4f6f0] text-[#8a968f]"
+        }`}
+        aria-live="polite"
+      >
+        {qa ? (
+          <>
+            <p className={`mb-1 font-bold ${qa.passed ? "text-[#30704f]" : "text-[#ba463f]"}`}>
+              {qa.passed ? "✓ Geometry checks passed" : "Geometry needs attention"}
+            </p>
+            {qa.humanReviewed && (
+              <p className="font-bold text-[#167a5d]">✓ Self-attested visual review recorded</p>
+            )}
+            {qa.warnings.length > 0 && (
+              <ul className="studio-scroll mt-1.5 max-h-40 space-y-1.5 overflow-y-auto pr-1">
+                {qa.warnings.map((w, i) => (
+                  <li key={i} className="flex gap-1.5 text-[#957242]">
+                    <AlertTriangle className="mt-0.5 size-3 shrink-0" aria-hidden />
+                    <span>{w}</span>
+                  </li>
+                ))}
+              </ul>
+            )}
+          </>
+        ) : (
+          <p>Compile an image to inspect geometry checks and small-target warnings.</p>
+        )}
+      </div>
+
+      {/* Region inspector */}
+      {view === "inspect" && bundle && (
+        <div className="rp-wide mt-4 rounded-[10px] bg-[#edf6f2] p-3">
+          <h3 className="text-[13px] font-semibold text-[#183837]">Region inspector</h3>
+          <MicroCaption className="mt-0.5">{selectionInfo}</MicroCaption>
+          <div className="mt-2.5 grid grid-cols-2 gap-2">
+            <div>
+              <Label htmlFor="studio-edit-palette" className="text-[10px] text-[#657671]">
+                Palette ID
+              </Label>
+              <Input
+                id="studio-edit-palette"
+                type="number"
+                min={1}
+                value={editPalette}
+                onChange={(e) => setEditPalette(e.target.value)}
+                className="mt-1 h-8 rounded-md bg-white text-xs"
+              />
+            </div>
+            <div>
+              <Label htmlFor="studio-object-group" className="text-[10px] text-[#657671]">
+                Object group
+              </Label>
+              <Input
+                id="studio-object-group"
+                value={objectGroup}
+                placeholder="roof"
+                pattern="[a-z0-9]+(-[a-z0-9]+)*"
+                onChange={(e) => setObjectGroup(e.target.value)}
+                className="mt-1 h-8 rounded-md bg-white text-xs"
+              />
+            </div>
+          </div>
+          <div className="mt-2.5 grid grid-cols-2 gap-1.5">
+            <Button
+              variant="outline"
+              size="sm"
+              className="h-8 rounded-md border-[#e1e5df] bg-white text-[9px]"
+              disabled={busy || !selected.size}
+              onClick={() => doEdit("palette", { palette_id: Number(editPalette) || 1 })}
+            >
+              <PaletteIcon className="size-3" aria-hidden />
+              Set palette
+            </Button>
+            <Button
+              variant="outline"
+              size="sm"
+              className="h-8 rounded-md border-[#e1e5df] bg-white text-[9px]"
+              disabled={busy || !selected.size}
+              onClick={() => doEdit("group", { group: objectGroup.trim() || "roof" })}
+            >
+              <Layers className="size-3" aria-hidden />
+              Set group
+            </Button>
+            <Button
+              variant="outline"
+              size="sm"
+              className="h-8 rounded-md border-[#e1e5df] bg-white text-[9px]"
+              disabled={busy || !selected.size}
+              onClick={() => doEdit("merge", { palette_id: Number(editPalette) || 1 })}
+            >
+              <Merge className="size-3" aria-hidden />
+              Merge selected
+            </Button>
+            <Button
+              variant="outline"
+              size="sm"
+              className="h-8 rounded-md border-[#e1e5df] bg-white text-[9px]"
+              disabled={busy || !selected.size}
+              onClick={() => doEdit("decorate")}
+            >
+              <Tag className="size-3" aria-hidden />
+              Make detail
+            </Button>
+            <Button
+              variant="outline"
+              size="sm"
+              className={`h-8 rounded-md text-[9px] ${
+                placing
+                  ? "border-[#087f74] bg-[#087f74] text-white"
+                  : "border-[#e1e5df] bg-white text-[#183837]"
+              }`}
+              disabled={selected.size !== 1 || busy}
+              onClick={startPlacing}
+            >
+              <Crosshair className="size-3" aria-hidden />
+              {placing ? "Tap new position" : "Place number"}
+            </Button>
+            <Button
+              variant="outline"
+              size="sm"
+              className="h-8 rounded-md border-[#e1e5df] bg-white text-[9px]"
+              disabled={!selected.size}
+              onClick={clearSelection}
+            >
+              <Trash2 className="size-3" aria-hidden />
+              Clear selection
+            </Button>
+          </div>
+          <MicroCaption className="mt-2">
+            Each edit creates a new revision. Merge only neighboring regions. &ldquo;Make detail&rdquo; precolors a
+            region and removes it from the progress count.
+          </MicroCaption>
+        </div>
+      )}
+
+      {/* Revision history */}
+      <div className="rp-wide">
+        <Label htmlFor="studio-revision-list" className="studio-label mb-1.5">
+          Revision history
+        </Label>
+        <Select
+          value={revisionSelect}
+          onValueChange={(v) => setRevisionSelect(v)}
+          disabled={!project?.revisions.length}
+        >
+          <SelectTrigger id="studio-revision-list" className="h-8 w-full rounded-md bg-white text-xs">
+            <SelectValue placeholder={project?.revisions.length ? "Select a revision" : "No revisions"} />
+          </SelectTrigger>
+          <SelectContent>
+            {[...(project?.revisions ?? [])].reverse().map((rev) => (
+              <SelectItem key={rev.id} value={rev.id}>
+                v{rev.version} · {rev.kind} · {rev.regionCount} regions
+              </SelectItem>
+            ))}
+          </SelectContent>
+        </Select>
+        <button
+          type="button"
+          className="block py-2 text-left text-[11px] font-medium text-[#087f74] hover:underline disabled:opacity-50"
+          disabled={!revisionSelect || busy}
+          onClick={() =>
+            void activateSelectedRevision().catch((e: Error) => toast(e.message))
+          }
+        >
+          Restore selected revision
+        </button>
+      </div>
+
+      <div className="rp-wide">
+        <ReviewDialog>
+          <Button
+            variant="outline"
+            className="mt-2 w-full rounded-xl border-[#cfe6db] bg-[#e5f3ed] py-2.5 text-[11px] font-semibold text-[#126e5e] hover:bg-[#d9ede2]"
+            disabled={!revision || busy}
+          >
+            <CheckCircle2 className="size-4" aria-hidden />
+            Mark visually reviewed
+          </Button>
+        </ReviewDialog>
+      </div>
+
+      {/* Export links */}
+      <div className="rp-wide mt-3">
+        {project && revision ? (
+          <div className="flex flex-col gap-1">
+          <a
+            href={exportUrl(project.id, revision.id)}
+            download
+            className="flex w-full items-center justify-between rounded-xl bg-[#087f74] px-4 py-3 text-[11px] font-semibold text-white transition-colors hover:bg-[#056c62]"
+          >
+            <span className="flex items-center gap-2">
+              <FileArchive className="size-4" aria-hidden />
+              Export game bundle .zip
+            </span>
+            <span aria-hidden>↧</span>
+          </a>
+          <a
+            href={exportUrl(project.id, revision.id, true)}
+            download
+            className="block py-1.5 text-left text-[11px] font-medium text-[#087f74] hover:underline"
+          >
+            Include source &amp; authoring files
+          </a>
+          <a
+            href={renderUrl(project.id, revision.id, 2048)}
+            download
+            className="block py-1.5 text-left text-[11px] font-medium text-[#087f74] hover:underline"
+          >
+            <ImageIcon className="mr-1 inline size-3.5" aria-hidden />
+            Render 2048px PNG from vector
+          </a>
+        </div>
+        ) : (
+          <div className="flex flex-col gap-1 opacity-40" aria-disabled="true">
+          <span className="flex w-full cursor-not-allowed items-center justify-between rounded-xl bg-[#087f74] px-4 py-3 text-[11px] font-semibold text-white">
+            <span className="flex items-center gap-2">
+              <Download className="size-4" aria-hidden />
+              Export game bundle .zip
+            </span>
+            <span aria-hidden>↧</span>
+          </span>
+          <span className="block cursor-not-allowed py-1.5 text-left text-[11px] font-medium text-[#087f74]">
+            Include source &amp; authoring files
+          </span>
+          <span className="block cursor-not-allowed py-1.5 text-left text-[11px] font-medium text-[#087f74]">
+            Render 2048px PNG from vector
+          </span>
+        </div>
+        )}
+      </div>
+      <MicroCaption className="rp-wide mt-1">
+        Export contains SVG + region, paint and palette JSON. Automatic output is a reviewable draft — not a
+        guaranteed publish-ready asset.
+      </MicroCaption>
+    </aside>
+  );
+}

@@ -1,0 +1,10 @@
+{
+  "name": "color-duel-studio-backend",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Color Duel Art Studio — Python/FastAPI vector compiler backend on port 8765",
+  "scripts": {
+    "dev": "/home/z/.venv/bin/python3.12 run.py",
+    "test": "/home/z/.venv/bin/python3.12 -m pytest tests/test_pipeline.py tests/test_api.py -q"
+  }
+}

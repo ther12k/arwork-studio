@@ -1,0 +1,67 @@
+"""Run against python run.py on localhost:8765; installs no dependencies or browsers.
+Requires Playwright and a local Chromium executable (CHROMIUM_BIN).
+"""
+import json,os,time,zipfile
+from pathlib import Path
+from playwright.sync_api import sync_playwright
+OUT=Path(os.getenv('STUDIO_TEST_OUTPUT','tests/browser-output'));OUT.mkdir(parents=True,exist_ok=True)
+checks=[]
+def check(name,condition):
+    assert condition,name
+    checks.append(name)
+with sync_playwright() as pw:
+    browser=pw.chromium.launch(executable_path=os.getenv('CHROMIUM_BIN','/usr/bin/chromium'),headless=True,args=['--no-sandbox'])
+    page=browser.new_page(viewport={'width':1440,'height':1100},device_scale_factor=1)
+    errors=[];page.on('pageerror',lambda e:errors.append(str(e)))
+    page.goto('http://127.0.0.1:8765');page.wait_for_selector('#project-list option')
+    check('Local compiler configuration visible','Local compiler ready' in page.locator('#ai-status').inner_text())
+    check('AI controls disabled without key',page.locator('#generate').is_disabled() and page.locator('#send-chat').is_disabled())
+    page.locator('#sample').click();page.wait_for_function("!document.querySelector('#master-image').hidden && document.querySelector('#master-image').naturalWidth>0")
+    check('Example source loads into master preview',page.locator('#master-image').is_visible())
+    page.locator('#max-edge').select_option('768')
+    page.locator('#target-regions').fill('750');page.locator('#target-regions').dispatch_event('input')
+    page.locator('#build').click()
+    page.wait_for_function("!!window.studioBoard && !document.querySelector('#board').hasAttribute('hidden')",timeout=120000)
+    check('Compiler produces real playable regions',page.evaluate('studioBoard.regions.size')>300)
+    check('Static painting is actual vector paths',page.locator('#board [data-layer="vector-paint"] path').count()>0)
+    check('Vector SVG contains no embedded image',page.locator('#board image').count()==0)
+    check('QA reported a pass','Geometry checks passed' in page.locator('#qa').inner_text())
+    page.screenshot(path=str(OUT/'studio-desktop.png'),full_page=True)
+    page.locator('[data-view="play"]').click()
+    r=page.evaluate('''() => [...studioBoard.regions.values()].sort((a,b)=>b.area-a.area)[0]''')
+    page.locator(f'#palette [data-palette="{r["paletteId"]}"]').click()
+    pos=page.evaluate('''id=>{let r=studioBoard.regions.get(id),p=new DOMPoint(r.label.x,r.label.y).matrixTransform(studioBoard.svg.getScreenCTM());return {x:p.x,y:p.y}}''',r['id'])
+    page.mouse.click(pos['x'],pos['y'])
+    check('Pointer hit-test colors correct region',page.evaluate('id=>studioBoard.completed.has(id)',r['id']))
+    check('Filled region hides number',page.evaluate('id=>studioBoard.labels.get(id).style.display',r['id'])=='none')
+    page.locator('#undo').click();check('Undo restores region',not page.evaluate('id=>studioBoard.completed.has(id)',r['id']))
+    wrong=1 if r['paletteId']!=1 else 2
+    page.locator(f'#palette [data-palette="{wrong}"]').click();page.mouse.click(pos['x'],pos['y'])
+    check('Wrong-color tap is rejected',not page.evaluate('id=>studioBoard.completed.has(id)',r['id']))
+    check('Wrong-color mistake recorded',page.evaluate('studioBoard.session.mistakes')==1)
+    page.locator('#zoom-in').click();check('Zoom button changes viewport',page.evaluate('studioBoard.state().zoom')>1)
+    page.locator('#fit').click();check('Fit restores full artwork',page.evaluate('studioBoard.state().zoom')==1)
+    page.locator('[data-view="inspect"]').click();page.mouse.click(pos['x'],pos['y'])
+    check('Region inspector selects pointer target','1 selected' in page.locator('#selection-info').inner_text())
+    before=page.evaluate('studioBoard.bundle.manifest.version')
+    page.locator('#object-group').fill('roof');page.locator('#assign-group').click()
+    page.wait_for_function('old=>window.studioBoard && studioBoard.bundle.manifest.version!==old',arg=before,timeout=120000)
+    check('Manual edit creates new version',page.evaluate('studioBoard.bundle.manifest.objectGroups[0].id')=='roof')
+    page.locator('[data-view="numbered"]').click();page.locator('#zoom-in').click();page.locator('#zoom-in').click()
+    check('Number labels appear when zoomed',page.locator('#board text:visible').count()>0)
+    page.screenshot(path=str(OUT/'studio-numbered.png'),full_page=True)
+    with page.expect_download() as dl:page.locator('#export').click()
+    download=dl.value;destination=OUT/'browser-export.zip';download.save_as(str(destination))
+    with zipfile.ZipFile(destination) as z:
+        check('Export is readable ZIP',z.testzip() is None)
+        check('ZIP includes game geometry',any(n.endswith('/regions.json') for n in z.namelist()))
+        check('ZIP includes vector painting',any(n.endswith('/paint.json') for n in z.namelist()))
+    page.set_viewport_size({'width':390,'height':844});page.locator('[data-view="colored"]').click();page.locator('#fit').click();page.wait_for_timeout(700)
+    check('Mobile page has no horizontal overflow',page.evaluate('document.documentElement.scrollWidth <= window.innerWidth+1'))
+    page.screenshot(path=str(OUT/'studio-mobile.png'),full_page=True)
+    page.reload();page.wait_for_function('!!window.studioBoard',timeout=20000)
+    check('Project and revision survive reload',page.evaluate('studioBoard.bundle.manifest.objectGroups[0].id')=='roof')
+    check('No browser JS exceptions',not errors)
+    browser.close()
+(OUT/'report.json').write_text(json.dumps({'checks':checks,'passed':len(checks),'javascriptErrors':errors},indent=2))
+print(json.dumps({'passed':len(checks),'checks':checks,'errors':errors},indent=2))

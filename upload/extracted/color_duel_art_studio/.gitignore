@@ -1,0 +1,7 @@
+.env
+.venv/
+workspace/
+__pycache__/
+.pytest_cache/
+*.pyc
+tests/browser-output/

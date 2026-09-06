@@ -1,0 +1,30 @@
+{
+  "scope": "Offline browser component tests with in-process FastAPI bridge. No browser HTTP networking or live AI.",
+  "passed": 23,
+  "checks": [
+    "Local compiler status shown",
+    "AI disabled with no key",
+    "Bundled source appears",
+    "Compiler produces detailed regions",
+    "Detailed vector painting present",
+    "No embedded raster in SVG",
+    "QA pass displayed",
+    "Pointer fills correct region",
+    "Number hidden after fill",
+    "Undo restores region",
+    "Wrong palette rejected",
+    "Mistake counted",
+    "Zoom works",
+    "Fit works",
+    "Inspector selects region",
+    "Group edit creates new revision",
+    "Numbers visible at useful zoom",
+    "Backend export ZIP intact",
+    "Export contains region geometry",
+    "Export contains paint layer",
+    "Mobile no horizontal overflow",
+    "No JS exceptions",
+    "Project revisions persisted"
+  ],
+  "errors": []
+}

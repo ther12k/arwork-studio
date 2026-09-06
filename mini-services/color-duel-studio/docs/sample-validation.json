@@ -1,0 +1,22 @@
+{
+  "passed": true,
+  "errors": [],
+  "warnings": [
+    "Detailed vector painting is heavy. Cache/rasterize its static layer in the game and test real devices.",
+    "Automatic regions are drafts, not guaranteed to follow semantic object boundaries. Human visual review is required."
+  ],
+  "playableRegions": 622,
+  "fixedRegions": 58,
+  "paletteGroups": 32,
+  "paintPaths": 80,
+  "paintSubshapes": 15433,
+  "area": 442368.0,
+  "canvasArea": 442368,
+  "overlapArea": 0,
+  "missingArea": 0,
+  "roundtripEmptyPixels": 0,
+  "smallTargetCount": 0,
+  "precoloredAreaPercent": 3.288,
+  "humanReviewed": false,
+  "checkScope": "IDs, palette references, versions, closed paths, polygon validity, bounds, label interiors, partition union, overlap, raster coverage. Not semantic/artistic quality."
+}

@@ -1,0 +1,12 @@
+{
+  "name": "ai-bridge",
+  "version": "0.1.0",
+  "private": true,
+  "description": "OpenAI-compatible shim for the Color Duel studio backed by z-ai-web-dev-sdk (port 8787)",
+  "scripts": {
+    "dev": "bun --hot index.ts"
+  },
+  "dependencies": {
+    "z-ai-web-dev-sdk": "^0.0.18"
+  }
+}
