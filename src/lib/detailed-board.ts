@@ -667,7 +667,13 @@ export class VectorBoard {
       const e = event as PointerEvent;
       if (e.pointerType === "mouse" && e.button !== 0) return;
       this.pointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
-      this.svg.setPointerCapture(e.pointerId);
+      // Synthetic/test events and stale pointers can make capture fail; a throw
+      // here would skip drag setup and break the whole tap flow, so guard it.
+      try {
+        this.svg.setPointerCapture(e.pointerId);
+      } catch {
+        /* no active pointer with this id — safe to continue without capture */
+      }
       if (this.pointers.size === 1) {
         this.suppressTap = false;
         const inverse = this.svg.getScreenCTM()!.inverse();

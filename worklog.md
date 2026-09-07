@@ -343,3 +343,82 @@ Stage Summary:
 - Known gaps: external image-to-SVG provider listed but unavailable without server-side
   credentials (by design); curve fit tolerance 1.0px leaves a documented sub-px
   partition band on 1px raster features.
+
+---
+Task ID: 11
+Agent: main (Z.ai Code)
+Task: Review for best practices and fix the React hydration error
+("A tree hydrated but some attributes of the server rendered HTML didn't match
+the client properties" — mismatched aria-controls="radix-_R_..." on the
+DialogTrigger button in the Header)
+
+Work Log:
+- Audited the rendered tree for hydration safety: no `typeof window` branches,
+  no Date.now()/Math.random()/locale date formatting during render, no
+  localStorage reads during render (both usages live inside effects/callbacks),
+  static string ids for all Label/htmlFor pairs, sonner Toaster wrapper is
+  deterministic (next-themes useTheme without provider returns defaults).
+- Clean-browser reproduction attempt: 7 loads + reloads → NO hydration error
+  (the mismatch is intermittent — matches the "some page loads" reports).
+- Root-caused via React 19.2.3 source (node_modules react-dom mountId): during
+  hydration, useId derives IDs from the fiber tree position (`_R_` + base32
+  path). If the streamed SSR tree differs from the hydration tree (Next App
+  Router + Suspense/streaming), every useId after the divergence shifts.
+  Confirmed as the known upstream issue radix-ui/primitives#3700 →
+  react#24669 ("useId is only stable when the tree matches; React team: not a
+  bug"), no React-side fix in 19.2.4–19.2.8.
+- KEY FINDING: installed @radix-ui/react-dialog@1.1.15 and
+  @radix-ui/react-select@2.2.6 render `"aria-controls": context.contentId`
+  UNCONDITIONALLY — the useId lands in the SSR HTML of every closed trigger.
+  Latest versions render `"aria-controls": context.open ? context.contentId :
+  void 0` — attribute omitted when closed → nothing left to mismatch.
+- FIX: `bun add @radix-ui/react-dialog@^1.1.23 @radix-ui/react-select@^2.3.7`
+  (the two useId-bearing primitives rendered on the page; other used primitives
+  — checkbox/slider/progress/label — generate no SSR useId attributes).
+  Verified installed dist contains the conditional aria-controls on both.
+- Verified SSR HTML via curl: ZERO `aria-controls` and ZERO `radix-_R_` ids in
+  the streamed output; both dialog triggers still render (aria-haspopup).
+- Dev server lifecycle: the boot-started server was killed for the module
+  upgrade and sandbox-reaped attempts (nohup/setsid) kept dying with the tool
+  command's process tree. Added `.zscripts/daemon.py` (classic double-fork +
+  setsid, orphaned to init while the spawning command is alive) — dev server
+  now survives across tool commands (PID 3932, PPID 1); dev.pid updated.
+- HARDENING: guarded `svg.setPointerCapture` in src/lib/detailed-board.ts with
+  try/catch — synthetic/test events or stale pointer ids threw NotFoundError,
+  skipping drag setup and breaking the tap flow (caught during verification;
+  real pointer events unaffected).
+- REGRESSION REPAIR: the boot-restarted studio backend had lost
+  mini-services/color-duel-studio/.env (dotfile lost in container sync), so
+  config.ai.configured was false. Recreated the .env (bridge URL/models),
+  killed the boot-time duplicate ai-bridge instance (second bun --hot that
+  never bound 8787) and the stale studio, restarted the studio detached via
+  daemon.py. `ai.configured: true`, chatModel glm-4.6, imageModel cogview-4;
+  page pill shows "Local compiler + AI connected".
+- Browser verification (agent-browser, gateway :81):
+  - 6 rapid reloads + fresh isolated session: 0 hydration errors, 0 page
+    errors, clean console (only HMR/Fast-Refresh logs).
+  - Guide dialog: opens, trigger aria-controls === content id at runtime
+    (radix-_R_19indlb_ both), Escape closes.
+  - Select: opens, trigger aria-controls === listbox id (radix-_R_4uindlb_).
+  - Play test golden path post-upgrade: swatch select → real-pointer tap fill
+    → "1 / 40 regions filled · 0 incorrect"; wrong-palette tap → toast
+    "That region needs a different palette group." + incorrect counter.
+  - Synthetic pointer events after the guard: no new page errors.
+  - Mobile 390px: bodyScrollW == 390 (no horizontal overflow); footer layout
+    intact (min-h-screen flex-col + mt-auto, pushed naturally on long pages).
+  - iframe embed smoke (preview-panel simulation): no console errors.
+- `bun run lint` → 0 problems; dev.log clean (all GET / 200, no
+  errors/warnings); services healthy on 3000 / 8765 / 8787.
+
+Stage Summary:
+- The hydration error is fixed at the source: closed Radix dialog/select
+  triggers no longer emit useId-derived aria-controls into SSR HTML
+  (upstream-correct conditional rendering), so the React 19.2 useId
+  tree-position mismatch class cannot surface on this page. Runtime a11y
+  pairings are correct when open.
+- App code was already hydration-clean; audit confirmed best practices.
+  One robustness guard added (setPointerCapture try/catch).
+- Service lifecycle made reproducible: .zscripts/daemon.py double-fork
+  launcher (dev server + studio now survive tool-command reaping).
+- AI features restored end-to-end (studio .env recreated; duplicate boot
+  ai-bridge instance removed); all three services verified healthy.
