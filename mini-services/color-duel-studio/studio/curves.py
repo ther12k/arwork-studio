@@ -28,7 +28,8 @@ Command = tuple  # ('M',x,y) ('L',x,y) ('C',x1,y1,x2,y2,x,y) ('Q',qx,qy,x,y) ('Z
 
 __all__ = [
     'parse_path', 'format_path', 'subpaths_of', 'flatten_path', 'flatten_subpath',
-    'commands_bbox', 'rings_bbox', 'point_in_rings', 'point_in_commands',
+    'commands_bbox', 'rings_bbox', 'point_in_rings', 'point_in_rings_rule',
+    'point_in_commands', 'solid_polygons',
     'evenodd_area', 'rdp', 'fit_polyline', 'fit_ring', 'reverse_commands',
     'parse_transform', 'mat_identity', 'mat_mul', 'mat_apply', 'transform_commands',
     'arc_to_cubics', 'snap_ring', 'max_deviation', 'fmt_num',
@@ -497,6 +498,113 @@ def point_in_rings(rings: Sequence[Sequence[Point]], x: float, y: float) -> bool
         if point_in_ring(ring, x, y):
             count += 1
     return count % 2 == 1
+
+
+def point_in_rings_rule(rings: Sequence[Sequence[Point]], x: float, y: float,
+                        rule: str = 'evenodd') -> bool:
+    """Point membership honouring the SVG fill rule (evenodd or nonzero)."""
+    winding = 0
+    hits = 0
+    for ring in rings:
+        if point_in_ring(ring, x, y):
+            hits += 1
+            winding += 1 if _ring_signed_area(ring) > 0 else -1
+    if rule == 'nonzero':
+        return winding != 0
+    return hits % 2 == 1
+
+
+def solid_polygons(rings, rule: str = 'evenodd'):
+    """Convert flattened rings into solid polygon(s) honouring the fill rule.
+
+    evenodd: ring nesting depth decides solid vs hole (even depth = solid).
+    nonzero: cumulative ring orientation decides — a same-winding nested
+    subpath is a UNION (not a hole), an opposite-winding one subtracts,
+    exactly like SVG's nonzero rule.  Ring order is not trusted; self-
+    touching rings are split via make_valid.
+    """
+    from shapely.geometry import Polygon
+    from shapely import make_valid
+
+    def parts_of(g):
+        if g is None or g.is_empty:
+            return []
+        if g.geom_type == 'Polygon':
+            return [g] if g.area > 0 else []
+        if g.geom_type in ('MultiPolygon', 'GeometryCollection'):
+            out = []
+            for child in g.geoms:
+                out.extend(parts_of(child))
+            return out
+        return []
+
+    parts = []
+    for ring in rings:
+        if ring is None or len(ring) < 3:
+            continue
+        p = Polygon(ring)
+        if not p.is_valid:
+            p = make_valid(p)
+        for poly in parts_of(p):
+            if poly.area > 1e-12:
+                parts.append(poly)
+    if not parts:
+        return []
+    # Nesting uses each part's own boundary vertex: an interior
+    # representative point of an outer ring can fall inside its hole and
+    # invert the parity.
+    reps = [Point_(p.exterior.coords[0]) for p in parts]
+    depth = [sum(1 for j, q in enumerate(parts) if j != i and q.contains(reps[i]))
+             for i in range(len(parts))]
+    signs = [1 if _ring_signed_area(p.exterior.coords) > 0 else -1 for p in parts]
+    parent = []
+    for j in range(len(parts)):
+        candidates = [i for i in range(len(parts)) if i != j and parts[i].contains(reps[j])]
+        parent.append(min(candidates, key=lambda i: parts[i].area) if candidates else None)
+    solids = []
+    for i, p in enumerate(parts):
+        # cumulative winding along the ancestor chain INCLUDING this ring
+        wind = signs[i]
+        k = parent[i]
+        guard = 0
+        while k is not None and guard < len(parts):
+            wind += signs[k]
+            k = parent[k]
+            guard += 1
+        if rule == 'nonzero':
+            solid_here = wind != 0
+        else:
+            solid_here = depth[i] % 2 == 0
+        if not solid_here:
+            continue
+        holes = []
+        for j in range(len(parts)):
+            if parent[j] != i:
+                continue
+            if rule == 'nonzero':
+                child_wind = signs[j]
+                k2 = parent[j]
+                guard = 0
+                while k2 is not None and guard < len(parts):
+                    child_wind += signs[k2]
+                    k2 = parent[k2]
+                    guard += 1
+                if child_wind == 0:
+                    holes.append(parts[j].exterior)
+            elif depth[j] % 2 == 1:
+                holes.append(parts[j].exterior)
+        solid = Polygon(p.exterior, holes) if holes else Polygon(p.exterior)
+        if not solid.is_valid:
+            solid = make_valid(solid)
+        for piece in parts_of(solid):
+            if piece.area > 1e-9:
+                solids.append(piece)
+    return solids
+
+
+def Point_(coord):
+    from shapely.geometry import Point as _ShapelyPoint
+    return _ShapelyPoint(coord[0], coord[1])
 
 
 def point_in_commands(cmds: Sequence[Command], x: float, y: float, tol: float = 0.25) -> bool:

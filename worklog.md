@@ -422,3 +422,225 @@ Stage Summary:
   launcher (dev server + studio now survive tool-command reaping).
 - AI features restored end-to-end (studio .env recreated; duplicate boot
   ai-bridge instance removed); all three services verified healthy.
+
+---
+Task ID: 7
+Agent: frontend (Z.ai Code subagent)
+Task: Recolor appearance UI + QA issues actionable (select region & zoom)
+
+Work Log:
+- Read worklog context (Tasks 1–11) plus `src/lib/studio-api.ts` (recolor/preserve_shading types
+  already present — not re-added), `src/lib/detailed-board.ts`, `use-studio.tsx`,
+  `right-panel.tsx`, `canvas-workspace.tsx` (board is rendered for all non-master/zoomlab views;
+  "inspect" is the selection view).
+- `src/lib/detailed-board.ts`: added public `focusRegion(id: string): string | null` next to
+  `nextRegion()` — centers the viewBox on the region label with a 1.8x bbox window (clamped to
+  base/10..base), applies it through the private `applyView` (private access is fine inside the
+  class) and focuses the region path (`preventScroll`). No other changes to the file.
+- `src/components/studio/use-studio.tsx`: new `inspectRegion(id)` on the `StudioApi` interface +
+  implementation + context exposure. Follows the existing selection pattern (the paint wrapper):
+  guards `boardRef.current?.regions.has(id)` (toast when absent), switches `viewRef`/`setView`
+  to "inspect" when not already there (the view that renders the interactive board with selection
+  preview), sets `selectedRef.current = new Set([id])` + `setSelected`, cancels placing, populates
+  the Palette-ID / Object-group inspector inputs, calls `board.focusRegion(id)` and
+  `highlightSelection()` so the `.selected-region` DOM class sync applies immediately.
+- `src/components/studio/right-panel.tsx`:
+  * `regionIdsIn(text)` helper (`/\br-[A-Za-z0-9_-]{4,}\b/g`, deduped) for QA warning/error lines.
+  * QA warnings: lines with at least one region id render as a shadcn ghost `Button` styled as a
+    list row (full width, left-aligned, `whitespace-normal`, subtle warm hover `#ece6d5`,
+    keyboard-focusable, `aria-label`/`title` "Select region r-XXXX and zoom to it", AlertTriangle
+    kept) wired to `inspectRegion(firstId)`; lines without ids render exactly as before.
+  * Region inspector: renamed "Set palette" → **"Assign number group"** (h-auto/min-h-8 so the
+    longer label wraps gracefully without clipping; explanatory title tooltip).
+  * New "Recolor appearance" block (white card, rounded-md, Paintbrush icon): `<input type="color">`
+    (h-8, rounded, border) + hex `Input` bound to local state (default `#66AA33`), validated with
+    `/^#[0-9A-Fa-f]{6}$/` (invalid → button disabled + `#ba463f` hint + `aria-invalid`; blur
+    normalizes a missing "#"), "Preserve shading" shadcn `Checkbox` with the caption "Tint
+    gradients toward the target instead of replacing the fill.", and the "Recolor appearance"
+    button → `doEdit("recolor", { color, preserve_shading })` (disabled when busy / no selection /
+    invalid hex; failures already `toast(e.message)` through doEdit).
+  * Distinction MicroCaption under the two controls: "Number group = gameplay association (what
+    number the region requires). Recolor = what the artwork looks like."
+- Verification: `bunx tsc --noEmit` clean; `bun run lint` 0 problems; dev.log compiles clean
+  (the two `/api/... 404` lines are from an intentional direct-origin check — localhost:3000
+  without the gateway can't route XTransformPort; the app is normally used through the preview
+  panel/gateway, as documented in Task 4).
+- Browser e2e (agent-browser via gateway :81, no console/page errors):
+  * QA drill-down tested with a network-route mock injecting a warning
+    "…resolve to a lower region than expected: r-00003@12.3,45.6→r-00007; …" (mock only — no
+    backend/data touched): clicking the row switched the view from Play test → Edit regions,
+    selection became exactly `r-00003` ("1 selected · r-00003", one `.selected-region`), board
+    zoomed 100%→449% with the viewBox centered on the region, path focused
+    (`document.activeElement` = the region path).
+  * Recolor UI: invalid hex "nothex" → button disabled + hint + aria-invalid; typed "b25a2b" +
+    blur → normalized "#B25A2B", color picker synced, button enabled.
+  * Recolor e2e on the SVG-master demo (region r-00005, preserve_shading off): job polled to
+    done, new revision v0.7.0 (kind "recolor") created, paint path fill for the region's
+    masterShapeId replaced with #66AA33, palette swatch hex synced, view auto-switched to Vector
+    and the selection cleared (runEdit path). preserve_shading=true + a gradient region surfaces
+    the backend failure as a toast (see known issue below).
+  * VLM review of the inspector screenshot: Recolor block complete, "Assign number group" not
+    clipped, captions readable, no visual defects.
+  * Restored the demo project's current revision to rev-1f284182 (v0.5.0) after testing; two
+    extra history revisions (v0.6.0/v0.7.0 "recolor") remain as harmless history entries.
+- KNOWN BACKEND ISSUE found during verification (NOT fixed — backend files are off-limits for
+  this task, to be routed to the backend agent): `studio/pipeline.py::_tint_gradient` builds
+  `ratios` with `for k in range(3)` (3 elements) but the stop-color comprehension indexes
+  `ratios[k]` with `k in (0, 2, 4)` → `IndexError` ("list index out of range") whenever recolor
+  runs with `preserve_shading: true` on a gradient-filled shape. The frontend already surfaces
+  it as a toast. Fix: use `range(3)` consistently in the rgb comprehension.
+
+Stage Summary:
+- QA warnings are now actionable: any warning naming region ids becomes a clickable, keyboard
+  accessible row that selects exactly that region, switches to the Edit-regions view, highlights
+  it and zooms/focuses the board (`VectorBoard.focusRegion` + `useStudio.inspectRegion`).
+- The Region inspector distinguishes gameplay vs appearance: "Assign number group" (palette
+  action, relabels only) and the new "Recolor appearance" block (recolor action: hex-validated
+  color, optional gradient-preserving tint, backend errors toasted) with an explanatory caption.
+- Frontend-only change set: detailed-board.ts (focusRegion only), use-studio.tsx, right-panel.tsx.
+  tsc + lint clean; browser-verified end-to-end through the gateway with zero console errors.
+
+---
+Task ID: 12
+Agent: main (Z.ai Code)
+Task: Repair the studio pipeline per the engineering review verdict (stage 1:
+trustworthy output) — shared format contract, visible-region geometry with
+fill-order independence, safe SVG serialization, SVG fidelity preservation,
+lean runtime export, TS-error fixes, and full browser verification.
+
+Work Log:
+- AUDIT: read integration/detailed-board.mjs (validated only M/L/Z + hex
+  fills — rejected the studio's own schema-2/curves/gradient output),
+  schemas/regions.schema.json (const schemaVersion 1, M/L/Z-only d),
+  src/lib/detailed-board.ts, studio/svg_master.py, studio/pipeline.py
+  (compile_svg_master emitted overlapping region masks: 469,946 px² on the
+  treehouse), models.py, app.py, tests/, and the workspace bundles.
+- svg_master.py (safe serialization + fidelity):
+  * emit_master_svg rebuilt with ElementTree (attribute values XML-escaped
+    by the serializer); ALL emitted ids are generated (s0000, g-0000-name);
+    source ids never reach the output — attribute-context injection
+    (id="x" onload=...) is structurally impossible. Verified with a
+    malicious-id fixture: 'onload'/'pwned' absent from output.
+  * Gradient coordinates parse percentages: objectBoundingBox 50% -> 0.5,
+    userSpaceOnUse 50% -> 0.5*viewBox axis (was misparsed as 50 -> flat
+    gradients); unsupported gradientUnits rejected with a precise error.
+  * Filled shapes keep stroke, fill-opacity, opacity, fill-rule and the
+    single ordered document stream (shapes + ink interleaved by order —
+    ink is no longer hoisted above fills).
+  * Shape solids honour the fill rule (nonzero same-winding nested subpath
+    = union, not a hole); _solid_union helper; hidden-shape test uses
+    effective opacity (fillOpacity*opacity).
+- curves.py: added rule-aware solid_polygons(rings, rule) (winding-based
+  nonzero nesting), point_in_rings_rule, exported both.
+- pipeline.py:
+  * compile_svg_master derives VISIBLE-REGION GEOMETRY: each gameplay
+    shape's solid polygon minus the union of all later opaque shapes
+    (suffix-union coverage index). Uncovered shapes keep verbatim master
+    commands; covered portions become derived visible surfaces (oriented
+    evenodd, refit at curve tolerance). Transparency/shading stay
+    appearance-only. Treehouse: 40 overlapping regions (469,946 px²
+    overlap, 210/210 probes mis-owned) -> 54 non-overlapping visible
+    surfaces (488.9 px² documented fit band, 0 label conflicts).
+  * Paint layer carries per-path fillRule, fillOpacity, opacity, stroke,
+    strokeWidth, z (document order) + shapeId links; svg_paint merges
+    paths+ink by z; numbered()/colored.svg/linework/ink regenerated.
+  * validate_bundle: rule-aware areas and label containment; label-point
+    ownership is an ERROR (acceptance rule: every number hits its own
+    region); svg-master overlap > band is an ERROR, decorations excluded
+    from the gameplay overlap gate (not interactive); new report fields
+    (labelOwnershipConflicts, visibleRegionGeometry, acceptanceRule,
+    fillRules).
+  * make_export: default export is now the LEAN RUNTIME bundle — only
+    artwork/regions/palette/paint JSON + validation evidence, regions
+    stripped of master/flat/rings/legacy authoring duplicates, manifest
+    assets reduced to the 3 runtime files; contract-checked before
+    writing. 552-region bundle: 10.08 MB authoring JSON -> 1.73 MB runtime
+    ZIP (-83%; was 8.78 MB before). validate_runtime_contract mirrors the
+    shipped adapter rules (Python-side gate).
+  * edit_bundle: NEW 'recolor' action (_recolor_bundle + _tint_gradient;
+    preserves gradient shading by tinting stops toward the target).
+    'palette' action documented as number-group assignment only. Fixed
+    _tint_gradient channel-index bug (ratios[k//2], caught by the frontend
+    subagent's e2e).
+  * models.py: EditRequest gains 'recolor', color (#RRGGBB pattern),
+    preserve_shading.
+- Shared format contract:
+  * integration/detailed-board.mjs REWRITTEN (web/ copy synced): accepts
+    geometrySchema 1/2, M/L/C/Q/Z paths, per-region fillRule
+    (evenodd/nonzero), gradient fills url(#g-...) with gradient
+    validation, per-path fillRule/fillOpacity/opacity/stroke/strokeWidth/z
+    checks, open ink paths; mounts paint+ink merged by z with per-path
+    attributes; hitTest honours per-region fill rule in reverse document
+    order; header documents the shared contract.
+  * schemas/regions.schema.json: schema 2 (enum 1/2, fillRule enum, curved
+    d pattern, $defs region with masterShapeId, visibleRegionGeometry).
+  * src/lib/detailed-board.ts: same contract (types + validation + mount +
+    hitTest), plus the two review TS errors fixed (keydown listener typed
+    as Event+cast, drag.anchor DOMPoint|null).
+- Regression gate: scripts/adapter-contract-check.mjs (bun) runs freshly
+  compiled bundles through the ACTUAL shipped adapter;
+  tests/test_game_adapter.py (7 tests) encodes the review's acceptance
+  rules: adapter pass on fresh SVG-master + raster compiles and the lean
+  runtime export; masks non-overlap; label ownership; foreground-covers-
+  background; fidelity survival (stroke/fillOpacity/nonzero/gradient %/
+  z-order); release-gate report fields; recolor-vs-palette semantics.
+  Full suite: 38 passed (31 original + 7 new).
+- next.config.ts: ignoreBuildErrors REMOVED; tsconfig excludes non-app
+  scaffolding (examples/skills/mini-services/...); `bunx tsc --noEmit`
+  clean; `bun run lint` 0 problems.
+- Workspace rebuilt through the live service (studio .env recreated —
+  ai.configured true; service restarted via .zscripts/daemon.py double-fork):
+  treehouse art-9761ab... rebuilt to v0.5.0 (visible geometry) and a
+  preserve-shading recolor verified live (v0.8.0: sky gradient tinted
+  #A9DBEF/#E8E2C4/#FFDCA6 -> #1598CB/#1D9DA6/#1F998D, palette 19 synced,
+  gradient ref preserved). INTEGRATION.md documents the shared contract.
+- Browser verification (agent-browser via the gateway :81 — NOT localhost:3000,
+  which 404s gateway API routes):
+  * Page loads clean: 0 errors, 0 console errors.
+  * Live acceptance probe on the mounted board (isPointInFill per region
+    fill-rule): 54/54 label points owned by exactly their own region, 0
+    violations (was 7/40 wrong hits before).
+  * Play-test golden path: swatch 19 -> real-pointer tap on r-00001 ->
+    "1 / 54 regions filled · 0 incorrect"; completed mask fill='none';
+    PIXEL PROOF via canvas rasterization of the board: tapped point paints
+    [222,225,204] (sky gradient through the removed mask) while an
+    untouched point stays [255,255,255] — the review's "reports success
+    but the point stays white" defect is gone (fill-order independence).
+  * Wrong-palette tap -> toast "That region needs a different palette
+    group." + "1 incorrect attempts" (and the tap correctly targeted
+    r-00008/palette 21, not the region above it).
+  * Recolor UI live (hex input + Preserve shading + "Assign number group"
+    relabeled); tint revision rendered live in the board DOM.
+  * Mobile 390x844: no horizontal overflow (scrollWidth 390), footer pushed
+    naturally on the long page.
+  * dev.log clean for gateway traffic; the few /api 404s came from my own
+    direct-:3000 browsing before switching to :81 (not user-facing).
+- Frontend follow-up (delegated to full-stack subagent, Task ID 7):
+  focusRegion() on VectorBoard, inspectRegion() in use-studio, QA warnings
+  with region ids render as clickable rows that select + zoom to the
+  region, recolor appearance block with color picker + preserve-shading
+  checkbox, "Assign number group" copy split from appearance recolor.
+
+Stage Summary:
+- All four stage-1 release blockers from the review are fixed and
+  regression-gated: (1) one shared versioned contract between the studio
+  renderer, the shipped game adapter, the JSON schema and the export gate,
+  with a bun script that runs fresh compiles through the actual shipped
+  adapter; (2) regions are visible surfaces — every number hits its own
+  region (54/54 live, 0 conflicts) and every region colors correctly when
+  filled first (pixel-level proof); (3) the sanitizer preserves strokes on
+  filled shapes, fill-opacity, per-shape nonzero/evenodd fill rules,
+  percentage gradient coordinates, gradient transforms and drawing order,
+  and rejects unsupported constructs with precise errors; (4) serialization
+  is ElementTree-escaped with generated ids only — attribute-context
+  injection cannot survive (verified).
+- Runtime export is lean and contract-gated (10.08 MB -> 1.73 MB for the
+  552-region bundle); "Set palette" is now "Assign number group" and a
+  separate "Recolor appearance" action changes what the player sees
+  (replace or tint-shading); QA issues with region ids are actionable
+  (select + zoom).
+- Type errors fixed and the build-error bypass removed (tsc + lint clean).
+- Known residual (documented, by design): visible-surface refit leaves a
+  ~1px boundary band (489 px² on the treehouse, reported as
+  partitionTolerance with an explicit warning); vector-authoring tools
+  (node editing, connected-region cuts, layer model) remain stage-2 work.

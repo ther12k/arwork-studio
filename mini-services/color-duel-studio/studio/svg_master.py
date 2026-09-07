@@ -12,6 +12,17 @@ Security policy (upload surface):
   elements are dropped and REPORTED, never silently kept.
 - Event handler attributes (on*), external/url hrefs are stripped.
 - Only a whitelisted element/attribute subset is interpreted.
+- Output is serialized with ElementTree (attribute values are XML-escaped
+  by the serializer) and every emitted id is GENERATED, never copied from
+  the source document — an id like ``x" onload="...`` cannot survive.
+
+Fidelity policy (what the sanitizer must preserve):
+- Per-shape fill-rule (evenodd AND nonzero), fill-opacity, opacity,
+  stroke/stroke-width on FILLED shapes, gradients (percentage or unit
+  coordinates, objectBoundingBox and userSpaceOnUse, gradientTransform)
+  and the original drawing order of shapes vs. ink.
+- Unsupported constructs are rejected with a precise error instead of
+  silently changing the artwork's rendered appearance.
 """
 from __future__ import annotations
 
@@ -76,6 +87,31 @@ def _num(value: str | None, default: float = 0.0) -> float:
     if not math.isfinite(v) or abs(v) > 1e6:
         raise ValueError('SVG coordinate out of supported range.')
     return v
+
+
+def _gcoord(raw: str | None, default: float, units: str, axis_len: float) -> float:
+    """Parse one gradient coordinate, honouring percentage values.
+
+    objectBoundingBox percentages are fractions of 1 ("50%" -> 0.5);
+    userSpaceOnUse percentages are fractions of the viewport axis
+    ("50%" of the viewBox width/height).  Unsupported syntax raises a
+    precise error instead of being silently misparsed.
+    """
+    if raw is None:
+        return default
+    v = str(raw).strip()
+    pct = v.endswith('%')
+    if pct:
+        v = v[:-1].strip()
+    m = re.match(r'^([-+]?(?:\d*\.\d+|\d+\.?)(?:[eE][-+]?\d+)?)$', v)
+    if not m:
+        raise ValueError(f'Unsupported gradient coordinate {raw!r}: use numbers or percentages.')
+    n = float(m.group(1))
+    if not math.isfinite(n) or abs(n) > 1e6:
+        raise ValueError('SVG coordinate out of supported range.')
+    if pct:
+        n = (n / 100.0) if units == 'objectBoundingBox' else (n / 100.0 * axis_len)
+    return n
 
 
 def _parse_color(value: str | None) -> Optional[str]:
@@ -272,6 +308,8 @@ class MasterDoc:
 
 
 def _collect_gradients(root: ET.Element, doc: MasterDoc) -> None:
+    vw, vh = float(doc.view_box[2]), float(doc.view_box[3])
+    diag = math.sqrt((vw * vw + vh * vh) / 2.0)
     for elem in root.iter():
         tag = _local(elem.tag)
         if tag not in ('lineargradient', 'radialgradient'):
@@ -281,6 +319,9 @@ def _collect_gradients(root: ET.Element, doc: MasterDoc) -> None:
         if not gid:
             doc.report['warnings'].append('A gradient without id was dropped.')
             continue
+        units = attrs.get('gradientunits', 'objectBoundingBox').strip()
+        if units not in ('objectBoundingBox', 'userSpaceOnUse'):
+            raise ValueError(f'Gradient {gid}: unsupported gradientUnits {units!r}.')
         stops = []
         for child in elem:
             if _local(child.tag) != 'stop':
@@ -295,21 +336,20 @@ def _collect_gradients(root: ET.Element, doc: MasterDoc) -> None:
             opacity = max(0.0, min(1.0, _num(merged.get('stop-opacity'), 1.0)))
             stops.append({'offset': round(off, 4), 'color': color or '#000000', 'opacity': opacity})
         stops.sort(key=lambda s: s['offset'])
-        units = attrs.get('gradientunits', 'objectBoundingBox')
         gtransform = parse_transform(attrs.get('gradientTransform'))
         entry = {'id': gid, 'type': 'linear' if tag == 'lineargradient' else 'radial',
                  'units': units, 'transform': gtransform, 'stops': stops}
         if tag == 'lineargradient':
-            entry['x1'] = _num(attrs.get('x1'), 0.0)
-            entry['y1'] = _num(attrs.get('y1'), 0.0)
-            entry['x2'] = _num(attrs.get('x2'), 1.0)
-            entry['y2'] = _num(attrs.get('y2'), 0.0)
+            entry['x1'] = _gcoord(attrs.get('x1'), 0.0, units, vw)
+            entry['y1'] = _gcoord(attrs.get('y1'), 0.0, units, vh)
+            entry['x2'] = _gcoord(attrs.get('x2'), 1.0, units, vw)
+            entry['y2'] = _gcoord(attrs.get('y2'), 0.0, units, vh)
         else:
-            entry['cx'] = _num(attrs.get('cx'), 0.5)
-            entry['cy'] = _num(attrs.get('cy'), 0.5)
-            entry['r'] = _num(attrs.get('r'), 0.5)
-            entry['fx'] = _num(attrs.get('fx'), entry['cx'])
-            entry['fy'] = _num(attrs.get('fy'), entry['cy'])
+            entry['cx'] = _gcoord(attrs.get('cx'), 0.5, units, vw)
+            entry['cy'] = _gcoord(attrs.get('cy'), 0.5, units, vh)
+            entry['r'] = _gcoord(attrs.get('r'), 0.5, units, diag)
+            entry['fx'] = _gcoord(attrs.get('fx'), entry['cx'], units, vw)
+            entry['fy'] = _gcoord(attrs.get('fy'), entry['cy'], units, vh)
         if not stops:
             doc.report['warnings'].append(f'Gradient {gid} has no stops and was dropped.')
             continue
@@ -364,6 +404,52 @@ def _shapely_poly(rings) -> Polygon:
         return poly
     except Exception:
         return Polygon(outer)
+
+
+def shape_solids(rings, fill_rule: str):
+    """Solid polygon(s) of flattened rings under the shape's fill rule.
+
+    Used for area, coverage and label decisions; evenodd nests by parity,
+    nonzero by cumulative ring orientation (a same-winding nested subpath
+    is a union, not a hole, exactly like SVG's nonzero rule).
+    """
+    from .curves import solid_polygons
+    try:
+        return solid_polygons(rings, 'nonzero' if fill_rule == 'nonzero' else 'evenodd')
+    except Exception:
+        return [_shapely_poly(rings)]
+
+
+def _safe_gid(order: int, ref: str) -> str:
+    """Generated, charset-safe internal gradient id (never source text)."""
+    cleaned = re.sub(r'[^a-zA-Z0-9_-]', '-', ref or 'grad')[:48].strip('-') or 'grad'
+    return f'g-{order:04d}-{cleaned}'
+
+
+def _solid_union(solids) -> Polygon:
+    """Union of rule-aware solid polygons, tolerant of bad inputs."""
+    from shapely import make_valid
+    cleaned = []
+    for g in solids:
+        if g is None or g.is_empty:
+            continue
+        if not g.is_valid:
+            g = make_valid(g)
+        if g.geom_type == 'Polygon':
+            if g.area > 0:
+                cleaned.append(g)
+        elif g.geom_type in ('MultiPolygon', 'GeometryCollection'):
+            for child in g.geoms:
+                if child.geom_type == 'Polygon' and child.area > 0:
+                    cleaned.append(child)
+    if not cleaned:
+        return Polygon()
+    if len(cleaned) == 1:
+        return cleaned[0]
+    try:
+        return unary_union(cleaned)
+    except Exception:
+        return cleaned[0]
 
 
 def import_master(text: str) -> MasterDoc:
@@ -473,7 +559,8 @@ def import_master(text: str) -> MasterDoc:
             return
         if sum(len(s['commands']) for s in doc.shapes) + sum(len(s['commands']) for s in doc.ink_shapes) + len(cmds) > _MAX_COMMANDS:
             raise ValueError('SVG master is too complex (command budget exceeded).')
-        shape_id = sattrs.get('id') or f's{ordn:03d}'
+        shape_id = f's{ordn:04d}'          # generated: never emitted from source text
+        source_id = sattrs.get('id')        # kept for reports only
         role = sattrs.get('data-cd-role') or None
         if role not in (None, 'gameplay', 'shading', 'ink'):
             role = None
@@ -484,7 +571,9 @@ def import_master(text: str) -> MasterDoc:
         fillable = sctx.fill is not None or fill_ref is not None
         stroke_only = (not fillable) and sctx.stroke is not None
         base = {
-            'order': ordn, 'id': shape_id, 'role': role, 'element': tag,
+            'order': ordn, 'id': shape_id, 'sourceId': source_id,
+            'kind': 'ink' if (stroke_only or role == 'ink') else 'shape',
+            'role': role, 'element': tag,
             'commands': cmds, 'd': format_path(cmds),
             'fillRule': 'evenodd' if sctx.fill_rule == 'evenodd' else 'nonzero',
             'bbox': bbox, 'rings': flat, 'opacity': round(sctx.opacity, 4),
@@ -500,7 +589,10 @@ def import_master(text: str) -> MasterDoc:
             else:
                 doc.report['warnings'].append(f'Shape {shape_id} has no fill and no stroke; skipped.')
             return
-        poly = _shapely_poly(flat)
+        solids = shape_solids(flat, base['fillRule'])
+        poly = _solid_union(solids)
+        if poly.is_empty:
+            poly = _shapely_poly(flat)
         area = float(poly.area) if not poly.is_empty else evenodd_area(flat)
         fill = sctx.fill or '#000000'
         if fill_ref:
@@ -530,7 +622,7 @@ def import_master(text: str) -> MasterDoc:
             continue
         resolved = _resolve_gradient(entry, shape['bbox'])
         shape['gradient'] = {
-            'id': f"g-{shape['order']}-{ref}",
+            'id': _safe_gid(shape['order'], ref),
             'ref': ref,
             **resolved,
         }
@@ -542,20 +634,22 @@ def import_master(text: str) -> MasterDoc:
         else:
             shape['fill'] = '#808080'
 
-    # hidden-shape exclusion: fully covered by opaque shapes ABOVE (z-order)
+    # hidden-shape exclusion: fully covered by opaque shapes ABOVE (z-order).
+    # Solid area honours the shape's own fill rule (nonzero unions count).
     opaque = [s for s in doc.shapes
-              if (s.get('fill') or s.get('gradientRef')) and s.get('fillOpacity', 1.0) >= 0.999]
+              if (s.get('fill') or s.get('gradientRef')) and s.get('fillOpacity', 1.0) * s.get('opacity', 1.0) >= 0.999]
     for idx, shape in enumerate(doc.shapes):
-        if shape.get('fillOpacity', 1.0) < 0.999 or not shape.get('fill') and not shape.get('gradientRef'):
+        if shape.get('fillOpacity', 1.0) * shape.get('opacity', 1.0) < 0.999 or not shape.get('fill') and not shape.get('gradientRef'):
             continue
-        own = _shapely_poly(shape['rings'])
+        solids = shape_solids(shape['rings'], shape['fillRule'])
+        own = _solid_union(solids)
         if own.is_empty or own.area <= 0:
             continue
         covers = [s for s in opaque if s['order'] > shape['order'] and s is not shape]
         if not covers:
             continue
         try:
-            above = unary_union([_shapely_poly(s['rings']) for s in covers])
+            above = unary_union([_solid_union(shape_solids(s['rings'], s['fillRule'])) for s in covers])
             visible = own.difference(above)
             ratio = 0.0 if visible.is_empty else visible.area / max(own.area, 1e-9)
             if ratio < 0.02:
@@ -570,47 +664,69 @@ def import_master(text: str) -> MasterDoc:
 
 
 def emit_master_svg(doc: MasterDoc) -> str:
-    """Serialize the sanitized master as standalone SVG (preview-safe)."""
+    """Serialize the sanitized master as standalone SVG (preview-safe).
+
+    Safety + fidelity contract:
+    - Built as an ElementTree and serialized by ET, so every attribute
+      value is XML-escaped properly (attribute-context injection such as
+      an id breaking out into an onload handler is structurally impossible).
+    - Every emitted id is GENERATED (s0001 / g-0001-...); source ids are
+      never copied into the output.
+    - Original drawing order is preserved: filled shapes and ink are
+      interleaved in one ordered stream (ink is not hoisted above fills).
+    - Filled shapes keep their stroke, fill-rule, fill-opacity and opacity.
+    """
     x, y, w, h = doc.view_box
-    parts = [f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="{fmt_num(x)} {fmt_num(y)} {fmt_num(w)} {fmt_num(h)}" '
-             f'width="{fmt_num(w)}" height="{fmt_num(h)}">']
+    root = ET.Element('svg', {
+        'xmlns': 'http://www.w3.org/2000/svg',
+        'viewBox': f'{fmt_num(x)} {fmt_num(y)} {fmt_num(w)} {fmt_num(h)}',
+        'width': fmt_num(w), 'height': fmt_num(h),
+    })
     grads = [s['gradient'] for s in doc.shapes if s.get('gradient')]
     if grads:
-        parts.append('<defs>')
+        defs = ET.SubElement(root, 'defs')
         for g in grads:
-            stops = ''.join(
-                f'<stop offset="{fmt_num(s["offset"], 4)}" stop-color="{s["color"]}"'
-                + (f' stop-opacity="{fmt_num(s["opacity"], 3)}"' if s.get('opacity', 1) != 1 else '')
-                + '/>' for s in g['stops'])
             if g['type'] == 'linear':
-                parts.append(f'<linearGradient id="{g["id"]}" gradientUnits="userSpaceOnUse" '
-                             f'x1="{fmt_num(g["x1"])}" y1="{fmt_num(g["y1"])}" '
-                             f'x2="{fmt_num(g["x2"])}" y2="{fmt_num(g["y2"])}">{stops}</linearGradient>')
+                node = ET.SubElement(defs, 'linearGradient', {
+                    'id': g['id'], 'gradientUnits': 'userSpaceOnUse',
+                    'x1': fmt_num(g['x1']), 'y1': fmt_num(g['y1']),
+                    'x2': fmt_num(g['x2']), 'y2': fmt_num(g['y2'])})
             else:
-                parts.append(f'<radialGradient id="{g["id"]}" gradientUnits="userSpaceOnUse" '
-                             f'cx="{fmt_num(g["cx"])}" cy="{fmt_num(g["cy"])}" r="{fmt_num(g["r"])}" '
-                             f'fx="{fmt_num(g["fx"])}" fy="{fmt_num(g["fy"])}">{stops}</radialGradient>')
-        parts.append('</defs>')
-    for s in doc.shapes:
+                node = ET.SubElement(defs, 'radialGradient', {
+                    'id': g['id'], 'gradientUnits': 'userSpaceOnUse',
+                    'cx': fmt_num(g['cx']), 'cy': fmt_num(g['cy']), 'r': fmt_num(g['r']),
+                    'fx': fmt_num(g['fx']), 'fy': fmt_num(g['fy'])})
+            for s in g['stops']:
+                stop = {'offset': fmt_num(s['offset'], 4), 'stop-color': s['color']}
+                if s.get('opacity', 1) != 1:
+                    stop['stop-opacity'] = fmt_num(s['opacity'], 3)
+                ET.SubElement(node, 'stop', stop)
+    # One ordered stream: shapes and ink interleaved by document order.
+    for s in sorted(doc.shapes + doc.ink_shapes, key=lambda t: t['order']):
         if s.get('hidden'):
+            continue
+        if s.get('kind') == 'ink':
+            ET.SubElement(root, 'path', {
+                'id': s['id'], 'fill': 'none',
+                'stroke': s.get('stroke') or '#29383E',
+                'stroke-width': fmt_num(s.get('strokeWidth', 1.5)),
+                'stroke-linecap': 'round', 'stroke-linejoin': 'round',
+                'd': s['d']})
             continue
         fill = s.get('fill') or '#000000'
         if s.get('gradient'):
             fill = f'url(#{s["gradient"]["id"]})'
-        opacity = s.get('fillOpacity', 1.0)
-        attrs = f'fill="{fill}" fill-rule="{s["fillRule"]}"'
-        if opacity < 0.999:
-            attrs += f' fill-opacity="{fmt_num(opacity, 3)}"'
+        attrs = {'id': s['id'], 'fill': fill, 'fill-rule': s['fillRule'], 'd': s['d']}
+        if s.get('fillOpacity', 1.0) < 0.999:
+            attrs['fill-opacity'] = fmt_num(s['fillOpacity'], 3)
         if s.get('opacity', 1.0) < 0.999:
-            attrs += f' opacity="{fmt_num(s["opacity"], 3)}"'
-        parts.append(f'<path id="{s["id"]}" {attrs} d="{s["d"]}"/>')
-    for s in doc.ink_shapes:
-        stroke = s.get('stroke') or '#29383E'
-        parts.append(f'<path id="{s["id"]}" fill="none" stroke="{stroke}" '
-                     f'stroke-width="{fmt_num(s.get("strokeWidth", 1.5))}" '
-                     f'stroke-linecap="round" d="{s["d"]}"/>')
-    parts.append('</svg>')
-    return ''.join(parts)
+            attrs['opacity'] = fmt_num(s['opacity'], 3)
+        if s.get('stroke') and s.get('strokeWidth', 0) > 0:
+            attrs['stroke'] = s['stroke']
+            attrs['stroke-width'] = fmt_num(s['strokeWidth'])
+            attrs['stroke-linejoin'] = 'round'
+        ET.SubElement(root, 'path', attrs)
+    return ET.tostring(root, encoding='unicode')
 
 
 def clean_svg(data: bytes, destination: Path) -> dict:

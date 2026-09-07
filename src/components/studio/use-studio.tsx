@@ -120,7 +120,7 @@ export interface StudioApi {
   // actions
   openProjectById: (pid: string) => Promise<void>;
   createNewProject: () => Promise<void>;
-  saveBrief: () => Promise<void>;
+  saveBrief: () => Promise<Project>;
   uploadFile: (file: File, role: "reference" | "master") => Promise<void>;
   uploadSvgFile: (file: File) => Promise<void>;
   promoteReference: () => Promise<void>;
@@ -133,6 +133,8 @@ export interface StudioApi {
   runEdit: (action: EditAction, extra?: Partial<EditPayload>) => Promise<void>;
   clearSelection: () => void;
   startPlacing: () => void;
+  /** Select a single region by id, switch to the board view and zoom to it (QA drill-down). */
+  inspectRegion: (id: string) => void;
   activateSelectedRevision: () => Promise<void>;
   submitReviewNote: (note: string) => Promise<void>;
   switchView: (next: StudioView) => void;
@@ -714,6 +716,36 @@ export function StudioProvider({ children }: { children: React.ReactNode }) {
     toast("Tap a roomy point inside the selected region.");
   }, []);
 
+  /** QA drill-down: make `id` the ONLY selected region, show the interactive
+   *  board and zoom/focus it. Follows the same selection pattern as the paint
+   *  wrapper (selectedRef + setSelected + highlightSelection + inspector inputs). */
+  const inspectRegion = useCallback(
+    (id: string) => {
+      const board = boardRef.current;
+      if (!board || !board.regions.has(id)) {
+        toast("That region is not on the mounted board — open a board view first.");
+        return;
+      }
+      if (viewRef.current !== "inspect") {
+        viewRef.current = "inspect";
+        setView("inspect");
+      }
+      const next = new Set([id]);
+      selectedRef.current = next;
+      setSelected(next);
+      placingRef.current = false;
+      setPlacing(false);
+      const reg = board.regions.get(id);
+      if (reg) {
+        setEditPalette(String(reg.paletteId));
+        setObjectGroup(!reg.objectId || reg.objectId === "unassigned" ? "roof" : reg.objectId);
+      }
+      board.focusRegion(id);
+      highlightSelection();
+    },
+    [highlightSelection]
+  );
+
   const activateSelectedRevision = useCallback(async () => {
     const p = projectRef.current;
     if (!p) throw new Error("Create a project first.");
@@ -825,6 +857,7 @@ export function StudioProvider({ children }: { children: React.ReactNode }) {
     runEdit,
     clearSelection,
     startPlacing,
+    inspectRegion,
     activateSelectedRevision,
     submitReviewNote,
     switchView,

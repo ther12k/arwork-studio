@@ -53,7 +53,8 @@ export interface RegionEntry {
   paletteId: number;
   objectId?: string;
   d: string;
-  fillRule: "evenodd";
+  fillRule: "evenodd" | "nonzero";
+  masterShapeId?: string;
   rings: number[][][];
   bbox: number[];
   area: number;
@@ -72,7 +73,7 @@ export interface Geometry {
   artworkId: string;
   artworkVersion: string;
   viewBox: number[];
-  fillRule: "evenodd";
+  fillRule: "evenodd" | "nonzero";
   stroke: string;
   strokeWidth: number;
   regions: RegionEntry[];
@@ -85,6 +86,12 @@ export interface PaintPath {
   d: string;
   strokeWidth?: number; // present on stroked ink paths (open line art)
   filled?: boolean; // false = stroke-rendered ink, not a closed fill
+  fillRule?: "evenodd" | "nonzero"; // source fill rule (schema 2)
+  fillOpacity?: number; // 0..1, preserved from the source SVG
+  opacity?: number; // 0..1, preserved from the source SVG
+  stroke?: string; // outline color on FILLED shapes (preserved)
+  z?: number; // document order: paint + ink render merged by z
+  shapeId?: string; // link to the sanitized master shape (authoring)
 }
 
 export interface PaintGradientStop {
@@ -175,7 +182,8 @@ export function validateBundle(bundle: Bundle): Bundle {
   for (const r of [...g.regions, ...(g.decorations ?? [])]) {
     if (ids.has(r.id) || !/^[a-zA-Z0-9_-]+$/.test(r.id)) throw new Error("Duplicate or unsafe region ID");
     ids.add(r.id);
-    if (!paletteIds.has(r.paletteId) || r.fillRule !== "evenodd" || !SAFE_PATH.test(r.d))
+    const rule = r.fillRule ?? "evenodd";
+    if (!paletteIds.has(r.paletteId) || !["evenodd", "nonzero"].includes(rule) || !SAFE_PATH.test(r.d))
       throw new Error("Invalid region geometry or palette");
   }
   if (m.format === "color-duel-detailed-vector-1") {
@@ -187,6 +195,12 @@ export function validateBundle(bundle: Bundle): Bundle {
       const okFill = SAFE_HEX.test(path.fill) ||
         (SAFE_GRADIENT_REF.test(path.fill) && gradientIds.has(path.fill.slice(5, -1)));
       if (!okFill || !SAFE_PATH.test(path.d)) throw new Error("Invalid paint path");
+      if (path.fillRule !== undefined && !["evenodd", "nonzero"].includes(path.fillRule))
+        throw new Error("Invalid paint fill rule");
+      for (const key of ["opacity", "fillOpacity", "strokeWidth", "z"] as const) {
+        const v = path[key];
+        if (v !== undefined && !Number.isFinite(v)) throw new Error(`Invalid paint ${key}`);
+      }
     }
     // Ink layer holds closed filled shapes OR open stroke line art.
     for (const path of paint.inkPaths) {
@@ -286,7 +300,7 @@ export class VectorBoard {
   private base: number[];
   private view: number[];
   private detailed: boolean;
-  private drag: { x: number; y: number; view: number[]; inverse: DOMMatrix; anchor: DOMPoint; moved: boolean } | null = null;
+  private drag: { x: number; y: number; view: number[]; inverse: DOMMatrix; anchor: DOMPoint | null; moved: boolean } | null = null;
   private pinch: { distance: number; view: number[]; inverse: DOMMatrix; anchor: DOMPoint | null } | null = null;
   private suppressTap = false;
   /** Set by the wrapper (clientToArt override) — last art-space point of a tap. */
@@ -401,17 +415,30 @@ export class VectorBoard {
     this.svg.append(defs);
     const g = this.bundle.geometry;
     if (this.detailed && this.bundle.paint) {
+      // Appearance layer below the masks: filled paths in ORIGINAL drawing
+      // order (z), honouring per-path fill rule, fill-opacity/opacity and
+      // strokes on filled shapes. Stroke-only ink renders in the ink layer
+      // above the masks so the linework stays visible during play.
       const art = svgNode("g", { "data-layer": "vector-paint", "pointer-events": "none" });
-      for (const p of this.bundle.paint.paths) {
+      const entries = [...this.bundle.paint.paths, ...this.bundle.paint.inkPaths].sort(
+        (a, b) => (a.z ?? Infinity) - (b.z ?? Infinity)
+      );
+      for (const p of entries) {
+        if (p.filled === false || (p.strokeWidth != null && !p.fill.startsWith("#"))) continue;
         const gradientFill = p.fill.startsWith("url(#");
-        art.append(
-          svgNode("path", {
-            d: p.d,
-            fill: p.fill,
-            ...(gradientFill ? {} : { stroke: p.fill, "stroke-width": 0.55, "stroke-linejoin": "round" }),
-            "fill-rule": "evenodd",
-          })
-        );
+        const attrs: Attrs = { d: p.d, fill: p.fill, "fill-rule": p.fillRule ?? "evenodd" };
+        if (!gradientFill) {
+          attrs.stroke = p.stroke ?? p.fill;
+          attrs["stroke-width"] = p.strokeWidth ?? 0.55;
+          attrs["stroke-linejoin"] = "round";
+        }
+        if (p.fillOpacity != null && p.fillOpacity < 0.999) attrs["fill-opacity"] = p.fillOpacity;
+        if (p.opacity != null && p.opacity < 0.999) attrs.opacity = p.opacity;
+        if (p.stroke && p.strokeWidth && p.strokeWidth > 0 && !gradientFill) {
+          attrs.stroke = p.stroke;
+          attrs["stroke-width"] = p.strokeWidth;
+        }
+        art.append(svgNode("path", attrs));
       }
       this.svg.append(art);
     }
@@ -419,7 +446,6 @@ export class VectorBoard {
       stroke: g.stroke,
       "stroke-width": g.strokeWidth,
       "stroke-linejoin": "round",
-      "fill-rule": "evenodd",
     });
     this.elements.clear();
     this.labels.clear();
@@ -431,6 +457,7 @@ export class VectorBoard {
         d: r.d,
         tabindex: 0,
         role: "button",
+        "fill-rule": r.fillRule ?? "evenodd",
         "aria-label": `Region ${r.id}, palette ${this.mode === "memory" ? "hidden" : r.paletteId}`,
       }) as SVGPathElement;
       this.elements.set(r.id, node);
@@ -455,7 +482,10 @@ export class VectorBoard {
             "stroke-linecap": "round", "stroke-linejoin": "round",
           }));
         } else {
-          ink.append(svgNode("path", { d: p.d, fill: p.fill, "fill-rule": "evenodd" }));
+          const attrs: Attrs = { d: p.d, fill: p.fill, "fill-rule": p.fillRule ?? "evenodd" };
+          if (p.opacity != null && p.opacity < 0.999) attrs.opacity = p.opacity;
+          if (p.fillOpacity != null && p.fillOpacity < 0.999) attrs["fill-opacity"] = p.fillOpacity;
+          ink.append(svgNode("path", attrs));
         }
       }
       this.svg.append(ink);
@@ -479,7 +509,8 @@ export class VectorBoard {
       this.labels.set(r.id, label);
     }
     this.svg.append(labels);
-    this.listen(this.svg, "keydown", (e: KeyboardEvent) => {
+    this.listen(this.svg, "keydown", (event: Event) => {
+      const e = event as KeyboardEvent;
       const id = (e.target as Element | null)?.getAttribute?.("data-region-id");
       if (id && (e.key === "Enter" || e.key === " ")) {
         e.preventDefault();
@@ -602,11 +633,13 @@ export class VectorBoard {
   }
 
   private hitTest(x: number, y: number): string | null {
-    // Iterate in reverse document order: the topmost region wins, which
-    // matches how stacked SVG-master masks resolve overlaps (z-order).
+    // Iterate in reverse document order: the topmost region wins. Regions
+    // are visible surfaces (non-overlapping masks), so this only matters at
+    // shared boundaries; per-region fill rules are honoured.
     for (const [id, r] of [...this.regions].reverse()) {
       const b = r.bbox;
-      if (x >= b[0] && x <= b[2] && y >= b[1] && y <= b[3] && this.ctx!.isPointInPath(this.paths.get(id)!, x, y, "evenodd"))
+      const rule = r.fillRule ?? "evenodd";
+      if (x >= b[0] && x <= b[2] && y >= b[1] && y <= b[3] && this.ctx!.isPointInPath(this.paths.get(id)!, x, y, rule))
         return id;
     }
     return null;
@@ -647,6 +680,31 @@ export class VectorBoard {
     this.applyView([r.label.x - w / 2, r.label.y - (w * this.base[3]) / this.base[2] / 2, w, (w * this.base[3]) / this.base[2]]);
     this.elements.get(r.id)?.focus({ preventScroll: true });
     return r.id;
+  }
+
+  /**
+   * Center the viewport on a specific region and focus its path element —
+   * used by the QA panel drill-down ("select region & zoom to it").
+   * Unlike nextRegion() this ignores mode/preview and completion state.
+   */
+  focusRegion(id: string): string | null {
+    const r = this.regions.get(id);
+    if (!r) return null;
+    const w = Math.max(
+      this.base[2] / 10,
+      Math.min(
+        this.base[2],
+        Math.max(r.bbox[2] - r.bbox[0], (r.bbox[3] - r.bbox[1]) * (this.base[2] / this.base[3])) * 1.8
+      )
+    );
+    this.applyView([
+      r.label.x - w / 2,
+      r.label.y - (w * this.base[3]) / this.base[2] / 2,
+      w,
+      (w * this.base[3]) / this.base[2],
+    ]);
+    this.elements.get(id)?.focus({ preventScroll: true });
+    return id;
   }
 
   private bindGestures() {

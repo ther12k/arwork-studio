@@ -2,10 +2,8 @@ import type { NextConfig } from "next";
 
 const nextConfig: NextConfig = {
   output: "standalone",
-  /* config options here */
-  typescript: {
-    ignoreBuildErrors: true,
-  },
+  // Type errors must fail the build: a working preview never substitutes
+  // for type checks (review finding). Keep this OFF.
   reactStrictMode: false,
 };
 

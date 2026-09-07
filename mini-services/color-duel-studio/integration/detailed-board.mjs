@@ -1,6 +1,18 @@
 /** Dependency-free region renderer. Copyright/provenance: see docs/PROVENANCE.md.
  * Consume our trusted, validated JSON; do NOT inject arbitrary uploaded SVG markup.
  * The demo is an offline solo asset tester, not an authoritative multiplayer server.
+ *
+ * SHARED FORMAT CONTRACT (detailed-vector schema 2) — this validator and the
+ * studio's src/lib/detailed-board.ts accept the same field set, and the studio's
+ * export pipeline (pipeline.validate_runtime_contract) mirrors these rules:
+ *  - geometry.geometrySchema 1 (legacy polygons) or 2 (curved masters)
+ *  - regions[*].d uses M/L/C/Q/Z path commands (curves preserved)
+ *  - regions[*].fillRule is 'evenodd' (default) or 'nonzero' (source rule kept)
+ *  - paint.paths[*] fill is #RRGGBB or url(#g-...) referencing paint.gradients
+ *  - paint paths carry optional fillRule/fillOpacity/opacity/stroke/strokeWidth/z
+ *  - paint.inkPaths may be OPEN paths (stroke line art) when strokeWidth/filled=false
+ *  - Regions are VISIBLE SURFACES: masks do not overlap, so any fill order
+ *    colors correctly (fill-order independence).
  */
 const NS = 'http://www.w3.org/2000/svg';
 let sequence = 0;
@@ -11,8 +23,15 @@ function svgNode(tag, attrs = {}) {
   return el;
 }
 
+const SAFE_PATH = /^M[\s\d.,eE+\-MLQCZ]+Z$/;
+const SAFE_PATH_OPEN = /^M[\s\d.,eE+\-MLQCZ]+$/;
+const SAFE_HEX = /^#[0-9A-Fa-f]{6}$/;
+const SAFE_GRADIENT_REF = /^url\(#g-[a-zA-Z0-9_-]+\)$/;
+const SAFE_GRADIENT_ID = /^g-[a-zA-Z0-9_-]+$/;
+const finite = (v) => Number.isFinite(v);
+
 export function validateBundle(bundle) {
-  const {manifest:m, geometry:g, palette:p} = bundle || {};
+  const {manifest: m, geometry: g, palette: p} = bundle || {};
   if (!m || !g || !Array.isArray(p) || !['color-duel-vector-1','color-duel-detailed-vector-1'].includes(m.format)) throw new Error('Unsupported artwork bundle');
   if (m.id !== g.artworkId || m.version !== g.artworkVersion || m.regionCount !== g.regions?.length) throw new Error('Artwork identity/count mismatch');
   if (!Array.isArray(g.viewBox) || g.viewBox.length !== 4 || g.viewBox.some(x => !Number.isFinite(x)) || g.viewBox[2] <= 0 || g.viewBox[3] <= 0) throw new Error('Invalid viewBox');
@@ -22,13 +41,35 @@ export function validateBundle(bundle) {
   for (const r of [...g.regions, ...g.decorations]) {
     if (ids.has(r.id) || !/^[a-zA-Z0-9_-]+$/.test(r.id)) throw new Error('Duplicate or unsafe region ID');
     ids.add(r.id);
-    if (!paletteIds.has(r.paletteId) || r.fillRule !== 'evenodd' || !/^M[\s\d.,eE+\-MLZ]+Z$/.test(r.d)) throw new Error('Invalid region geometry or palette');
+    const rule = r.fillRule === undefined ? 'evenodd' : r.fillRule;
+    if (!paletteIds.has(r.paletteId) || !['evenodd','nonzero'].includes(rule) || !SAFE_PATH.test(r.d)) throw new Error('Invalid region geometry or palette');
   }
   if (m.format === 'color-duel-detailed-vector-1') {
     const paint = bundle.paint;
     if (!paint || paint.artworkId !== m.id || !Array.isArray(paint.paths) || !Array.isArray(paint.inkPaths)) throw new Error('Missing detailed vector paint');
-    for (const p of [...paint.paths,...paint.inkPaths]) {
-      if (!/^#[0-9A-Fa-f]{6}$/.test(p.fill) || !/^M[\s\d.,eE+\-MLZ]+Z$/.test(p.d)) throw new Error('Invalid paint path');
+    const gradientIds = new Set((paint.gradients ?? []).map(x => x.id));
+    for (const gr of paint.gradients ?? []) {
+      if (!SAFE_GRADIENT_ID.test(gr.id) || !['linear','radial'].includes(gr.type) || !Array.isArray(gr.stops) || !gr.stops.length) throw new Error('Invalid gradient definition');
+      for (const s of gr.stops) if (!SAFE_HEX.test(s.color) || !finite(s.offset)) throw new Error('Invalid gradient stop');
+    }
+    for (const path of paint.paths) {
+      const fill = path.fill;
+      const okFill = SAFE_HEX.test(fill) || (SAFE_GRADIENT_REF.test(fill) && gradientIds.has(fill.slice(5, -1)));
+      if (!okFill || !SAFE_PATH.test(path.d)) throw new Error('Invalid paint path');
+      if (path.fillRule !== undefined && !['evenodd','nonzero'].includes(path.fillRule)) throw new Error('Invalid paint fill rule');
+      for (const key of ['opacity','fillOpacity','strokeWidth','z']) {
+        const v = path[key];
+        if (v !== undefined && !finite(v)) throw new Error(`Invalid paint ${key}`);
+      }
+      if (path.opacity !== undefined && (path.opacity < 0 || path.opacity > 1)) throw new Error('Invalid paint opacity');
+      if (path.fillOpacity !== undefined && (path.fillOpacity < 0 || path.fillOpacity > 1)) throw new Error('Invalid paint fill-opacity');
+    }
+    // Ink layer holds closed filled shapes OR open stroke line art.
+    for (const path of paint.inkPaths) {
+      const fill = path.fill;
+      const okFill = SAFE_HEX.test(fill) || (SAFE_GRADIENT_REF.test(fill) && gradientIds.has(fill.slice(5, -1)));
+      const okPath = path.strokeWidth != null || path.filled === false ? SAFE_PATH_OPEN.test(path.d) : SAFE_PATH.test(path.d);
+      if (!okFill || !okPath) throw new Error('Invalid ink path');
     }
   }
   return bundle;
@@ -106,20 +147,50 @@ export class VectorBoard {
       for (const stop of p.paint.stops) grad.append(svgNode('stop',{offset:stop.offset,'stop-color':stop.color}));
       defs.append(grad);
     }
+    if (this.bundle.paint?.gradients) {
+      for (const g of this.bundle.paint.gradients) {
+        const attrs = g.type === 'linear'
+          ? {id: g.id, gradientUnits: 'userSpaceOnUse', x1: g.x1, y1: g.y1, x2: g.x2, y2: g.y2}
+          : {id: g.id, gradientUnits: 'userSpaceOnUse', cx: g.cx, cy: g.cy, r: g.r, fx: g.fx, fy: g.fy};
+        const node = svgNode(g.type === 'linear' ? 'linearGradient' : 'radialGradient', attrs);
+        for (const stop of g.stops) {
+          const stopAttrs = {offset: stop.offset, 'stop-color': stop.color};
+          if (stop.opacity != null && stop.opacity !== 1) stopAttrs['stop-opacity'] = stop.opacity;
+          node.append(svgNode('stop', stopAttrs));
+        }
+        defs.append(node);
+      }
+    }
     const hatch = svgNode('pattern',{id:this.prefix+'selected',width:12,height:12,patternUnits:'userSpaceOnUse'});
     hatch.append(svgNode('rect',{width:12,height:12,fill:'#EDF1F4'}),svgNode('path',{d:'M0 0H6V6H0Z M6 6H12V12H6Z',fill:'#C3CED4'}));
     defs.append(hatch); this.svg.append(defs);
     const g = this.bundle.geometry;
     this.detailed = this.bundle.manifest.format === 'color-duel-detailed-vector-1';
     if (this.detailed) {
+      // Appearance layer below the masks: filled paths in ORIGINAL drawing
+      // order (z), honouring per-path fill rule, opacity and strokes.
+      // (Stroke ink is rendered above the masks in the ink layer so the
+      // linework stays visible during play; see the numbered.svg preview.)
       const art = svgNode('g',{'data-layer':'vector-paint','pointer-events':'none'});
-      for (const p of this.bundle.paint.paths) art.append(svgNode('path',{d:p.d,fill:p.fill,stroke:p.fill,'stroke-width':.55,'stroke-linejoin':'round','fill-rule':'evenodd'}));
+      for (const p of this.orderedPaint()) {
+        if (p.filled === false || (p.strokeWidth != null && !SAFE_HEX.test(p.fill))) {
+          continue; // stroke-only ink: rendered in the ink layer above masks
+        }
+        const gradientFill = p.fill.startsWith('url(#');
+        const attrs = {d: p.d, fill: p.fill, 'fill-rule': p.fillRule || 'evenodd'};
+        if (!gradientFill) { attrs.stroke = p.stroke || p.fill; attrs['stroke-width'] = p.strokeWidth ?? 0.55; attrs['stroke-linejoin'] = 'round'; }
+        if (p.fillOpacity != null && p.fillOpacity < 0.999) attrs['fill-opacity'] = p.fillOpacity;
+        if (p.opacity != null && p.opacity < 0.999) attrs.opacity = p.opacity;
+        if (p.stroke && p.strokeWidth > 0) { attrs.stroke = p.stroke; attrs['stroke-width'] = p.strokeWidth; attrs['stroke-linejoin'] = 'round'; }
+        art.append(svgNode('path', attrs));
+      }
       this.svg.append(art);
     }
-    const regions = svgNode('g',{'stroke':g.stroke,'stroke-width':g.strokeWidth,'stroke-linejoin':'round','fill-rule':'evenodd'});
+    const regions = svgNode('g',{'stroke':g.stroke,'stroke-width':g.strokeWidth,'stroke-linejoin':'round'});
     this.elements = new Map(); this.labels = new Map();
     for (const r of g.regions) {
       const node = svgNode('path',{id:this.prefix+r.id,'data-region-id':r.id,'data-palette-id':r.paletteId,d:r.d,tabindex:0,role:'button',
+        'fill-rule': r.fillRule || 'evenodd',
         'aria-label':`Region ${r.id}, palette ${this.mode==='memory'?'hidden':r.paletteId}`});
       this.elements.set(r.id,node); regions.append(node);
     }
@@ -132,7 +203,15 @@ export class VectorBoard {
     this.svg.append(details);
     if (this.detailed) {
       const ink = svgNode('g',{'data-layer':'ink','pointer-events':'none'});
-      for (const p of this.bundle.paint.inkPaths) ink.append(svgNode('path',{d:p.d,fill:p.fill,'fill-rule':'evenodd'}));
+      for (const p of this.bundle.paint.inkPaths) {
+        if (p.strokeWidth != null || p.filled === false) {
+          ink.append(svgNode('path',{d:p.d, fill:'none', stroke:p.fill,
+            'stroke-width':p.strokeWidth ?? 1.5, 'stroke-linecap':'round', 'stroke-linejoin':'round'}));
+        } else {
+          ink.append(svgNode('path',{d:p.d, fill:p.fill, 'fill-rule':p.fillRule || 'evenodd',
+            ...(p.opacity != null && p.opacity < 0.999 ? {opacity: p.opacity} : {})}));
+        }
+      }
       this.svg.append(ink);
     }
     const labels = svgNode('g',{'pointer-events':'none','font-family':'Arial,sans-serif',fill:'#33444C','text-anchor':'middle','dominant-baseline':'central'});
@@ -145,6 +224,13 @@ export class VectorBoard {
       const id = e.target.getAttribute?.('data-region-id');
       if (id && (e.key==='Enter' || e.key===' ')) {e.preventDefault();this.paint(id);}
     });
+  }
+  /** Paint + ink entries merged into original drawing order (by z). */
+  orderedPaint() {
+    const paint = this.bundle.paint;
+    if (!paint) return [];
+    const entries = [...(paint.paths ?? []), ...(paint.inkPaths ?? [])];
+    return entries.sort((a, b) => (a.z ?? Infinity) - (b.z ?? Infinity) || 0);
   }
   listen(el,type,fn,options) {el.addEventListener(type,fn,options);this.handlers.push(()=>el.removeEventListener(type,fn,options));}
   state() {
@@ -219,9 +305,12 @@ export class VectorBoard {
   }
   setPreview(value) {this.preview=!!value;this.refresh();}
   hitTest(x,y) {
-    for (const [id,r] of this.regions) {
+    // Iterate in reverse document order (topmost wins). Regions are visible
+    // surfaces and must not overlap; per-region fill rules are honoured.
+    for (const [id,r] of [...this.regions].reverse()) {
       const b=r.bbox;
-      if (x>=b[0] && x<=b[2] && y>=b[1] && y<=b[3] && this.ctx.isPointInPath(this.paths.get(id),x,y,'evenodd')) return id;
+      const rule = r.fillRule || 'evenodd';
+      if (x>=b[0] && x<=b[2] && y>=b[1] && y<=b[3] && this.ctx.isPointInPath(this.paths.get(id),x,y,rule)) return id;
     }
     return null;
   }
@@ -261,7 +350,7 @@ export class VectorBoard {
     this.listen(this.svg,'pointerdown',e=>{
       if (e.pointerType==='mouse' && e.button!==0)return;
       this.pointers.set(e.pointerId,{x:e.clientX,y:e.clientY});
-      this.svg.setPointerCapture(e.pointerId);
+      try { this.svg.setPointerCapture(e.pointerId); } catch { /* synthetic/stale pointer */ }
       if (this.pointers.size===1) {
         this.suppressTap=false;
         const inverse=this.svg.getScreenCTM().inverse();

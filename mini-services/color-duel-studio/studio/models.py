@@ -52,12 +52,15 @@ class PromoteRequest(StrictModel):
 
 class EditRequest(StrictModel):
     base_revision: str
-    action: Literal['merge', 'group', 'palette', 'label', 'decorate', 'split']
+    action: Literal['merge', 'group', 'palette', 'recolor', 'label', 'decorate', 'split']
     region_ids: list[str] = Field(min_length=1, max_length=1600)
     group: str = Field('unassigned', pattern=r'^[a-z][a-z0-9_-]{0,39}$')
     palette_id: int | None = None
     x: float | None = Field(None, allow_inf_nan=False)
     y: float | None = Field(None, allow_inf_nan=False)
+    # 'recolor' (visible appearance, distinct from 'palette' = number group):
+    color: str | None = Field(None, pattern=r'^#[0-9A-Fa-f]{6}$')
+    preserve_shading: bool = Field(False, description='Keep gradient shading (tinted toward the target color) instead of replacing the fill.')
 
 class ReviewRequest(StrictModel):
     revision: str

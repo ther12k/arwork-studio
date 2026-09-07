@@ -35,15 +35,22 @@ from shapely.ops import unary_union, polylabel
 
 from .curves import (
     Command, evenodd_area, fit_polyline, fit_ring, flatten_path, format_path,
-    fmt_num, parse_path, point_in_rings, reverse_commands, rings_bbox,
-    snap_ring, subpaths_of, flatten_subpath,
+    fmt_num, parse_path, point_in_rings, point_in_rings_rule, reverse_commands,
+    rings_bbox, snap_ring, solid_polygons, subpaths_of, flatten_subpath,
 )
 from .models import BuildSettings
 
 SCHEMA = 'color-duel-detailed-vector-1'
 INK = '#29383E'
-GEOMETRY_SCHEMA = 2            # 2 = curved masters authoritative
+GEOMETRY_SCHEMA = 2            # 2 = curved masters authoritative + visible-region geometry
 FLATTEN_TOLERANCE = 0.25       # px, documented derived-approximation tolerance
+import re as _re
+SAFE_D = _re.compile(r'^M[\s\d.,eE+\-MLQCZ]+Z$')
+SAFE_D_OPEN = _re.compile(r'^M[\s\d.,eE+\-MLQCZ]+$')
+SAFE_HEX = _re.compile(r'^#[0-9A-Fa-f]{6}$')
+SAFE_GRAD_REF = _re.compile(r'^url\(#g-[a-zA-Z0-9_-]+\)$')
+SAFE_ID = _re.compile(r'^[a-zA-Z0-9_-]+$')
+RUNTIME_REGION_KEYS = ('id', 'paletteId', 'objectId', 'd', 'fillRule', 'bbox', 'area', 'label')
 BACKENDS = [
     {'id': 'spline-local', 'name': 'Local spline tracing (curves)', 'kind': 'raster-to-vector',
      'paid': False, 'available': True,
@@ -126,9 +133,26 @@ def path_of(rings: list) -> str:
     return ' '.join(paths)
 
 
+def rule_area(rings, rule: str = 'evenodd') -> float:
+    """Filled area of flattened rings under the given fill rule.
+
+    Nonzero nesting: same-winding nested subpaths are already inside their
+    parent, so the area is the UNION of the solids (not their sum).
+    """
+    if rule == 'evenodd':
+        return evenodd_area(rings) if rings else 0.0
+    solids = solid_polygons(rings, rule) if rings else []
+    if not solids:
+        return 0.0
+    if len(solids) == 1:
+        return float(solids[0].area)
+    return float(_safe_union(solids).area)
+
+
 def region_polygon(r):
     rings = r.get('flat', {}).get('rings') or r.get('rings') or []
-    solids = solid_polygons(rings)
+    rule = r.get('fillRule', 'evenodd')
+    solids = solid_polygons(rings, rule)
     if not solids:
         return Polygon()
     if len(solids) == 1:
@@ -155,47 +179,15 @@ def _safe_union(geoms):
         return unary_union([g for g in cleaned if not g.is_empty]) or Polygon()
 
 
-def solid_polygons(rings):
-    """Convert even-odd rings into valid polygon(s) with proper nesting.
+def solid_polygons(rings, rule='evenodd'):
+    """Deprecated local shim -> curves.solid_polygons (fill-rule aware).
 
-    Ring order is not trusted: containment depth decides solid vs hole
-    (even depth = solid, odd = hole), so flattened master rings can appear
-    in any subpath order. Self-touching rings are split via make_valid.
+    evenodd: containment depth decides solid vs hole.
+    nonzero: cumulative ring orientation decides (same-winding nested
+    subpaths union, opposite-winding subtract), exactly like SVG.
     """
-    parts = []
-    for ring in rings:
-        if ring is None or len(ring) < 3:
-            continue
-        p = Polygon(ring)
-        if not p.is_valid:
-            p = make_valid(p)
-        for poly in polygon_parts(p):
-            parts.append(poly)
-    if not parts:
-        return []
-    # Nesting tests use each part's own boundary vertex: an interior
-    # representative point of the outer ring can fall inside its hole and
-    # invert the even-odd parity.
-    reps = [Point(p.exterior.coords[0]) for p in parts]
-    depth = [sum(1 for j, q in enumerate(parts) if j != i and q.contains(reps[i]))
-             for i in range(len(parts))]
-    parent = []
-    for j in range(len(parts)):
-        candidates = [i for i in range(len(parts)) if i != j and parts[i].contains(reps[j])]
-        parent.append(min(candidates, key=lambda i: parts[i].area) if candidates else None)
-    solids = []
-    for i, p in enumerate(parts):
-        if depth[i] % 2 == 0:
-            holes = [parts[j].exterior for j in range(len(parts))
-                     if parent[j] == i and depth[j] % 2 == 1]
-            solid = Polygon(p.exterior, holes) if holes else Polygon(p.exterior)
-            if not solid.is_valid:
-                # crossing subpath rings: normalize into valid pieces
-                solid = make_valid(solid)
-            for piece in polygon_parts(solid):
-                if piece.area > 1e-9:
-                    solids.append(piece)
-    return solids
+    from .curves import solid_polygons as _solid
+    return _solid(rings, rule)
 
 
 def region_master_commands(r) -> List[Command]:
@@ -236,13 +228,16 @@ def _corner_cos(angle_deg: float) -> float:
 def pack_region(geometry, rid: str, pid: int, object_id: str = 'unassigned',
                 label: dict | None = None, source: str = 'boundary-chain-fit',
                 fit_tolerance: float = 1.0, legacy_rings: list | None = None,
-                fit: bool = True) -> dict:
+                fit: bool = True, fill_rule: str = 'evenodd') -> dict:
     """Pack a region from curved master commands OR a plain shapely polygon.
 
     Master geometry is authoritative; ``rings``/``flat`` are derived
     approximations at the documented flatten tolerance. Polygon input is
     refit with corner preservation (``fit=True``, merges) or emitted as exact
     M/L/Z pixel-edge commands (``fit=False``, the legacy backend).
+    ``fill_rule`` preserves the source shape's SVG fill rule: nonzero
+    compound paths stay nonzero so a same-winding nested subpath keeps
+    unioning instead of turning into an unintended hole.
     """
     if isinstance(geometry, Polygon):
         cmds: List[Command] = []
@@ -266,16 +261,16 @@ def pack_region(geometry, rid: str, pid: int, object_id: str = 'unassigned',
     flat = flatten_path(cmds, FLATTEN_TOLERANCE)
     if not flat:
         raise ValueError('Region master flattens to nothing.')
-    solids = solid_polygons(flat)
+    solids = solid_polygons(flat, fill_rule)
     poly = solids[0] if solids else Polygon(flat[0])
     if len(solids) > 1:
         poly = _safe_union(solids)
-    area = evenodd_area(flat)
+    area = rule_area(flat, fill_rule)
     bbox = list(map(float, rings_bbox(flat)))
     region = {
         'id': rid, 'paletteId': int(pid), 'objectId': object_id,
-        'd': d, 'fillRule': 'evenodd',
-        'master': {'d': d, 'fillRule': 'evenodd', 'source': source,
+        'd': d, 'fillRule': fill_rule,
+        'master': {'d': d, 'fillRule': fill_rule, 'source': source,
                    'tolerance': round(float(fit_tolerance), 3)},
         'flat': {'tolerance': FLATTEN_TOLERANCE,
                  'rings': [[[round(float(x), 2), round(float(y), 2)] for x, y in ring] for ring in flat],
@@ -790,41 +785,70 @@ def svg_open(w, h):
     return f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {w} {h}" width="{w}" height="{h}">'
 
 
+def _xa(value: str) -> str:
+    """Escape a value for an XML attribute context (defense in depth)."""
+    return (str(value).replace('&', '&amp;').replace('<', '&lt;')
+            .replace('>', '&gt;').replace('"', '&quot;'))
+
+
 def _gradient_defs(gradients):
     if not gradients:
         return ''
     parts = ['<defs>']
     for g in gradients:
-        stops = ''.join(f'<stop offset="{fmt_num(s["offset"], 4)}" stop-color="{s["color"]}"'
+        stops = ''.join(f'<stop offset="{fmt_num(s["offset"], 4)}" stop-color="{_xa(s["color"])}"'
                         + (f' stop-opacity="{fmt_num(s["opacity"], 3)}"' if s.get('opacity', 1) != 1 else '')
                         + '/>' for s in g['stops'])
+        gid = _xa(g['id'])
         if g['type'] == 'linear':
-            parts.append(f'<linearGradient id="{g["id"]}" gradientUnits="userSpaceOnUse" '
+            parts.append(f'<linearGradient id="{gid}" gradientUnits="userSpaceOnUse" '
                          f'x1="{fmt_num(g["x1"])}" y1="{fmt_num(g["y1"])}" x2="{fmt_num(g["x2"])}" y2="{fmt_num(g["y2"])}">{stops}</linearGradient>')
         else:
-            parts.append(f'<radialGradient id="{g["id"]}" gradientUnits="userSpaceOnUse" '
+            parts.append(f'<radialGradient id="{gid}" gradientUnits="userSpaceOnUse" '
                          f'cx="{fmt_num(g["cx"])}" cy="{fmt_num(g["cy"])}" r="{fmt_num(g["r"])}" '
                          f'fx="{fmt_num(g["fx"])}" fy="{fmt_num(g["fy"])}">{stops}</radialGradient>')
     parts.append('</defs>')
     return ''.join(parts)
 
 
+def _ordered_paint_entries(paint, include_ink=True):
+    """Paint + ink entries merged back into original drawing order (by z).
+
+    Legacy bundles without ``z`` keep their previous ordering (filled paths
+    first, ink after). Ink drawn behind a fill in the source stays behind it.
+    """
+    entries = list(paint.get('paths') or [])
+    if include_ink:
+        entries += list(paint.get('inkPaths') or [])
+    return sorted(entries, key=lambda e: e.get('z', 1 << 30))
+
+
+def _paint_element(p) -> str:
+    """One paint layer element honouring fill rule, opacity, stroke, z-role."""
+    if p.get('filled') is False or (p.get('strokeWidth') and not p.get('fill')):
+        return (f'<path fill="none" stroke="{_xa(p["fill"])}" stroke-width="{number(p.get("strokeWidth", 1.5))}" '
+                f'stroke-linecap="round" stroke-linejoin="round" d="{p["d"]}"/>')
+    attrs = [f'fill="{_xa(p["fill"])}"']
+    if p.get('fillRule') and p['fillRule'] != 'evenodd':
+        attrs.append(f'fill-rule="{p["fillRule"]}"')
+    if p.get('fillOpacity') is not None and p['fillOpacity'] < 0.999:
+        attrs.append(f'fill-opacity="{fmt_num(p["fillOpacity"], 3)}"')
+    if p.get('opacity') is not None and p['opacity'] < 0.999:
+        attrs.append(f'opacity="{fmt_num(p["opacity"], 3)}"')
+    if p.get('stroke') and p.get('strokeWidth', 0) > 0:
+        attrs.append(f'stroke="{_xa(p["stroke"])}" stroke-width="{number(p["strokeWidth"])}" stroke-linejoin="round"')
+    return f'<path {" ".join(attrs)} d="{p["d"]}"/>'
+
+
 def svg_paint(paint):
+    """Colored appearance layer: gradients + paths + ink in drawing order."""
     defs = _gradient_defs(paint.get('gradients'))
-    body = '<g fill-rule="evenodd">' + ''.join(
-        f'<path fill="{p["fill"]}" d="{p["d"]}"/>' for p in paint['paths']) + '</g>'
+    body = '<g>' + ''.join(_paint_element(p) for p in _ordered_paint_entries(paint)) + '</g>'
     return defs + body
 
 
 def svg_ink(paint):
-    parts = []
-    for p in paint['inkPaths']:
-        if p.get('filled') is False or p.get('strokeWidth'):
-            width = p.get('strokeWidth', 1.5)
-            parts.append(f'<path fill="none" stroke="{p["fill"]}" stroke-width="{number(width)}" '
-                         f'stroke-linecap="round" stroke-linejoin="round" d="{p["d"]}"/>')
-        else:
-            parts.append(f'<path fill="{p["fill"]}" d="{p["d"]}"/>')
+    parts = [_paint_element(p) for p in (paint.get('inkPaths') or [])]
     return '<g>' + ''.join(parts) + '</g>'
 
 
@@ -847,11 +871,19 @@ def validate_bundle(bundle: dict, roundtrip=True) -> dict:
     if m['regionCount'] != len(g['regions']): errors.append('Incorrect region count.')
     curved_cmds = 0; total_cmds = 0
     hit_samples = 0; hit_mismatches = []; z_overlaps = 0
+    fill_rules = {'evenodd': 0, 'nonzero': 0}
+    label_mismatches = []
     prep = [(r, r.get('flat', {}).get('rings') or r.get('rings') or []) for r in regs]
     z_order = {id(r): k for k, (r, _rings) in enumerate(prep)}
     for r, rings in prep:
         if r['id'] in ids: errors.append('Duplicate region ID.')
         ids.add(r['id'])
+        rule = r.get('fillRule', 'evenodd')
+        if rule not in fill_rules:
+            errors.append(f'Unsupported fill rule {rule!r}: ' + r['id'])
+            rule = 'evenodd'
+        else:
+            fill_rules[rule] += 1
         # master path must parse, be closed and multi-subpath-complete
         try:
             cmds = region_master_commands(r)
@@ -868,42 +900,56 @@ def validate_bundle(bundle: dict, roundtrip=True) -> dict:
         flat_stored = rings
         if len(flat) != len(flat_stored):
             errors.append('Flattened ring count mismatch (derived data drift): ' + r['id'])
-        area_flat = evenodd_area(flat) if flat else 0.0
+        area_flat = rule_area(flat, rule)
         if abs(area_flat - r['area']) > max(0.05, 0.004 * max(1.0, r['area'])):
             errors.append('Area mismatch vs flattened master: ' + r['id'])
         poly = region_polygon(r); polys.append(poly)
         if r['paletteId'] not in pids: errors.append('Unknown palette group.')
         if not poly.is_valid or poly.area <= 0: errors.append('Invalid polygon: ' + r['id'])
         if not box(0, 0, w, h).buffer(2.0).covers(poly): errors.append('Out of bounds: ' + r['id'])
-        pt = Point(r['label']['x'], r['label']['y'])
-        if not point_in_rings(rings, r['label']['x'], r['label']['y']):
+        if not point_in_rings_rule(rings, r['label']['x'], r['label']['y'], rule):
             outside_labels.append(r['id'])
-        # hit-test alignment: label point + bbox-inset probes must resolve to this region
-        probes = [(r['label']['x'], r['label']['y'])]
+        # hit-test alignment: label point + bbox-inset probes must resolve to
+        # THIS region. With visible-region geometry no other region may own
+        # the point (fill-order independence: every region can be colored
+        # first without depending on another region's completion).
+        probes = [(r['label']['x'], r['label']['y'], True)]
         x0, y0, x1, y1 = r['bbox']
         for dx, dy in ((.25, .25), (.75, .25), (.25, .75), (.75, .75)):
             probe = (x0 + dx * (x1 - x0), y0 + dy * (y1 - y0))
-            if point_in_rings(rings, probe[0], probe[1]):
-                probes.append(probe)
-        for px, py in probes:
+            if point_in_rings_rule(rings, probe[0], probe[1], rule):
+                probes.append((probe[0], probe[1], False))
+        for px, py, is_label in probes:
             hit_samples += 1
             owners = [other for other, other_rings in prep
-                      if other is not r
+                      if other is not r and other in g['regions']
                       and other['bbox'][0] <= px <= other['bbox'][2]
                       and other['bbox'][1] <= py <= other['bbox'][3]
-                      and point_in_rings(other_rings, px, py)]
+                      and point_in_rings_rule(other_rings, px, py,
+                                              other.get('fillRule', 'evenodd'))]
             if source == 'svg-master' and owners:
-                # Stacked masters resolve taps to the topmost region by design;
-                # containing owners (background under foreground) are expected,
-                # not alignment defects. Raster builds must not overlap at all.
+                if is_label:
+                    # Acceptance rule: every number must hit its own region.
+                    label_mismatches.append(f'{r["id"]}@{px:.1f},{py:.1f}→{owners[0]["id"]}')
                 z_overlaps += 1
             elif owners:
                 hit_mismatches.append(f'{r["id"]}@{px:.1f},{py:.1f}→{owners[0]["id"]}')
     if outside_labels:
         errors.append('Labels outside region interiors: ' + ','.join(outside_labels[:5]))
-    # partition topology on the tolerance-flattened rings
-    combined = unary_union([make_valid(poly) for poly in polys if not poly.is_empty])
-    total_area = sum(poly.area for poly in polys if not poly.is_empty)
+    if label_mismatches:
+        errors.append('Label ownership: number labels that resolve to a different region (visible-region geometry broken): '
+                      + '; '.join(label_mismatches[:5]))
+    # partition topology on the tolerance-flattened rings. Decorations are
+    # not interactive (no masks, no hit-testing), so the gameplay overlap
+    # gate measures playable regions only; raster keeps its stricter
+    # full-partition check (decorations were part of the SLIC partition).
+    if source == 'svg-master':
+        region_polys = [region_polygon(r) for r in g['regions']]
+        combined = unary_union([make_valid(poly) for poly in region_polys if not poly.is_empty])
+        total_area = sum(poly.area for poly in region_polys if not poly.is_empty)
+    else:
+        combined = unary_union([make_valid(poly) for poly in polys if not poly.is_empty])
+        total_area = sum(poly.area for poly in polys if not poly.is_empty)
     overlap = max(0.0, total_area - combined.area)
     missing = max(0.0, w * h - combined.area)
     # Shared chains make the curved partition exact up to the fit tolerance:
@@ -916,10 +962,17 @@ def validate_bundle(bundle: dict, roundtrip=True) -> dict:
         elif overlap > 0.01 or missing > 0.01:
             warnings.append(f'Partition deviation within the curve-fit tolerance band: overlap {overlap:.2f}px², missing {missing:.2f}px² (shared chains keep gaps bounded; check 1px features at zoom).')
     else:
-        if overlap > 0.01:
-            warnings.append(f'SVG-master regions overlap by {overlap:.1f}px²; drawing order resolves tap targets (topmost wins).')
+        # Visible-region geometry: masks must not overlap beyond the fit
+        # tolerance band, otherwise coloring one region depends on another
+        # region's completion (fill-order independence breaks).
+        if overlap > band:
+            errors.append(f'SVG-master regions overlap by {overlap:.1f}px² (beyond tolerance {band:.2f}); '
+                          'visible-region subtraction failed - re-import the master.')
+        elif overlap > 0.01:
+            warnings.append(f'SVG-master regions overlap by {overlap:.1f}px² (within the fit tolerance band).')
         if missing > 0.01:
-            warnings.append(f'SVG-master regions leave {missing:.1f}px² of the canvas uncovered; check whether background gaps are intended.')
+            warnings.append(f'SVG-master regions leave {missing:.1f}px² of the canvas uncovered; '
+                            'shading and decorative shapes are expected to be non-playable.')
     empty_pixels = None
     if roundtrip and source == 'raster':
         back = _rasterize_regions(regs, w, h)
@@ -935,8 +988,8 @@ def validate_bundle(bundle: dict, roundtrip=True) -> dict:
         warnings.append(f'Hit-test alignment: {len(hit_mismatches)}/{hit_samples} interior probes resolve to a lower region than expected: '
                         + '; '.join(hit_mismatches[:4]))
     if z_overlaps:
-        warnings.append(f'Hit-test alignment: {z_overlaps}/{hit_samples} interior probes lie under higher z-order regions '
-                        '(stacked masters resolve taps to the topmost region by design).')
+        warnings.append(f'Hit-test alignment: {z_overlaps}/{hit_samples} interior probes lie under another region; '
+                        'visible-region geometry should own every tap surface - inspect the affected shapes.')
     if paint.get('sourceColorShapeCount', 0) > 15000:
         warnings.append('Detailed vector painting is heavy. Cache/rasterize its static layer in the game and test real devices.')
     warnings.append('Automatic regions are drafts, not guaranteed to follow semantic object boundaries. Human visual review is required.')
@@ -958,8 +1011,12 @@ def validate_bundle(bundle: dict, roundtrip=True) -> dict:
             'curvedCommands': curved_cmds, 'totalCommands': total_cmds,
             'curvedCommandRatio': round(curved_cmds / total_cmds, 4) if total_cmds else 0.0,
             'hitTestProbes': hit_samples, 'hitTestConflicts': len(hit_mismatches),
-            'hitTestZOverlaps': z_overlaps,
+            'hitTestZOverlaps': z_overlaps, 'labelOwnershipConflicts': len(label_mismatches),
             'partitionToleranceAllowance': allowance,
+            'fillRules': fill_rules,
+            'visibleRegionGeometry': source == 'svg-master',
+            'acceptanceRule': ('every number label hits its own region, and every region can be colored first '
+                               'without depending on another region completion (non-overlapping masks)'),
         },
         'visualReview': {
             'required': True,
@@ -1001,9 +1058,9 @@ def emit_bundle(folder: Path, bundle: dict, previews=True) -> dict:
     w, h = map(int, g['viewBox'][2:]); vb = svg_open(w, h)
     write_json(folder / 'regions.json', g); write_json(folder / 'palette.json', p); write_json(folder / 'paint.json', paint)
     m['contentHash'] = hashlib.sha256(b''.join((folder / f).read_bytes() for f in ['regions.json', 'palette.json', 'paint.json'])).hexdigest()
-    final = vb + svg_paint(paint) + svg_ink(paint) + '</svg>'
+    final = vb + svg_paint(paint) + '</svg>'
     (folder / 'colored.svg').write_text(final)
-    outlines = '<g fill="none" fill-rule="evenodd" stroke="' + INK + '" stroke-width="0.65" stroke-linejoin="round">' + \
+    outlines = '<g fill="none" stroke="' + INK + '" stroke-width="0.65" stroke-linejoin="round">' + \
         ''.join(f'<path d="{r["d"]}"/>' for r in g['regions']) + '</g>'
     (folder / 'linework.svg').write_text(vb + outlines + svg_ink(paint) + '</svg>')
     (folder / 'ink.svg').write_text(vb + svg_ink(paint) + '</svg>')
@@ -1012,10 +1069,12 @@ def emit_bundle(folder: Path, bundle: dict, previews=True) -> dict:
         select = g['regions'][0]['paletteId'] if g['regions'] else 1
         defs = '<defs><pattern id="sel" width="8" height="8" patternUnits="userSpaceOnUse"><rect width="8" height="8" fill="#F0F3F6"/><path d="M0 0H4V4H0Z M4 4H8V8H4Z" fill="#CBD5DD"/></pattern></defs>'
         masks = '<g stroke="' + INK + '" stroke-width=".65" fill-rule="evenodd">' + ''.join(
-            f'<path d="{r["d"]}" fill="' + ('url(#sel)' if selected and r['paletteId'] == select else 'white') + '"/>' for r in g['regions']) + '</g>'
+            f'<path d="{r["d"]}"' + (' fill-rule="nonzero"' if r.get('fillRule') == 'nonzero' else '')
+            + ' fill="' + ('url(#sel)' if selected and r['paletteId'] == select else 'white') + '"/>' for r in g['regions']) + '</g>'
         labels = '<g font-family="sans-serif" text-anchor="middle" dominant-baseline="central" fill="' + INK + '">' + ''.join(
             f'<text x="{r["label"]["x"]}" y="{r["label"]["y"]}" font-size="{r["label"]["fontSize"]}">{r["paletteId"]}</text>' for r in g['regions']) + '</g>'
-        return vb + defs + svg_paint(paint) + masks + svg_ink(paint) + labels + '</svg>'
+        paint_under = {'gradients': paint.get('gradients'), 'paths': paint['paths'], 'inkPaths': []}
+        return vb + defs + svg_paint(paint_under) + masks + svg_ink(paint) + labels + '</svg>'
 
     (folder / 'numbered.svg').write_text(numbered())
     (folder / 'selected-preview.svg').write_text(numbered(True))
@@ -1193,43 +1252,105 @@ def _split_disconnected_master(cmds: List[Command], fit_tolerance: float):
 def compile_svg_master(source: Path, output: Path, *, artwork_id: str, version: str, title: str,
                         settings: BuildSettings, provenance: dict | None = None,
                         progress: Callable = lambda *_: None) -> dict:
-    from .svg_master import import_master
+    """Compile a sanitized SVG master into the detailed-vector bundle.
+
+    Trust rules enforced here (review stage 1):
+    - VISIBLE-REGION GEOMETRY: an opaque shape drawn above another covers it.
+      Gameplay regions are the *visible surfaces* (own geometry minus the
+      coverage of every later opaque shape), so region masks never overlap:
+      every number hits its own region and every region can be colored
+      first, whatever order the player fills in.
+    - Visual fidelity: paint/ink layers keep the original drawing order (z),
+      per-shape fill rule, fill-opacity/opacity and strokes on filled
+      shapes. Transparent shapes and role=shading are appearance, not
+      gameplay; role=ink stays ink. Nothing is rasterized.
+    """
+    from .svg_master import import_master, shape_solids, _solid_union
     progress(.06, 'Sanitizing the SVG master (curves are never rasterized)')
     doc = import_master(source.read_text(encoding='utf-8'))
     x, y, w, h = (float(v) for v in doc.view_box)
     if w > 4096 or h > 4096:
         raise ValueError('Scale the SVG master down to at most 4096 user units per side.')
     corner_cos = _corner_cos(settings.corner_angle_deg)
-    progress(.18, 'Separating shading shapes from gameplay tap targets')
+    progress(.18, 'Separating shading shapes from gameplay tap surfaces')
     ink_parts = []
     for s in doc.ink_shapes:
-        ink_parts.append({'fill': s.get('stroke') or INK, 'd': s['d'],
-                           'strokeWidth': round(max(0.4, s.get('strokeWidth', 1.5)), 3), 'filled': False})
-    # filled shapes with real strokes become ink overlays as well
-    for s in doc.shapes:
-        if s.get('stroke') and s.get('strokeWidth', 0) >= 0.5 and not s.get('hidden'):
-            ink_parts.append({'fill': s['stroke'], 'd': s['d'],
-                              'strokeWidth': round(max(0.4, s['strokeWidth']), 3), 'filled': False})
+        ink_parts.append({'shapeId': s['id'], 'z': s['order'], 'fill': s.get('stroke') or INK, 'd': s['d'],
+                          'strokeWidth': round(max(0.4, s.get('strokeWidth', 1.5)), 3), 'filled': False})
+    # NOTE: filled shapes with strokes are no longer converted to ink
+    # overlays (that reordered ink above fills); the stroke stays on the
+    # filled paint path itself, exactly like the source SVG.
     gameplay = []
     for s in doc.shapes:
         if s.get('hidden'):
             continue
         is_shading = (s.get('role') == 'shading'
-                      or s.get('fillOpacity', 1.0) < 0.999
-                      or s.get('opacity', 1.0) < 0.999)
+                      or s.get('fillOpacity', 1.0) * s.get('opacity', 1.0) < 0.999)
         if is_shading and s.get('role') != 'gameplay':
             continue
         gameplay.append(s)
     if not gameplay:
         raise ValueError('The SVG master has no gameplay-sized filled shapes.')
-    progress(.30, 'Splitting disconnected tap targets and excluding hidden shapes')
+    progress(.30, 'Deriving visible tap surfaces (opaque coverage subtracted)')
+    # Coverage model: every non-hidden, effectively opaque filled shape
+    # (any role) covers whatever is drawn below it.
+    cover = []
+    for s in doc.shapes:
+        if s.get('hidden') or s.get('fillOpacity', 1.0) * s.get('opacity', 1.0) < 0.999:
+            continue
+        solid = _solid_union(shape_solids(s['rings'], s['fillRule']))
+        if not solid.is_empty and solid.area > 0:
+            cover.append((s['order'], solid))
+    cover.sort(key=lambda t: t[0])
+    orders = [o for o, _poly in cover]
+    suffix = [Polygon()] * (len(cover) + 1)
+    for i in range(len(cover) - 1, -1, -1):
+        try:
+            suffix[i] = cover[i][1].union(suffix[i + 1])
+        except Exception:
+            suffix[i] = suffix[i + 1]
+
+    def coverage_above(order: float):
+        import bisect
+        return suffix[bisect.bisect_right(orders, order)]
+
+    from shapely.geometry.polygon import orient as _orient
     candidates = []
     for s in gameplay:
-        for part_cmds, part_rings in _split_disconnected_master(s['commands'], settings.curve_tolerance):
-            area = evenodd_area(part_rings)
-            if area <= 0:
-                continue
-            candidates.append({'shape': s, 'cmds': part_cmds, 'rings': part_rings, 'area': area})
+        own = _solid_union(shape_solids(s['rings'], s['fillRule']))
+        if own.is_empty or own.area <= 0:
+            continue
+        above = coverage_above(s['order'])
+        visible = own if above.is_empty else own.difference(above)
+        if visible.is_empty or visible.area <= 1e-9:
+            continue                     # fully covered: not a reachable surface
+        ratio = visible.area / max(own.area, 1e-9)
+        if ratio >= 0.999:
+            # Uncovered: keep the verbatim master commands (perfect fidelity),
+            # splitting disconnected tap targets as before.
+            for part_cmds, part_rings in _split_disconnected_master(s['commands'], settings.curve_tolerance):
+                area = rule_area(part_rings, s['fillRule'])
+                if area <= 0:
+                    continue
+                candidates.append({'shape': s, 'cmds': part_cmds, 'rings': part_rings,
+                                   'area': area, 'fillRule': s['fillRule'], 'verbatim': True,
+                                   'poly': _solid_union(shape_solids(part_rings, s['fillRule']))})
+        else:
+            # Partially covered: the visible surface is the derived geometry
+            # (own boundary minus foreground coverage). Each connected piece
+            # becomes its own tap target; rings are oriented so evenodd and
+            # nonzero agree on the result.
+            for part in polygon_parts(make_valid(visible)):
+                if part is None or part.is_empty or part.area <= 1e-9:
+                    continue
+                try:
+                    part = _orient(part, 1.0)
+                except Exception:
+                    pass
+                candidates.append({'shape': s, 'poly': part, 'area': part.area,
+                                   'fillRule': 'evenodd', 'verbatim': False})
+    if not candidates:
+        raise ValueError('No reachable tap surfaces: every gameplay shape is covered.')
     progress(.42, 'Building the palette from master fills')
     hexes = [c['shape'].get('fill') or '#808080' for c in candidates]
     palette, mapping = _palette_from_hexes(hexes)
@@ -1238,10 +1359,19 @@ def compile_svg_master(source: Path, output: Path, *, artwork_id: str, version: 
     regions = []; decorations = []
     for idx, cand in enumerate(candidates, 1):
         pid = mapping[cand['shape'].get('fill') or '#808080']
-        poly = Polygon(cand['rings'][0], cand['rings'][1:]) if len(cand['rings']) > 1 else Polygon(cand['rings'][0])
+        poly = cand.get('poly')
+        if poly is None:
+            poly = Polygon(cand['rings'][0], cand['rings'][1:]) if len(cand['rings']) > 1 else Polygon(cand['rings'][0])
         label = make_label(poly, pid)
-        reg = pack_region(cand['cmds'], f'r-{idx:05d}', pid, label=label,
-                          source='svg-master-import', fit_tolerance=0.0)
+        if cand['verbatim']:
+            reg = pack_region(cand['cmds'], f'r-{idx:05d}', pid, label=label,
+                              source='svg-master-import', fit_tolerance=0.0,
+                              fill_rule=cand['fillRule'])
+        else:
+            reg = pack_region(cand['poly'], f'r-{idx:05d}', pid, label=label,
+                              source='visible-surface-refit', fit_tolerance=settings.curve_tolerance,
+                              fill_rule='evenodd')
+        reg['masterShapeId'] = cand['shape']['id']
         if label['clearance'] < settings.min_label_radius or label['fontSize'] < 3.5 \
                 or cand['area'] < settings.min_region_pixels:
             decorations.append(reg)
@@ -1249,58 +1379,75 @@ def compile_svg_master(source: Path, output: Path, *, artwork_id: str, version: 
             regions.append(reg)
     if not regions:
         raise ValueError('No playable regions in the SVG master; shapes are too small.')
-    progress(.55, 'Emitting the detailed paint layer (gradients preserved)')
+    progress(.55, 'Emitting the detailed paint layer (order, strokes and gradients preserved)')
     paint_paths = []
     gradients = []
     for s in doc.shapes:
         if s.get('hidden'):
             continue
+        entry = {'z': s['order'], 'shapeId': s['id'], 'd': s['d'], 'fillRule': s['fillRule']}
         if s.get('gradient'):
             gradients.append(s['gradient'])
-            fill = f'url(#{s["gradient"]["id"]})'
+            entry['fill'] = f'url(#{s["gradient"]["id"]})'
         else:
-            fill = s.get('fill') or '#808080'
-        paint_paths.append({'fill': fill, 'd': s['d']})
+            entry['fill'] = s.get('fill') or '#808080'
+        if s.get('fillOpacity', 1.0) < 0.999:
+            entry['fillOpacity'] = round(s['fillOpacity'], 4)
+        if s.get('opacity', 1.0) < 0.999:
+            entry['opacity'] = round(s['opacity'], 4)
+        if s.get('stroke') and s.get('strokeWidth', 0) > 0:
+            entry['stroke'] = s['stroke']
+            entry['strokeWidth'] = round(s['strokeWidth'], 3)
+        paint_paths.append(entry)
     ink_paths = []
-    for p in ink_parts:
-        entry = {'fill': p['fill'], 'd': p['d']}
-        if p.get('strokeWidth'):
-            entry['strokeWidth'] = p['strokeWidth']
-        if p.get('filled') is False:
+    for part in ink_parts:
+        entry = {'fill': part['fill'], 'd': part['d']}
+        if part.get('z') is not None:
+            entry['z'] = part['z']
+        if part.get('shapeId'):
+            entry['shapeId'] = part['shapeId']
+        if part.get('strokeWidth'):
+            entry['strokeWidth'] = part['strokeWidth']
+        if part.get('filled') is False:
             entry['filled'] = False
         ink_paths.append(entry)
     paint = {'schemaVersion': 2, 'artworkId': artwork_id, 'viewBox': [0, 0, w, h],
              'paths': paint_paths, 'inkPaths': ink_paths, 'gradients': gradients,
              'sourceColorShapeCount': len(paint_paths) + len(ink_paths),
              'notes': ('Detailed vector appearance layer copied from the sanitized SVG master with curves, holes, '
-                       'gradients and drawing order preserved. Never rasterized. Do not replace with flat single-color '
-                       'fills or the artwork visually degrades.')}
-    # partition allowance: SVG masters may overlap by design (z-order resolves)
+                       'gradients, per-shape fill rules, opacity, strokes and drawing order preserved. Never rasterized. '
+                       'Do not replace with flat single-color fills or the artwork visually degrades.')}
+    # Visible-region partition: masks must not overlap beyond the fit band.
     overlap_allowance = 0.0
     try:
         polys = [region_polygon(r) for r in regions]
         union = unary_union([p for p in polys if not p.is_empty])
         overlap_allowance = max(0.0, sum(p.area for p in polys if not p.is_empty) - union.area)
+        # margin for union/make_valid drift when validation re-measures
+        overlap_allowance += max(1.0, overlap_allowance * 0.05)
     except Exception:
         overlap_allowance = float(w * h * 0.002)
     geometry = {'schemaVersion': 2, 'geometrySchema': GEOMETRY_SCHEMA, 'source': 'svg-master',
                 'artworkId': artwork_id, 'artworkVersion': version,
                 'viewBox': [0, 0, w, h], 'fillRule': 'evenodd', 'stroke': INK, 'strokeWidth': .65,
                 'backend': 'svg-master', 'flattenTolerance': FLATTEN_TOLERANCE,
-                'curveFitTolerance': 0.0, 'partitionTolerance': round(overlap_allowance + 0.01, 3),
+                'curveFitTolerance': settings.curve_tolerance, 'partitionTolerance': round(overlap_allowance + 0.01, 3),
+                'visibleRegionGeometry': True,
                 'importReport': doc.report, 'regions': regions, 'decorations': decorations, 'detailPaths': []}
     manifest = {'schemaVersion': 1, 'format': SCHEMA, 'id': artwork_id, 'version': version, 'title': title,
-                'description': 'Compiled from a sanitized SVG master: curves, holes, gradients, transforms and drawing order preserved.',
+                'description': 'Compiled from a sanitized SVG master: curves, holes, gradients, transforms and drawing order preserved; regions are visible surfaces.',
                 'category': 'Studio', 'viewBox': [0, 0, w, h], 'difficulty': 'unrated', 'difficultyValidatedByPlaytest': False,
                 'regionCount': len(regions), 'paletteCount': len(palette), 'objectGroups': [],
                 'assets': {'regions': 'regions.json', 'palette': 'palette.json', 'paint': 'paint.json', 'coloredSvg': 'colored.svg',
                            'numberedSvg': 'numbered.svg', 'lineworkSvg': 'linework.svg', 'inkSvg': 'ink.svg', 'thumbnail': 'thumbnail.webp', 'sourceMaster': 'source-master.svg'},
-                'rendering': {'model': 'vector-underpainting-with-region-masks', 'fillRule': 'evenodd', 'decorationsArePrecolored': True,
+                'rendering': {'model': 'vector-underpainting-with-region-masks', 'fillRule': 'per-region (evenodd default, nonzero preserved)', 'decorationsArePrecolored': True,
                               'labelMinScreenPx': 9, 'zoomRecommended': 8, 'geometrySchema': GEOMETRY_SCHEMA,
-                              'masterNote': 'Masters are the imported SVG path commands verbatim (arcs pre-converted to cubics); nothing was rasterized or retraced.'},
+                              'visibleRegionGeometry': True,
+                              'masterNote': 'Masters are the imported SVG path commands verbatim (arcs pre-converted to cubics); covered portions are replaced by the derived visible-surface geometry.'},
                 'generation': {'settings': settings.model_dump(),
                                'algorithm': 'Sanitized SVG-master import: curves/holes/gradients/transforms/drawing-order preserved; '
-                                            'disconnected tap targets split; fully hidden shapes excluded; shading separated from gameplay.',
+                                            'visible surfaces derived by subtracting opaque coverage; disconnected tap targets split; '
+                                            'fully hidden shapes excluded; shading and transparent shapes are appearance, not gameplay.',
                                'rasterizedMaster': False},
                 'provenance': provenance or {'source': 'User-supplied SVG; rights not independently verified'}}
     bundle = {'manifest': manifest, 'geometry': geometry, 'palette': palette, 'paint': paint}
@@ -1359,6 +1506,64 @@ def legacy_geometry(geometry: dict) -> dict:
 # Edits (curve-preserving; every edit produces a new version)
 # ---------------------------------------------------------------------------
 
+
+
+def _tint_gradient(gradient: dict, target_hex: str) -> None:
+    """Shift a gradient's stop colors toward ``target_hex`` while keeping the
+    stop-to-stop shading relationship (light/dark structure is preserved)."""
+    stops = gradient.get('stops') or []
+    if not stops:
+        return
+    avg = [0.0, 0.0, 0.0]
+    for s in stops:
+        c = s.get('color', '#808080').lstrip('#')
+        avg[0] += int(c[0:2], 16); avg[1] += int(c[2:4], 16); avg[2] += int(c[4:6], 16)
+    avg = [v / len(stops) for v in avg]
+    tgt = [int(target_hex.lstrip('#')[k:k + 2], 16) for k in (0, 2, 4)]
+    ratios = [(tgt[k] / avg[k]) if avg[k] > 1e-6 else (1.0 if tgt[k] > 0 else 0.4) for k in range(3)]
+    for s in stops:
+        c = s.get('color', '#808080').lstrip('#')
+        rgb = [min(255, max(0, round(int(c[k:k + 2], 16) * ratios[k // 2]))) for k in (0, 2, 4)]
+        s['color'] = '#' + ''.join(f'{v:02X}' for v in rgb)
+
+
+def _recolor_bundle(bundle: dict, chosen, color: str, preserve_shading: bool) -> None:
+    """Recolor the *visible appearance* of the chosen regions' source shapes.
+
+    Separate from the 'palette' action (which assigns the number group):
+    this changes what the player sees. ``preserve_shading`` keeps gradient
+    shading (tinted toward the target); otherwise the fill is replaced.
+    """
+    paint = bundle['paint']
+    shape_ids = set()
+    for r in chosen:
+        sid = r.get('masterShapeId')
+        if not sid:
+            raise ValueError(f'Region {r["id"]} has no paintable source shape; '
+                             'raster-built bundles can only be re-colored by rebuilding.')
+        shape_ids.add(sid)
+    paths = [p for p in (paint.get('paths') or []) if p.get('shapeId') in shape_ids]
+    if not paths:
+        raise ValueError('No paint paths found for the selected regions.')
+    grad_ids = {p['fill'][5:-1] for p in paths if str(p.get('fill', '')).startswith('url(#')}
+    for path in paths:
+        if preserve_shading and str(path.get('fill', '')).startswith('url(#'):
+            continue                      # tinted through the gradient below
+        path['fill'] = color
+    if preserve_shading and grad_ids:
+        for gradient in (paint.get('gradients') or []):
+            if gradient.get('id') in grad_ids:
+                _tint_gradient(gradient, color)
+    # keep the palette swatch in sync with the new appearance
+    pids = {r['paletteId'] for r in chosen}
+    for entry in bundle['palette']:
+        if entry['id'] in pids:
+            entry['hex'] = color
+            entry['paint'] = {'type': 'linearGradient',
+                              'stops': [{'offset': 0, 'color': color}, {'offset': 1, 'color': color}]}
+
+
+
 def edit_bundle(source: Path, output: Path, request, version: str):
     bundle = load_bundle(source); g = bundle['geometry']; m = bundle['manifest']
     settings = read_json(source / 'build-settings.json') if (source / 'build-settings.json').is_file() else {}
@@ -1400,9 +1605,15 @@ def edit_bundle(source: Path, output: Path, request, version: str):
     elif request.action == 'group':
         for r in chosen: r['objectId'] = request.group
     elif request.action == 'palette':
+        # Assigns the NUMBER GROUP (gameplay association), not the artwork's
+        # visible color - use 'recolor' to change the painted appearance.
         for r in chosen:
             r['paletteId'] = pid
             r['label'] = make_label(region_polygon(r), pid)
+    elif request.action == 'recolor':
+        if not request.color:
+            raise ValueError('Choose a #RRGGBB color to recolor with.')
+        _recolor_bundle(bundle, chosen, request.color.upper(), bool(request.preserve_shading))
     elif request.action == 'label':
         if len(chosen) != 1 or request.x is None or request.y is None:
             raise ValueError('Select one region and a label position.')
@@ -1433,27 +1644,157 @@ def edit_bundle(source: Path, output: Path, request, version: str):
     return {'manifest': m, 'validation': qa}
 
 
+def validate_runtime_contract(bundle: dict) -> list:
+    """Mirror of the shipped game adapter's validateBundle (shared contract).
+
+    Both sides must accept exactly the same field set: region ids, palette
+    references, per-region fill rules, curved M/L/C/Q/Z path data, paint
+    fills (#hex or url(#g-...)), gradients, strokes and open ink paths.
+    Runs on every export so "passed validation" implies "the game can load it".
+    """
+    errors = []
+    m, g, p, paint = bundle['manifest'], bundle['geometry'], bundle['palette'], bundle['paint']
+    if m.get('format') not in ('color-duel-vector-1', SCHEMA):
+        errors.append('Unsupported artwork bundle format.')
+    if m['id'] != g.get('artworkId') or m['version'] != g.get('artworkVersion') \
+            or m.get('regionCount') != len(g.get('regions', [])):
+        errors.append('Artwork identity/count mismatch.')
+    vb = g.get('viewBox')
+    if not isinstance(vb, list) or len(vb) != 4 or not all(isinstance(v, (int, float)) for v in vb) \
+            or vb[2] <= 0 or vb[3] <= 0:
+        errors.append('Invalid viewBox.')
+    palette_ids = set()
+    for entry in p:
+        if entry['id'] in palette_ids:
+            errors.append('Duplicate palette ID.')
+        palette_ids.add(entry['id'])
+    grad_ids = {gr.get('id') for gr in (paint.get('gradients') or [])}
+    seen = set()
+    for r in [*g.get('regions', []), *g.get('decorations', [])]:
+        if r['id'] in seen or not SAFE_ID.match(r['id']):
+            errors.append('Duplicate or unsafe region ID.')
+        seen.add(r['id'])
+        if r.get('paletteId') not in palette_ids:
+            errors.append(f'Unknown palette group: {r["id"]}')
+        rule = r.get('fillRule', 'evenodd')
+        if rule not in ('evenodd', 'nonzero'):
+            errors.append(f'Unsupported region fill rule: {r["id"]}')
+        if not SAFE_D.match(r['d']):
+            errors.append(f'Invalid region path data: {r["id"]}')
+    for path in (paint.get('paths') or []):
+        fill = path.get('fill', '')
+        ok_fill = SAFE_HEX.match(fill) or (SAFE_GRAD_REF.match(fill) and fill[5:-1] in grad_ids)
+        if not ok_fill:
+            errors.append('Invalid paint fill.')
+        if not SAFE_D.match(path['d']):
+            errors.append('Invalid paint path.')
+        if path.get('fillRule') not in (None, 'evenodd', 'nonzero'):
+            errors.append('Invalid paint fill rule.')
+        for key in ('opacity', 'fillOpacity', 'strokeWidth', 'z'):
+            v = path.get(key)
+            if v is not None and (not isinstance(v, (int, float)) or not (0 <= v if key != 'z' else True)):
+                errors.append(f'Invalid paint {key}.')
+    for path in (paint.get('inkPaths') or []):
+        fill = path.get('fill', '')
+        ok_fill = SAFE_HEX.match(fill) or (SAFE_GRAD_REF.match(fill) and fill[5:-1] in grad_ids)
+        open_ok = (path.get('strokeWidth') is not None or path.get('filled') is False) and SAFE_D_OPEN.match(path['d'])
+        if not ok_fill:
+            errors.append('Invalid ink fill.')
+        if not (SAFE_D.match(path['d']) or open_ok):
+            errors.append('Invalid ink path.')
+    for gr in (paint.get('gradients') or []):
+        if not _re.match(r'^g-[a-zA-Z0-9_-]+$', gr.get('id', '')):
+            errors.append('Unsafe gradient id.')
+        if gr.get('type') not in ('linear', 'radial') or not gr.get('stops'):
+            errors.append('Invalid gradient definition.')
+    return errors
+
+
+def _runtime_geometry(g: dict) -> dict:
+    """Lean runtime geometry: exactly what the game adapter needs."""
+    keep = ('schemaVersion', 'geometrySchema', 'source', 'artworkId', 'artworkVersion',
+            'viewBox', 'fillRule', 'stroke', 'strokeWidth', 'backend',
+            'flattenTolerance', 'curveFitTolerance', 'partitionTolerance',
+            'visibleRegionGeometry', 'detailPaths')
+    out = {k: v for k, v in g.items() if k in keep}
+    out['regions'] = [{k: r[k] for k in RUNTIME_REGION_KEYS if k in r} for r in g.get('regions', [])]
+    out['decorations'] = []
+    out['note'] = 'Runtime bundle: master/flat/rings/legacy authoring geometry stripped; regions[*].d is authoritative.'
+    return out
+
+
+def _runtime_paint(paint: dict) -> dict:
+    keep = ('schemaVersion', 'artworkId', 'viewBox', 'paths', 'inkPaths', 'gradients',
+            'sourceColorShapeCount', 'notes')
+    return {k: v for k, v in paint.items() if k in keep}
+
+
 def make_export(folder: Path, include_authoring=False):
+    """Export the runtime bundle (lean) or the full authoring bundle.
+
+    The runtime export carries only the geometry, paint, palette, labels and
+    metadata the game needs - no duplicate master/ring representations -
+    and is contract-checked against the shipped game adapter rules before
+    it is written, so a "passed validation" export actually loads.
+    """
     m = read_json(folder / 'artwork.json')
+    g = read_json(folder / 'regions.json')
+    p = read_json(folder / 'palette.json')
+    paint = read_json(folder / 'paint.json')
     master_name = m['assets'].get('sourceMaster', 'source-master.png')
-    names = ['artwork.json', 'regions.json', 'palette.json', 'paint.json', 'colored.svg', 'numbered.svg',
-             'linework.svg', 'ink.svg', 'selected-preview.svg', 'thumbnail.webp', 'validation.json']
-    if include_authoring:
-        names += [master_name, 'build-settings.json', 'colored-preview.png', 'numbered-preview.png']
     from io import BytesIO
     output = BytesIO()
+    root = f'artworks/{m["id"]}/'
+    export_m = json.loads(json.dumps(m))
+    contract_errors = validate_runtime_contract({'manifest': m, 'geometry': g, 'palette': p, 'paint': paint})
+    if contract_errors:
+        raise ValueError('Runtime contract check failed: ' + '; '.join(contract_errors[:5]))
+    if include_authoring:
+        names = ['artwork.json', 'regions.json', 'palette.json', 'paint.json', 'colored.svg', 'numbered.svg',
+                 'linework.svg', 'ink.svg', 'selected-preview.svg', 'thumbnail.webp', 'validation.json',
+                 master_name, 'build-settings.json', 'colored-preview.png', 'numbered-preview.png']
+        bundle_kind = 'authoring'
+    else:
+        g_out = _runtime_geometry(g)
+        paint_out = _runtime_paint(paint)
+        write_json(folder / '.runtime-regions.json', g_out)
+        write_json(folder / '.runtime-paint.json', paint_out)
+        slim = {'manifest': export_m, 'geometry': g_out, 'palette': p, 'paint': paint_out}
+        slim_errors = validate_runtime_contract(slim)
+        if slim_errors:
+            (folder / '.runtime-regions.json').unlink(missing_ok=True)
+            (folder / '.runtime-paint.json').unlink(missing_ok=True)
+            raise ValueError('Lean runtime contract check failed: ' + '; '.join(slim_errors[:5]))
+        export_m['assets'] = {k: v for k, v in export_m['assets'].items()
+                              if k in ('regions', 'palette', 'paint')}
+        export_m['exportKind'] = 'runtime'
+        bundle_kind = 'runtime'
+        export_m['runtime'] = {'contract': 'detailed-vector schema 2 (curves, gradients, per-region fill rules)',
+                               'leanGeometry': True,
+                               'contentHash': hashlib.sha256((folder / '.runtime-regions.json').read_bytes()
+                                                             + (folder / '.runtime-paint.json').read_bytes()
+                                                             + (folder / 'palette.json').read_bytes()).hexdigest()}
+        export_m['contentHash'] = export_m['runtime']['contentHash']
+        # ONLY what the game adapter loads: the four JSON files plus the
+        # validation evidence. Preview SVGs and thumbnails stay in the
+        # authoring export - the adapter renders from JSON, not from SVGs.
+        names = ['artwork.json', 'validation.json']
     with zipfile.ZipFile(output, 'w', zipfile.ZIP_DEFLATED) as z:
-        root = f'artworks/{m["id"]}/'
-        export_m = json.loads(json.dumps(m))
-        if not include_authoring:
-            export_m['assets'].pop('sourceMaster', None)
         for name in names:
             if name == 'artwork.json':
                 z.writestr(root + name, json.dumps(export_m, indent=2))
             elif (folder / name).is_file():
                 z.write(folder / name, root + name)
-        z.writestr('catalog-entry.json', json.dumps({'id': m['id'], 'title': m['title'], 'manifest': root + 'artwork.json', 'format': m['format'], 'status': m['qa']['status']}, indent=2))
-        z.writestr('IMPORT.md', 'Load artwork.json and its regions/palette/paint files with the detailed-vector adapter. This is a draft until reviewed. '
-                                'Geometry schema 2: regions[*].master.d is the AUTHORITATIVE curved path data; rings/flat.rings are derived approximations at the documented tolerance — never treat them as master geometry and never re-trace them. '
-                                'Preserve viewBox, even-odd holes, gradients, contentHash and version. Do not stretch a full painting into each region. Do not use numbered.svg as hit-test metadata. Validation does not establish copyright clearance.\n')
+        if not include_authoring:
+            z.writestr(root + 'regions.json', (folder / '.runtime-regions.json').read_text(encoding='utf-8'))
+            z.writestr(root + 'paint.json', (folder / '.runtime-paint.json').read_text(encoding='utf-8'))
+            z.writestr(root + 'palette.json', (folder / 'palette.json').read_text(encoding='utf-8'))
+        z.writestr('catalog-entry.json', json.dumps({'id': m['id'], 'title': m['title'], 'manifest': root + 'artwork.json', 'format': m['format'], 'status': m['qa']['status'], 'exportKind': bundle_kind}, indent=2))
+        z.writestr('IMPORT.md', 'Load artwork.json and its regions/palette/paint files with the detailed-vector adapter (integration/detailed-board.mjs). '
+                                'The runtime bundle was contract-checked against that adapter before export. '
+                                'Geometry schema 2: regions[*].d is the AUTHORITATIVE curved path data (M/L/C/Q/Z); authoring duplicates (master/rings/flat/legacy) are stripped from the runtime export. '
+                                'Regions are visible surfaces: masks do not overlap, so any fill order colors correctly. '
+                                'Preserve viewBox, per-region fill rules (evenodd/nonzero), gradients, contentHash and version. Do not stretch a full painting into each region. Do not use numbered.svg as hit-test metadata. Validation does not establish copyright clearance.\n')
+    (folder / '.runtime-regions.json').unlink(missing_ok=True)
+    (folder / '.runtime-paint.json').unlink(missing_ok=True)
     return output.getvalue()

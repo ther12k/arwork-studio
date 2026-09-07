@@ -12,6 +12,7 @@ import {
   Image as ImageIcon,
   Loader2,
   Merge,
+  Paintbrush,
   SplitSquareHorizontal,
   Tag,
   Layers,
@@ -22,6 +23,7 @@ import {
 import { toast } from "sonner";
 
 import { Button } from "@/components/ui/button";
+import { Checkbox } from "@/components/ui/checkbox";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
@@ -39,6 +41,16 @@ function flattenToleranceLine(derivation: string): string | null {
   const match = /±\s*([\d.]+)\s*px/.exec(derivation);
   return match ? match[1] : null;
 }
+
+/** Region ids referenced by a QA warning/error line ("r-00001", "r-m-abc123…").
+ *  Empty when the line is not actionable (no region drill-down possible). */
+function regionIdsIn(text: string): string[] {
+  const ids = text.match(/\br-[A-Za-z0-9_-]{4,}\b/g);
+  return ids ? [...new Set(ids)] : [];
+}
+
+/** "#RRGGBB" only — the backend recolor route rejects anything else. */
+const HEX_COLOR_RE = /^#[0-9A-Fa-f]{6}$/;
 
 function NumberField({
   id,
@@ -107,11 +119,16 @@ export function RightPanel() {
     selectionInfo,
     startPlacing,
     clearSelection,
+    inspectRegion,
     runEdit,
     build,
     activateSelectedRevision,
   } = studio;
   const [advancedOpen, setAdvancedOpen] = useState(false);
+  // Recolor appearance (distinct from the palette number-group action)
+  const [recolorHex, setRecolorHex] = useState("#66AA33");
+  const [preserveShading, setPreserveShading] = useState(false);
+  const hexValid = HEX_COLOR_RE.test(recolorHex);
 
   const canBuild = !!project?.master && !busy;
   const qa = revision?.qa;
@@ -414,13 +431,34 @@ export function RightPanel() {
               </div>
             )}
             {qa.warnings.length > 0 && (
-              <ul className="studio-scroll mt-1.5 max-h-40 space-y-1.5 overflow-y-auto pr-1">
-                {qa.warnings.map((w, i) => (
-                  <li key={i} className="flex gap-1.5 text-[#957242]">
-                    <AlertTriangle className="mt-0.5 size-3 shrink-0" aria-hidden />
-                    <span>{w}</span>
-                  </li>
-                ))}
+              <ul className="studio-scroll mt-1.5 max-h-40 space-y-1 overflow-y-auto pr-1">
+                {qa.warnings.map((w, i) => {
+                  const ids = regionIdsIn(w);
+                  if (!ids.length) {
+                    // Not actionable (no region drill-down) — plain warning line.
+                    return (
+                      <li key={i} className="flex gap-1.5 text-[#957242]">
+                        <AlertTriangle className="mt-0.5 size-3 shrink-0" aria-hidden />
+                        <span>{w}</span>
+                      </li>
+                    );
+                  }
+                  const first = ids[0];
+                  return (
+                    <li key={i}>
+                      <Button
+                        variant="ghost"
+                        className="h-auto w-full justify-start gap-1.5 whitespace-normal rounded-md px-1.5 py-1 text-left text-[10px] font-normal leading-relaxed text-[#957242] hover:bg-[#ece6d5] hover:text-[#957242]"
+                        onClick={() => inspectRegion(first)}
+                        aria-label={`Select region ${first} and zoom to it`}
+                        title={`Select region ${first} and zoom to it`}
+                      >
+                        <AlertTriangle className="mt-0.5 size-3 shrink-0" aria-hidden />
+                        <span className="min-w-0 break-words">{w}</span>
+                      </Button>
+                    </li>
+                  );
+                })}
               </ul>
             )}
           </>
@@ -466,12 +504,13 @@ export function RightPanel() {
             <Button
               variant="outline"
               size="sm"
-              className="h-8 rounded-md border-[#e1e5df] bg-white text-[9px]"
+              className="h-auto min-h-8 rounded-md border-[#e1e5df] bg-white py-1 text-[9px] leading-tight"
               disabled={busy || !selected.size}
+              title="Relabel the selected regions to a palette (number) group — gameplay association, no visual change"
               onClick={() => doEdit("palette", { palette_id: Number(editPalette) || 1 })}
             >
-              <PaletteIcon className="size-3" aria-hidden />
-              Set palette
+              <PaletteIcon className="size-3 shrink-0" aria-hidden />
+              Assign number group
             </Button>
             <Button
               variant="outline"
@@ -545,7 +584,86 @@ export function RightPanel() {
               Clear selection
             </Button>
           </div>
+
+          {/* Recolor appearance — changes what the artwork looks like (paint layer),
+              distinct from the number-group association above. */}
+          <div className="mt-2.5 rounded-md border border-[#d9e4dc] bg-white p-2.5">
+            <div className="flex items-center gap-1.5">
+              <Paintbrush className="size-3 text-[#657671]" aria-hidden />
+              <span className="text-[11px] font-semibold text-[#183837]">Recolor appearance</span>
+            </div>
+            <div className="mt-2 flex items-center gap-2">
+              <input
+                type="color"
+                value={hexValid ? recolorHex : "#66AA33"}
+                onChange={(e) => setRecolorHex(e.target.value.toUpperCase())}
+                className="h-8 w-10 shrink-0 cursor-pointer rounded-md border border-[#e1e5df] bg-white p-0.5"
+                aria-label="Recolor target color"
+                disabled={busy}
+              />
+              <Input
+                id="studio-recolor-hex"
+                value={recolorHex}
+                onChange={(e) => setRecolorHex(e.target.value.trim().toUpperCase())}
+                onBlur={() => {
+                  const t = recolorHex.trim().toUpperCase();
+                  setRecolorHex(/^[0-9A-F]{6}$/.test(t) ? `#${t}` : t);
+                }}
+                placeholder="#RRGGBB"
+                spellCheck={false}
+                autoComplete="off"
+                className="h-8 rounded-md bg-white font-mono text-xs"
+                aria-invalid={!hexValid}
+                aria-describedby={hexValid ? undefined : "studio-recolor-hex-hint"}
+              />
+            </div>
+            {!hexValid && (
+              <p id="studio-recolor-hex-hint" className="mt-1 text-[9px] font-medium text-[#ba463f]">
+                Enter a 6-digit hex color like #66AA33.
+              </p>
+            )}
+            <div className="mt-2 flex items-start gap-2">
+              <Checkbox
+                id="studio-preserve-shading"
+                checked={preserveShading}
+                onCheckedChange={(v) => setPreserveShading(v === true)}
+                disabled={busy}
+                className="mt-0.5"
+              />
+              <Label
+                htmlFor="studio-preserve-shading"
+                className="text-[10px] leading-snug font-normal text-[#657671]"
+              >
+                Preserve shading
+              </Label>
+            </div>
+            <MicroCaption className="mt-1">
+              Tint gradients toward the target instead of replacing the fill.
+            </MicroCaption>
+            <Button
+              variant="outline"
+              size="sm"
+              className="mt-2 h-8 w-full rounded-md border-[#e1e5df] bg-white text-[9px]"
+              disabled={busy || !selected.size || !hexValid}
+              title={
+                hexValid
+                  ? "Recolor the selected regions' artwork (SVG-master builds only)"
+                  : "Enter a valid #RRGGBB hex first"
+              }
+              onClick={() =>
+                doEdit("recolor", { color: recolorHex.toUpperCase(), preserve_shading: preserveShading })
+              }
+            >
+              <Paintbrush className="size-3" aria-hidden />
+              Recolor appearance
+            </Button>
+          </div>
+
           <MicroCaption className="mt-2">
+            Number group = gameplay association (what number the region requires). Recolor = what
+            the artwork looks like.
+          </MicroCaption>
+          <MicroCaption className="mt-1.5">
             Each edit creates a new revision. Merge only neighboring regions. &ldquo;Make detail&rdquo; precolors a
             region and removes it from the progress count.
           </MicroCaption>

@@ -85,7 +85,10 @@ export interface QaReport {
     hitTestProbes: number;
     hitTestConflicts: number;
     hitTestZOverlaps?: number;
+    labelOwnershipConflicts?: number;
     partitionToleranceAllowance: number;
+    visibleRegionGeometry?: boolean;
+    acceptanceRule?: string;
   };
   visualReview?: {
     required: boolean;
@@ -153,7 +156,7 @@ export interface BuildSettings {
   corner_angle_deg?: number;
 }
 
-export type EditAction = "merge" | "group" | "palette" | "label" | "decorate" | "split";
+export type EditAction = "merge" | "group" | "palette" | "recolor" | "label" | "decorate" | "split";
 
 export type GeometryMode = "curved" | "legacy";
 
@@ -168,10 +171,11 @@ export interface RegionLabel {
 export interface ModeRegion {
   id: string;
   paletteId: number;
-  fillRule: "evenodd";
+  fillRule: "evenodd" | "nonzero";
   d: string;
   label: RegionLabel;
   bbox: number[];
+  masterShapeId?: string;
 }
 
 export interface GeometryModePayload {
@@ -194,6 +198,12 @@ export interface EditPayload {
   palette_id?: number;
   x?: number;
   y?: number;
+  /** 'recolor': the visible appearance color (#RRGGBB). Distinct from
+   * 'palette', which assigns the gameplay number group. */
+  color?: string;
+  /** 'recolor': keep gradient shading (tinted toward the target color)
+   * instead of replacing the fill. */
+  preserve_shading?: boolean;
 }
 
 export class ApiError extends Error {}
