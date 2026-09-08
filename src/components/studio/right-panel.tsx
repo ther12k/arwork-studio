@@ -1,6 +1,8 @@
 "use client";
 
-/** Right panel — 01 / REGION COMPILER + 02 / REVIEW & EXPORT. */
+/** Right panel — 01 / REGION COMPILER + 02 / REVIEW & EXPORT.
+ *  Stage 2 adds the auto-subdivide switch (+ multistage prefill note) and the
+ *  difficulty profile panel (contract §5). */
 
 import { useState } from "react";
 import {
@@ -9,6 +11,7 @@ import {
   ChevronDown,
   Download,
   FileArchive,
+  Gauge,
   Image as ImageIcon,
   Loader2,
   Merge,
@@ -28,9 +31,11 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Slider } from "@/components/ui/slider";
-import { exportUrl, renderUrl, type ImageQuality } from "@/lib/studio-api";
+import { Switch } from "@/components/ui/switch";
+import { exportUrl, renderUrl, type DifficultyProfile, type ImageQuality } from "@/lib/studio-api";
 import { useStudioContext } from "./use-studio";
 import { ReviewDialog } from "./review-dialog";
+import { DIFFICULTY_TIERS as TIERS, normalizeDifficulty } from "./difficulty";
 
 function MicroCaption({ children, className = "" }: { children: React.ReactNode; className?: string }) {
   return <p className={`text-[10px] leading-relaxed text-[#778481] ${className}`}>{children}</p>;
@@ -51,6 +56,108 @@ function regionIdsIn(text: string): string[] {
 
 /** "#RRGGBB" only — the backend recolor route rejects anything else. */
 const HEX_COLOR_RE = /^#[0-9A-Fa-f]{6}$/;
+
+// ---------------------------------------------------- difficulty profile panel
+
+const num = (v: unknown): number | null => {
+  const n = typeof v === "number" ? v : Number(v);
+  return Number.isFinite(n) ? n : null;
+};
+
+/** Full difficulty profile (contract §5): 4-tier segmented bar + score +
+ *  metric rows with units + a palette-ambiguity chip. Legacy manifests carry
+ *  the string "unrated" — normalized to an Unrated note without bars. */
+function DifficultyPanel({ raw }: { raw: string | DifficultyProfile | undefined }) {
+  const normalized = normalizeDifficulty(raw);
+  if (!normalized) {
+    return (
+      <div className="rp-wide mt-4 rounded-[10px] border border-[#e1e5df] bg-[#f4f6f0] px-3 py-2.5">
+        <div className="flex items-center gap-1.5 text-[10px] font-semibold text-[#778481]">
+          <Gauge className="size-3.5" aria-hidden />
+          Difficulty profile
+        </div>
+        <p className="mt-1 text-[10px] leading-relaxed text-[#8a968f]">
+          Unrated — not computed for this revision. Rebuild with the upgraded compiler to analyze difficulty.
+        </p>
+      </div>
+    );
+  }
+  const { tier: activeTier, score } = normalized;
+  const tierIndex = TIERS.indexOf(activeTier);
+  const profile = normalized.profile;
+  const metrics = profile.metrics ?? {};
+  const ambiguity = metrics.paletteAmbiguity;
+  const ambiguityTone =
+    ambiguity === "high"
+      ? "border-[#e8cfc7] bg-[#fdf3f1] text-[#ba463f]"
+      : ambiguity === "medium"
+        ? "border-[#e8d9b8] bg-[#fdf6e3] text-[#957242]"
+        : "border-[#cce7dc] bg-[#e5f3ed] text-[#087f74]";
+  const rows: Array<[string, string]> = [
+    ["Regions", num(metrics.regionCount)?.toLocaleString("en-US") ?? "—"],
+    ["Median region area", num(metrics.medianRegionArea) != null ? `${num(metrics.medianRegionArea)!.toLocaleString("en-US", { maximumFractionDigits: 1 })} px²` : "—"],
+    ["Tiny targets", num(metrics.tinyRegionPct) != null ? `${num(metrics.tinyRegionPct)!.toFixed(1)} %` : "—"],
+    ["Required zoom", num(metrics.requiredZoom) != null ? `${num(metrics.requiredZoom)!.toFixed(1)} ×` : "—"],
+    ["Palette groups", num(metrics.paletteGroups)?.toLocaleString("en-US") ?? "—"],
+    ["Avg neighbours", num(metrics.avgNeighbors) != null ? num(metrics.avgNeighbors)!.toFixed(2) : "—"],
+    ["Subdivision edges", num(metrics.subdivisionEdges)?.toLocaleString("en-US") ?? "—"],
+    ["Object density", num(metrics.objectDensity) != null ? num(metrics.objectDensity)!.toFixed(2) : "—"],
+    ["Label clearance", String(metrics.labelClearance ?? "—")],
+  ];
+  return (
+    <div className="rp-wide mt-4 rounded-[10px] border border-[#dfe6d8] bg-[#eff3ec] px-3 py-2.5">
+      <div className="flex items-center justify-between gap-2">
+        <div className="flex items-center gap-1.5 text-[10px] font-semibold text-[#6c7c6b]">
+          <Gauge className="size-3.5" aria-hidden />
+          Difficulty profile
+        </div>
+        <span
+          className="rounded-full border px-2 py-0.5 text-[9px] font-bold uppercase tracking-[0.08em]"
+          style={{ color: TIERS[tierIndex].color, borderColor: TIERS[tierIndex].color, background: "white" }}
+        >
+          {TIERS[tierIndex].label}
+        </span>
+      </div>
+      {/* 4-tier segmented bar: each block = 25 points; filled up to score */}
+      <div
+        className="mt-2 flex h-2.5 gap-0.5 overflow-hidden rounded-full"
+        role="img"
+        aria-label={`Difficulty score ${score} of 100 — ${TIERS[tierIndex].label}`}
+      >
+        {TIERS.map((t, i) => {
+          const fill = Math.max(0, Math.min(1, (score - i * 25) / 25));
+          return (
+            <div key={t.key} className="relative h-full flex-1 rounded-[2px] bg-[#e1e5df]" title={`${t.label}: ${i * 25}–${t.max}`}>
+              <div className="h-full rounded-[2px]" style={{ width: `${fill * 100}%`, background: t.color }} />
+            </div>
+          );
+        })}
+      </div>
+      <div className="mt-1 flex justify-between text-[9px] text-[#778481]">
+        <span className={tierIndex === 0 ? "font-bold text-[#087f74]" : ""}>Easy</span>
+        <span className={tierIndex === 1 ? "font-bold text-[#087f74]" : ""}>Medium</span>
+        <span className={tierIndex === 2 ? "font-bold text-[#087f74]" : ""}>Hard</span>
+        <span className={tierIndex === 3 ? "font-bold text-[#087f74]" : ""}>Master</span>
+      </div>
+      <p className="mt-1.5 text-[11px] font-bold text-[#183837]">
+        Score {score} / 100
+      </p>
+      {ambiguity != null && (
+        <span className={`mt-1.5 inline-block rounded-full border px-2 py-0.5 text-[9px] font-semibold capitalize ${ambiguityTone}`}>
+          Palette ambiguity · {String(ambiguity)}
+        </span>
+      )}
+      <dl className="mt-2 grid grid-cols-2 gap-x-2.5 gap-y-1 text-[10px] leading-snug">
+        {rows.map(([label, value]) => (
+          <div key={label} className="flex items-baseline justify-between gap-1.5">
+            <dt className="text-[#778481]">{label}</dt>
+            <dd className="font-semibold text-[#183837]">{value}</dd>
+          </div>
+        ))}
+      </dl>
+    </div>
+  );
+}
 
 function NumberField({
   id,
@@ -174,6 +281,31 @@ export function RightPanel() {
         aria-label="Target regions"
       />
       <MicroCaption>An approximate target, not a guaranteed count.</MicroCaption>
+
+      {/* Auto-subdivide (contract §6): split the largest regions with organic
+          cuts until ~target. Prefilled from multi-stage generation hints. */}
+      <div className="mt-3 flex items-start justify-between gap-2.5 rounded-[10px] border border-[#dfe6d8] bg-[#eff3ec] px-3 py-2.5">
+        <div className="min-w-0">
+          <Label htmlFor="studio-auto-subdivide" className="text-[11px] font-semibold leading-snug text-[#183837]">
+            Auto-subdivide to target
+          </Label>
+          <p className="mt-0.5 text-[10px] leading-relaxed text-[#778481]">
+            Split the largest regions with organic cuts until the target count (SVG-master builds stay true
+            vector).{" "}
+            {project?.pendingBuildSettings && (
+              <span className="font-semibold text-[#087f74]">Suggested by multi-stage generation.</span>
+            )}
+          </p>
+        </div>
+        <Switch
+          id="studio-auto-subdivide"
+          checked={!!buildSettings.auto_subdivide}
+          onCheckedChange={(v) => setBuildSetting("auto_subdivide", v === true)}
+          disabled={busy}
+          className="mt-0.5 data-[state=checked]:bg-[#087f74]"
+          aria-label="Auto-subdivide regions to the target count"
+        />
+      </div>
 
       <div className="mt-3 grid grid-cols-2 gap-2">
         <NumberField
@@ -466,6 +598,10 @@ export function RightPanel() {
           <p>Compile an image to inspect geometry checks and small-target warnings.</p>
         )}
       </div>
+
+      {/* Difficulty profile (contract §5) — one place, no duplication:
+          the review panel, fed by the mounted bundle's manifest. */}
+      {bundle && <DifficultyPanel raw={bundle.manifest.difficulty} />}
 
       {/* Region inspector */}
       {view === "inspect" && bundle && (

@@ -1,0 +1,402 @@
+     1→# Worklog — Color Duel Art Studio integration
+     2→
+     3→Project: Port the uploaded `color_duel_art_studio` (Python/FastAPI + vanilla JS studio) into the
+     4→Next.js 16 sandbox so the user can operate the full authoring workflow from the preview panel.
+     5→
+     6→Architecture decisions:
+     7→- Python FastAPI studio backend runs as a mini-service on port **8765** (`mini-services/color-duel-studio`).
+     8→  The Next.js frontend (port 3000) reaches it via the Caddy gateway using `?XTransformPort=8765`
+     9→  and the required `X-Studio-Request: 1` header on POSTs.
+    10→- Frontend = single Next.js page at `/` (React + shadcn/ui), replicating and upgrading the vanilla
+    11→  studio (project list, reference/master upload, brief, chat, build settings, tabs Master/Vector/
+    12→  Numbered/Play test/Edit regions, inspector, QA panel, revisions, export links).
+    13→- `detailed-board.mjs` (VectorBoard) is ported to TypeScript at `src/lib/detailed-board.ts` and
+    14→  wrapped in a React component; the play test uses real geometry (regions/palette/paint JSON).
+    15→- AI features are bridged to z-ai-web-dev-sdk (LLM + image generation) through a bun mini-service
+    16→  on port **8787** (`mini-services/ai-bridge`) exposing an OpenAI-compatible endpoint layer; the
+    17→  Python `Provider` is patched with an `AI_BASE_URL` override so no external OpenAI key is needed.
+    18→
+    19→---
+    20→Task ID: 1
+    21→Agent: main (Z.ai Code)
+    22→Task: Set up the Python studio backend as a mini-service
+    23→
+    24→Work Log:
+    25→- Extracted `color_duel_art_studio_mvp.zip` to `/home/z/my-project/upload/extracted/color_duel_art_studio`
+    26→- Verified required Python deps exist in `/home/z/.venv` (fastapi, uvicorn, numpy, scipy,
+    27→  scikit-image, opencv-headless, rasterio, shapely, CairoSVG, Pillow, pytest)
+    28→- Copied source into `mini-services/color-duel-studio/` with `package.json` (dev → run.py, port 8765)
+    29→- Ran `pytest tests/test_pipeline.py tests/test_api.py -q` → **31 passed**
+    30→- Started backend via `bun run dev` in background (nohup, log: `studio.log`)
+    31→- Smoke-tested full pipeline: sample treehouse → build (768px, 650 target) → **done in ~13s,
+    32→  571 regions, QA passed**
+    33→- PATCHED `studio/app.py` middleware: origin check now compares hostnames ignoring the port
+    34→  (Caddy forwards `Host {host}` without port, breaking `localhost:81` origins)
+    35→- PATCHED `studio/ai.py`: `_client()` honors `AI_BASE_URL` env override so the provider can
+    36→  point at a private OpenAI-compatible bridge instead of api.openai.com
+    37→- Verified gateway round trip: GET+POST `/api/...?XTransformPort=8765` via Caddy :81 with
+    38→  `X-Studio-Request: 1` header → works
+    39→- Workspace: kept one demo project "Cascade Treehouse" (art-088a00d04df04086) with a compiled
+    40→  revision (rev-6d7979a026014730, 571 regions) for frontend testing
+    41→
+    42→Stage Summary:
+    43→- Python studio backend is LIVE on 127.0.0.1:8765, reachable through the gateway at
+    44→  `?XTransformPort=8765`. AI features currently NOT configured (no key) — frontend must render
+    45→  disabled state until Task 3 (z-ai bridge) flips `config.ai.configured` to true.
+    46→- AI bridge patch point ready: set `OPENAI_API_KEY` + `AI_BASE_URL` in
+    47→  `mini-services/color-duel-studio/.env` and restart to enable.
+    48→
+    49→---
+    50→Task ID: 3
+    51→Agent: main (Z.ai Code)
+    52→Task: AI bridge mini-service (z-ai-web-dev-sdk) + wire the studio to it
+    53→
+    54→Work Log:
+    55→- Read SKILL.md docs for LLM / image-generation / image-edit / VLM skills
+    56→- Created `mini-services/ai-bridge/` (bun, `bun --hot index.ts`, port 8787): an OpenAI-compatible
+    57→  shim with `POST /v1/responses` (chat, uses createVision when the payload carries a reference
+    58→  image, robust {reply, brief} JSON extraction incl. one normalization retry),
+    59→  `POST /v1/images/generations` (size map 1024x1536→864x1152 etc.), `POST /v1/images/edits`
+    60→  (multipart → data-URL edit), `GET /healthz`; binds 127.0.0.1 only
+    61→- Started bridge in background (`bridge.log`), health check OK
+    62→- Direct bridge tests: chat → clean {reply, brief}; generation → 864x1152 JPEG in ~73s;
+    63→  edit → 864x1152 JPEG in ~15s
+    64→- Created `mini-services/color-duel-studio/.env` (OPENAI_API_KEY=local-z-ai-bridge,
+    65→  AI_BASE_URL=http://127.0.0.1:8787/v1/, CHAT_MODEL=glm-4.6, IMAGE_MODEL=cogview-4) and
+    66→  restarted the studio
+    67→- Verified `/api/config` → `ai.configured: true`; full studio flow tests via the gateway:
+    68→  chat job done with brief refinement + messages, generate job done (864x1152 master,
+    69→  2 aiUsage entries); test project cleaned up afterwards
+    70→
+    71→Stage Summary:
+    72→- AI features are LIVE end-to-end through the sanctioned chain:
+    73→  browser → gateway(XTransformPort=8765) → Python studio → AI_BASE_URL bridge (8787) →
+    74→  z-ai-web-dev-sdk. No external OpenAI key required. The `confirm_paid` checkbox gate remains
+    75→  in the UI for every AI request, as designed.
+    76→
+    77→---
+    78→Task ID: 4
+    79→Agent: main (Z.ai Code)
+    80→Task: End-to-end verification with Agent Browser + fixes
+    81→
+    82→Work Log:
+    83→- Opened http://localhost:81/ (gateway origin) in agent-browser: page renders, demo project
+    84→  "Cascade Treehouse" auto-opens (571 regions), no console/page errors
+    85→- VLM-reviewed screenshots: professional 3-column layout, warm paper + teal design, artwork
+    86→  rendering in canvas — no defects
+    87→- Golden path on a NEW project in the browser:
+    88→  1. New project created
+    89→  2. Chat: typed brief direction, checked "Allow this AI request" → job polled to done →
+    90→     assistant reply rendered, brief updated (AI refined to cozy cottage scene)
+    91→  3. Generate master: paid-confirmed → z-ai generation (~90s) → master displayed (864x1152)
+    92→  4. Build vector draft → 12s → 658 regions / 32 palette groups / 80 paint paths,
+    93→     "✓ Geometry checks passed"
+    94→  5. Play test: swatch select + pointer tap fill and keyboard Enter fill → "2 / 658 regions
+    95→     filled · 0 incorrect attempts"; VLM confirmed filled regions reveal artwork while others
+    96→     show white masks with numbers
+    97→  6. Export: game bundle ZIP downloaded via gateway (3.45 MB, 13 entries — artwork.json,
+    98→     regions/palette/paint JSON, colored/numbered/linework/ink SVGs, thumbnail, validation,
+    99→     catalog-entry.json, IMPORT.md)
+   100→- Edit regions view: keyboard-selected a region → "1 selected · r-00001" + inspector populated
+   101→- Responsive: found and FIXED a real bug — at ≤720px the flex-column `.studio-main` inherited
+   102→  `align-items:start` from the grid rule, so panels shrank to content width (body 1432px wide
+   103→  at a 390px viewport). Fixed in globals.css mobile media query (`align-items:stretch` +
+   104→  width:100% panels); re-verified bodyScrollW == 390, canvas 358px, board 328x476
+   105→- Footer: pushed naturally to the bottom on long pages (footerBottom == viewport height after
+   106→  scroll); root uses min-h-screen flex-col with mt-auto footer
+   107→- Cleaned workspace: removed "Reference playpen" scratch project; renamed the AI-generated
+   108→  demo to "Cliffside Cottage at Golden Hour"
+   109→- Final state: no browser console errors, no page errors, dev.log clean, `bun run lint` 0
+   110→  problems, all three services healthy (3000 / 8765 / 8787)
+   111→
+   112→Stage Summary:
+   113→- The complete Color Duel Art Studio workflow is browser-verified end-to-end:
+   114→  reference/upload → AI chat brief refinement → AI master generation → local vector
+   115→  compilation → review (Master/Vector/Numbered/Play test/Edit regions) → export game ZIP.
+   116→- One responsive-layout bug found and fixed during verification.
+   117→
+   118→
+   119→---
+   120→Task ID: 2
+   121→Agent: frontend (Z.ai Code)
+   122→Task: Build the Color Duel Art Studio frontend (React + shadcn/ui on Next.js 16)
+   123→
+   124→Work Log:
+   125→- Read the vanilla implementation (web/studio.mjs, index.html, studio.css, detailed-board.mjs,
+   126→  examples/compiled-treehouse JSON, schemas/regions.schema.json) and mirrored its behavior.
+   127→- NEW `src/lib/detailed-board.ts`: TypeScript port of VectorBoard (validateBundle, mount, pan/pinch/
+   128→  wheel gestures, Path2D+evenodd tap hit-testing, keyboard paint, paint/undo/reset/nextRegion/zoom/
+   129→  fit/setPalette/setPreview/updateLabelVisibility/destroy, elements/regions maps, overridable
+   130→  `paint` + `clientToArt` fields). Replaced `loadArtwork` with gateway-aware `loadBundle(pid, rev)`
+   131→  (fetches artwork/regions/palette/paint.json with `?XTransformPort=8765`); dropped localStorage
+   132→  persistence (persist:false in-memory sessions only). Bug fixed during port: `setPreview` was
+   133→  initially missing → runtime TypeError, caught via browser test and restored.
+   134→- NEW `src/lib/studio-api.ts`: fully typed API client (ApiError parsing of `detail`, X-Studio-Request
+   135→  header on every call, relative URLs + XTransformPort, URL builders for image/export/render with
+   136→  `?v=<sha256>` cache-bust).
+   137→- NEW `src/components/studio/` — `use-studio.tsx` (StudioProvider context: project/config/view/bundle/
+   138→  board/selection state + job polling every 900ms, open/create/save-brief/upload/promote/sample/chat/
+   139→  generate/build/edit/activate/review actions, refs for paint-wrapper closures), `studio-page.tsx`
+   140→  (header w/ brand tile + AI status pill + LOCAL MVP badge, 3-col responsive main, slim mt-auto
+   141→  footer), `left-panel.tsx` (workspace select, title, reference card + hidden file input + rights
+   142→  checkbox + promote, treehouse sample, chat w/ paid-consent gate), `canvas-workspace.tsx`
+   143→  (brief box, generation-source select, view tabs Master/Vector/Numbered/Play test/Edit regions,
+   144→  zoom tools, canvas w/ dotted-grid backdrop, React renders the board `<svg>` ONCE with no children —
+   145→  VectorBoard owns its DOM), `right-panel.tsx` (compiler settings incl. target-regions slider +
+   146→  advanced collapsible, stats, QA box w/ amber warning scroll list, region inspector w/
+   147→  palette/group inputs + 6 edit actions + Place-number flow, revision history + restore, review
+   148→  dialog trigger, export links as real `<a download>`), `review-dialog.tsx`, `guide-dialog.tsx`.
+   149→- Inspect-mode wiring: `board.paint` wrapped (taps toggle selection + populate inspector inputs +
+   150→  `.selected-region` class; placing mode submits edit action `label` with captured tap point),
+   151→  `board.clientToArt` wrapped to record `board.lastTapPoint`; preview ON for Vector/Edit-regions,
+   152→  OFF for Numbered/Play test. Palette bar visible in Numbered/Play test/Edit regions (as in the
+   153→  original); progress text from boardState; wrong-color toast.
+   154→- `src/app/page.tsx` → server shell rendering `<StudioPage />` (metadata "Color Duel · Art Studio");
+   155→  `src/app/layout.tsx` → sonner Toaster mounted (replaced old toaster); `src/app/globals.css` →
+   156→  appended studio design language (warm paper #f5f4ef, teal #087f74, dotted canvas, .selected-region
+   157→  style, slim custom scrollbars, 3-col→2-col(≤1150px)→1-col canvas-first(≤720px) grid).
+   158→- eslint.config.mjs: added ignores for mini-services/, upload/, download/, db/ (vendored reference
+   159→  JS not part of the Next app broke the new react-hooks/refs rule); fixed all lint issues in src/
+   160→  (ref-during-render violations from context member access → destructuring; shadowed API import
+   161→  caused infinite-recursion risk in promoteReference; deferred poll self-reference via ref).
+   162→
+   163→Verification (agent-browser via gateway http://localhost:81/):
+   164→- Page renders with clean console; demo "Cascade Treehouse" auto-opens on its compiled revision
+   165→  (571 regions, stats 571/32/80, Vector view active, board = 571 region buttons + labels).
+   166→- Play test: swatch select → tap region → "1 / 571 regions filled"; wrong palette → mistake counter;
+   167→  Undo fill and Reset test both work. Numbered labels appear when zoomed (403 at 274%).
+   168→- Edit regions: taps select (highlight + "N selected · ids" + inspector inputs populated);
+   169→  non-adjacent merge → graceful error toast; adjacent merge → job polled to done, new revision
+   170→  v0.2.0/570 regions mounted, badge/stats/revision list updated (then restored v0.1.0 via
+   171→  "Restore selected revision" — works).
+   172→- New project → "Try the bundled treehouse" → master shown → "Build vector draft" → progress
+   173→  38%→70%→100% → done → auto-switch to Vector with 546-region board.
+   174→- Export links present with correct relative hrefs; ZIP downloaded through gateway (4.9MB, valid).
+   175→- AI controls render disabled ("API key required" / muted pill) as config.ai.configured=false.
+   176→- Guide dialog, review dialog (≥10-char note → "✓ Self-attested visual review recorded"), reference
+   177→  upload + promote (rights gate error toast + success path), zoom controls verified.
+   178→- Responsive: 1512px 3-col, 1000px 2-col + right panel wrapped as 2-col grid, 390px single column
+   179→  with canvas first. `bun run lint` → 0 problems; dev.log clean.
+   180→
+   181→Stage Summary:
+   182→- Full authoring workflow is live in the preview panel at `/` (single client page; all API calls
+   183→  relative through ?XTransformPort=8765 with X-Studio-Request). No routes/DB/server actions touched.
+   184→- Workspace now also contains a "Reference playpen" scratch project (from upload/promote testing);
+   185→  "Cascade Treehouse" remains the showcase project, currently on pristine v0.1.0 (571 regions).
+   186→- Known gaps: AI chat/generate disabled until Task 3 flips config.ai.configured; merge/place-number
+   187→  etc. depend on backend validation (errors surfaced as toasts); board test progress is in-memory
+   188→  only (never written to player progress).
+   189→
+   190→---
+   191→Task ID: 2-a
+   192→Agent: asset-author (subagent)
+   193→Task: Author examples/treehouse-master.svg curved SVG demo master
+   194→
+   195→Work Log:
+   196→- Read worklog + inspected `mini-services/color-duel-studio/` layout; confirmed render
+   197→  tooling (cairosvg + Pillow) available in /home/z/.venv.
+   198→- Hand-planned a 576x768 portrait scene with layered z-order: gradient sky / radial sun
+   199→  halo / 2 cubic clouds / 2 rolling hill layers / curved trunk with quadratic root flares /
+   200→  4+1 layered canopy blobs / straight-edge treehouse (platform, walls, triangular roof,
+   201→  evenodd window with cut-out hole + glass, attic porthole, door, flag) / catenary rope
+   202→  bridge to a post / straight ladder with ink rungs / 3 identical transform-translated
+   203→  flowers / same-document `use` leaf / translate+rotate songbird group in local coords.
+   204→- Authored `/home/z/my-project/mini-services/color-duel-studio/examples/treehouse-master.svg`
+   205→  using ONLY the sanitizer-supported element set (svg/g/defs/linearGradient/radialGradient/
+   206→  stop/path/rect/circle/ellipse/polygon/polyline/line/use) and presentation attributes
+   207→  (fill, fill-opacity, fill-rule, stroke, stroke-width, transform, id, data-*).
+   208→- Verification: ET.parse well-formed OK; grep confirmed 124 `C` + 12 `Q` commands,
+   209→  2 gradients referenced via url(#), 2 evenodd holes, 5 transforms, 4 shading shapes,
+   210→  exact viewBox, 0 forbidden elements (style/image/text/script/filter/mask/clip/pattern/
+   211→  DOCTYPE); 24 flat fill colors + 5 gradient stop colors = 29 distinct.
+   212→- Rendered via cairosvg to PNG and ran 40+ PIL pixel probes (sun, clouds, hills, trunk,
+   213→  knot ring + hole, canopy layers, ropes, planks, post, platform, walls, roof + shading
+   214→  blend, window/attic glass, door, flag, rails, rungs, tufts, flowers, leaf, bird body/
+   215→  wing/beak). Occlusion test: all 361 pixels of the hidden rock ellipse are exactly trunk
+   216→  color, and rock-gray appears nowhere in the render -> FULLY HIDDEN.
+   217→- First VLM review (z-ai vision) flagged: ladder floating left of trunk, bridge ending in
+   218→  mid-air (thin post), grass tufts reading as scribbles, canopy gap above platform. Fixed:
+   219→  ladder moved to x 184–224 with rails hooking over the platform edge and leaning on the
+   220→  trunk base; post widened to 16px and extended 27px into the grass; tufts restyled as 5
+   221→  short blades; canopy back blob bottom deepened to y~355 so the house reads nestled in
+   222→  the tree; bird nudged to clear the sun halo. Re-rendered, re-probed (all OK), second VLM
+   223→  review confirms ladder/bridge/grass/composition all clean.
+   224→
+   225→Stage Summary:
+   226→- Produced: `mini-services/color-duel-studio/examples/treehouse-master.svg` (8088 bytes,
+   227→  well-formed, ~53 drawn shapes) — ready as the test fixture for the parallel sanitized
+   228→  SVG-master import route.
+   229→- Checklist coverage: (1) many C + Q curves; (2) 2 evenodd holes (window frame with
+   230→  cut-out + hollow trunk-knot donut); (3) linearGradient sky + radialGradient sun glow,
+   231→  3 stops each, referenced via url(#); (4) bird g translate(498,212) rotate(-10) with 4
+   232→  local-coord shapes (+3 flower translate groups + transform on use); (5) pure
+   233→  straight-line architecture (walls/roof/door/platform/ladder rails/planks); (6) 4
+   234→  data-cd-role="shading" shapes with fill-opacity 0.2–0.32 (the only semi-transparent
+   235→  shapes); (7) many disconnected same-fill groups (4x #E8604C petals+flag, 3x #FFC94D
+   236→  centers, 2x #F6E7C8 window frames, 2x #A8DDE8 glass, 2x #FFFDF7 clouds, 2x #79B258
+   237→  canopy+leaf, 2x #B58A5A ropes, 2x #B3763F rails, 3x #8B5E3C trunk/roots/post); (8) one
+   238→  role-less rock ellipse drawn early, geometrically proven 100% covered by the trunk;
+   239→  (9) 3 stroke-only ink elements (#29383E, width 2–2.5: flagpole `<line>`, rungs path,
+   240→  grass `<polyline>`); (10) background→midground→tree/house→details order, every gameplay
+   241→  shape pixel-verified partially visible except the hidden rock.
+   242→- Note: 24 flat fill colors (29 incl. gradient stops) and 54 shape elements (incl. the
+   243→  defs leaf) — one notch above the 50-shape guide in exchange for covering every supported
+   244→  element type (line, polyline, ellipse, polygon, use all exercised).
+   245→
+   246→---
+   247→Task ID: 2-b
+   248→Agent: frontend-ui (subagent, completed by main agent after context timeout)
+   249→Task: Zoom lab comparison view, SVG master import card, backend settings, split button, validation fields
+   250→
+   251→Work Log:
+   252→- Created `src/components/studio/zoom-lab.tsx` (354 lines): crop-picker overview SVG with
+   253→  pointer-draggable + keyboard-nudgeable crop rect, 3x2 comparison grid (100%/400%/1000% x
+   254→  curved/legacy) fed by fetchGeometryMode(pid, rev, mode), skeletons, error card.
+   255→- `canvas-workspace.tsx`: added "zoomlab" to VIEW_ORDER + canvasTag, renders <ZoomLab/>
+   256→  instead of the board for that view; master view renders masterSvgUrl(img) when
+   257→  project.master.kind === 'svg' plus the sanitize-summary figcaption.
+   258→- `left-panel.tsx`: new "SVG master (curves preserved)" card — load curved SVG example,
+   259→  Import SVG master file input (rights-gated), AI SVG generation (paid consent gate,
+   260→  prompt textarea, aspect select) wired to generateSvg().
+   261→- `right-panel.tsx`: Geometry backend Select (spline-local / polygon-legacy), Curve fit
+   262→  tolerance slider, Corner threshold slider (advanced), Split button in the edit actions,
+   263→  QA geometry row set (curved commands, hit-test probes/conflicts, flatten tolerance,
+   264→  partition band) and the amber "Visual review" limitations block separated from
+   265→  geometry tests.
+   266→- (main agent) fixed: view tab row now flex-wrap (mobile 390px overflow 438->390),
+   267→  detailed-board ink paths accept open stroke line art (strokeWidth/filled fields).
+   268→
+   269→Stage Summary:
+   270→- All four UI features live and browser-verified; lint 0 problems; mobile wraps cleanly.
+   271→
+   272→---
+   273→Task ID: 5/6/7/8/9/10 (main agent)
+   274→Agent: main (Z.ai Code)
+   275→Task: Curve-preserving SVG workflow upgrade — geometry kernel, sanitized SVG-master import,
+   276→pluggable backends, authoritative curved region masters, curve-preserving edits, smooth
+   277→paint/ink/gameplay masks, shading separation, validation/versioning/labels/hit-testing,
+   278→save compatibility, exports, API routes, E2E verification
+   279→
+   280→Work Log:
+   281→- Inspected studio/pipeline.py: confirmed pixel-edge polygon output (path_of M/L/Z only,
+   282→  rasterio shapes, rings authoritative) as the staircase source.
+   283→- NEW studio/curves.py (~700 lines): robust SVG path parser (relative/S/T/A flags,
+   284→  arc->cubic), formatter, adaptive flatten with explicit tolerance, even-odd point/area,
+   285→  RDP, windowed corner detection (adaptive window, adjacent-merge), Schneider cubic
+   286→  fitting with robust min-distance end tangents + control-hull degeneracy guard,
+   287→  fit_polyline/fit_ring, exact chain reversal, affine transforms. Smoke-tested.
+   288→- NEW studio/svg_master.py (~640 lines): sanitized SVG import — whitelisted elements only,
+   289→  DTD/entity rejection, script/image/foreignObject stripping with report, curve/hole/
+   290→  gradient/transform/drawing-order preservation, per-shape resolved userSpace gradients,
+   291→  hidden-shape occlusion exclusion, never rasterizes. clean_svg upload entry.
+   292→- REWROTE studio/pipeline.py: crack-edge shared-boundary chains (pair-constant walks with
+   293→  forced breaks at component-degree!=2 vertices, rotated Euler cycles, whole-chain
+   294→  segment assembly with two safety passes) -> each chain fitted ONCE and reused by both
+   295→  neighbouring regions (reversed), so the curved partition is watertight by construction;
+   296→  regions/paint/ink all curved (trace_paint via the same chain machinery); polygon-legacy
+   297→  backend reproduces the pre-upgrade output exactly (fit=False pack); compile_svg_master
+   298→  (shading/gameplay separation by role+opacity, disconnected tap-target splitting,
+   299→  palette from master fills, gradients in paint.json, partitionTolerance from measured
+   300→  overlap); pack_region dual-signature (commands or polygon w/ corner-preserving refit);
+   301→  solid_polygons even-odd nesting (boundary-vertex depth parity); validate_bundle with
+   302→  master re-parse + flatten consistency, partition checks with documented band, raster
+   303→  roundtrip, hit-test probe alignment (z-order aware for stacked masters), curve stats,
+   304→  separate visualReview limitations block; edit_bundle merge with measured
+   305→  symmetric-difference partition allowance, split action, label/palette/group; load_bundle
+   306→  migrates legacy v1 polygon bundles in memory; legacy_geometry zoom-lab payload;
+   307→  BACKENDS registry. models.py: backend/curve_tolerance/corner_angle_deg + GenerateSvgRequest
+   308→  + split action.
+   309→- app.py: /upload-svg, /master/svg, /sample-svg, /generate-svg (paid, Provider.svg ->
+   310→  bridge), geometry?mode=curved|legacy endpoint, config backends registry (v0.2.0,
+   311→  geometrySchema 2), build dispatch by master kind, source-master.svg in FILES.
+   312→  ai.py: SVG_DIRECTION + Provider.svg (parses <svg>…</svg>, size budget).
+   313→  ai-bridge: new POST /v1/svg route (chat -> raw SVG extraction + one normalization
+   314→  retry; toZaiMessages parameterized contract).
+   315→- Frontend: studio-api.ts (backends, SvgMasterSummary, ModeRegion/GeometryModePayload,
+   316→  uploadSvgMaster/loadSvgSample/generateSvgMaster/fetchGeometryMode/masterSvgUrl,
+   317→  QaReport geometry/visualReview fields); detailed-board.ts (SAFE_PATH +C/Q,
+   318→  gradient defs + url(#g-*) paint fills, open stroke ink paths, reversed topmost-wins
+   319→  hitTest); use-studio.tsx (backend settings state, SVG master actions, zoomlab view).
+   320→- Studio service runs detached via double-fork (plain background spawns are reaped
+   321→  between tool commands in this sandbox).
+   322→- Rebuilt demo: Cascade Treehouse raster curved build (552 regions, 551 curved, QA pass,
+   323→  missing 0.0 / overlap 0.39px2 band / roundtrip 0 / 1754 probes 0 conflicts) + new
+   324→  "Treehouse SVG Master (curves preserved)" project (40 regions from treehouse-master.svg).
+   325→- E2E (agent-browser, gateway :81): page clean; SVG master preview (img 576px) + sanitize
+   326→  summary; Zoom lab renders 3x2 grid, crop drag verified with art-unit mapping; play test
+   327→  tap-to-fill on curved geometry (1/40 filled, 0 incorrect after swatch select; z-order
+   328→  topmost resolution observed live); QA panel fields; export ZIP has all 8 required files
+   329→  with schema-2 masters; mobile 390px no overflow (tab row wraps); sticky footer OK;
+   330→  lint 0.
+   331→- VLM visual review (separate from geometry tests): zoom-lab 400%/1000% screenshots —
+   332→  curved column smooth vs legacy staircase confirmed, numbers readable, no glaring
+   333→  defects; numbered view — numbers inside regions, smooth boundaries, no defects.
+   334→- Existing suite: 31/31 pytest tests pass (incl. exact 0.0/0.0 partition + roundtrip
+   335→  assertions on the fresh fixture).
+   336→
+   337→Stage Summary:
+   338→- Curve-preserving workflow is live end-to-end: SVG-master import (never rasterized),
+   339→  local spline tracing (default), legacy polygon backend (comparison), separate paid
+   340→  AI SVG-generation route; curved masters authoritative with documented ±0.25px derived
+   341→  rings; merge/split/label edits keep geometry curved with measured partition allowance;
+   342→  versioning + contentHash unchanged; exports carry schema 2 + visualReview separation.
+   343→- Known gaps: external image-to-SVG provider listed but unavailable without server-side
+   344→  credentials (by design); curve fit tolerance 1.0px leaves a documented sub-px
+   345→  partition band on 1px raster features.
+   346→
+   347→---
+   348→Task ID: 11
+   349→Agent: main (Z.ai Code)
+   350→Task: Review for best practices and fix the React hydration error
+   351→("A tree hydrated but some attributes of the server rendered HTML didn't match
+   352→the client properties" — mismatched aria-controls="radix-_R_..." on the
+   353→DialogTrigger button in the Header)
+   354→
+   355→Work Log:
+   356→- Audited the rendered tree for hydration safety: no `typeof window` branches,
+   357→  no Date.now()/Math.random()/locale date formatting during render, no
+   358→  localStorage reads during render (both usages live inside effects/callbacks),
+   359→  static string ids for all Label/htmlFor pairs, sonner Toaster wrapper is
+   360→  deterministic (next-themes useTheme without provider returns defaults).
+   361→- Clean-browser reproduction attempt: 7 loads + reloads → NO hydration error
+   362→  (the mismatch is intermittent — matches the "some page loads" reports).
+   363→- Root-caused via React 19.2.3 source (node_modules react-dom mountId): during
+   364→  hydration, useId derives IDs from the fiber tree position (`_R_` + base32
+   365→  path). If the streamed SSR tree differs from the hydration tree (Next App
+   366→  Router + Suspense/streaming), every useId after the divergence shifts.
+   367→  Confirmed as the known upstream issue radix-ui/primitives#3700 →
+   368→  react#24669 ("useId is only stable when the tree matches; React team: not a
+   369→  bug"), no React-side fix in 19.2.4–19.2.8.
+   370→- KEY FINDING: installed @radix-ui/react-dialog@1.1.15 and
+   371→  @radix-ui/react-select@2.2.6 render `"aria-controls": context.contentId`
+   372→  UNCONDITIONALLY — the useId lands in the SSR HTML of every closed trigger.
+   373→  Latest versions render `"aria-controls": context.open ? context.contentId :
+   374→  void 0` — attribute omitted when closed → nothing left to mismatch.
+   375→- FIX: `bun add @radix-ui/react-dialog@^1.1.23 @radix-ui/react-select@^2.3.7`
+   376→  (the two useId-bearing primitives rendered on the page; other used primitives
+   377→  — checkbox/slider/progress/label — generate no SSR useId attributes).
+   378→  Verified installed dist contains the conditional aria-controls on both.
+   379→- Verified SSR HTML via curl: ZERO `aria-controls` and ZERO `radix-_R_` ids in
+   380→  the streamed output; both dialog triggers still render (aria-haspopup).
+   381→- Dev server lifecycle: the boot-started server was killed for the module
+   382→  upgrade and sandbox-reaped attempts (nohup/setsid) kept dying with the tool
+   383→  command's process tree. Added `.zscripts/daemon.py` (classic double-fork +
+   384→  setsid, orphaned to init while the spawning command is alive) — dev server
+   385→  now survives across tool commands (PID 3932, PPID 1); dev.pid updated.
+   386→- HARDENING: guarded `svg.setPointerCapture` in src/lib/detailed-board.ts with
+   387→  try/catch — synthetic/test events or stale pointer ids threw NotFoundError,
+   388→  skipping drag setup and breaking the tap flow (caught during verification;
+   389→  real pointer events unaffected).
+   390→- REGRESSION REPAIR: the boot-restarted studio backend had lost
+   391→  mini-services/color-duel-studio/.env (dotfile lost in container sync), so
+   392→  config.ai.configured was false. Recreated the .env (bridge URL/models),
+   393→  killed the boot-time duplicate ai-bridge instance (second bun --hot that
+   394→  never bound 8787) and the stale studio, restarted the studio detached via
+   395→  daemon.py. `ai.configured: true`, chatModel glm-4.6, imageModel cogview-4;
+   396→  page pill shows "Local compiler + AI connected".
+   397→- Browser verification (agent-browser, gateway :81):
+   398→  - 6 rapid reloads + fresh isolated session: 0 hydration errors, 0 page
+   399→    errors, clean console (only HMR/Fast-Refresh logs).
+   400→  - Guide dialog: opens, trigger aria-controls === content id at runtime
+
+[showing lines 1-400 of 800; use offset=401 with limit to continue reading]

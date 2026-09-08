@@ -137,6 +137,9 @@ export interface Project {
   revisions: Revision[];
   currentRevision: string | null;
   job: Job;
+  /** Set by multi-stage SVG generation: the next Build should apply these
+   *  (auto-subdivide to the requested region count). */
+  pendingBuildSettings?: { auto_subdivide: boolean; target_regions: number } | null;
 }
 
 export type GenerateSource = "brief" | "reference" | "current";
@@ -154,9 +157,11 @@ export interface BuildSettings {
   backend?: "spline-local" | "polygon-legacy";
   curve_tolerance?: number;
   corner_angle_deg?: number;
+  /** Stage 2: deterministically split large regions until ~target_regions. */
+  auto_subdivide?: boolean;
 }
 
-export type EditAction = "merge" | "group" | "palette" | "recolor" | "label" | "decorate" | "split";
+export type EditAction = "merge" | "group" | "palette" | "recolor" | "label" | "decorate" | "split" | "cut" | "draw";
 
 export type GeometryMode = "curved" | "legacy";
 
@@ -204,6 +209,32 @@ export interface EditPayload {
   /** 'recolor': keep gradient shading (tinted toward the target color)
    * instead of replacing the fill. */
   preserve_shading?: boolean;
+  /** 'cut': the cut polyline (open path, M/L only). 'draw': the closed
+   * region outline (M…Z). Pattern ^M[\s\d.,eE+\-MLQCZz]+$ upstream. */
+  d?: string;
+}
+
+/** Difficulty metrics from the compiler analyzer (contract §5).
+ *  Numbers unless noted; labelClearance and paletteAmbiguity are enums
+ *  expressed as strings. Extra keys are tolerated for forward compat. */
+export interface DifficultyMetrics {
+  regionCount?: number;
+  medianRegionArea?: number;
+  tinyRegionPct?: number;
+  requiredZoom?: number;
+  labelClearance?: "ok" | "tight" | "conflict" | string;
+  paletteAmbiguity?: "low" | "medium" | "high" | string;
+  paletteGroups?: number;
+  avgNeighbors?: number;
+  subdivisionEdges?: number;
+  objectDensity?: number;
+  [key: string]: unknown;
+}
+
+export interface DifficultyProfile {
+  rating: "easy" | "medium" | "hard" | "master";
+  score: number;
+  metrics: DifficultyMetrics;
 }
 
 export class ApiError extends Error {}
@@ -297,7 +328,16 @@ export const uploadSvgMaster = (pid: string, file: File, rightsConfirmed: boolea
 
 export const generateSvgMaster = (
   pid: string,
-  body: { prompt: string; aspect: "1024x1536" | "1536x1024" | "1024x1024"; include_reference: boolean; confirm_paid: boolean }
+  body: {
+    prompt: string;
+    aspect: "1024x1536" | "1536x1024" | "1024x1024";
+    include_reference: boolean;
+    confirm_paid: boolean;
+    /** "single" = one-shot SVG; "multistage" = scene plan → objects → compose. */
+    mode: "single" | "multistage";
+    /** Multistage only: desired region count after auto-subdivide (60..1200). */
+    target_regions: number;
+  }
 ): Promise<{ jobId: string; projectId: string }> => post(`/projects/${pid}/generate-svg`, body);
 
 export const fetchGeometryMode = (pid: string, rev: string, mode: GeometryMode): Promise<GeometryModePayload> =>

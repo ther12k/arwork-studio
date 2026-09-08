@@ -644,3 +644,314 @@ Stage Summary:
   ~1px boundary band (489 px² on the treehouse, reported as
   partitionTolerance with an explicit warning); vector-authoring tools
   (node editing, connected-region cuts, layer model) remain stage-2 work.
+
+---
+Task ID: 8
+Agent: main (Z.ai Code)
+Task: Stage-2 plan + SHARED CONTRACT for the six review features (cut/pen tools,
+edges kinds, AI multi-stage vector generation, free color, difficulty analyzer,
+cached high-performance renderer). Tasks 9-a (Python backend) and 9-b (Next.js
+frontend) implement against THIS contract so the studio renderer, the shipped
+game adapter and the JSON schema cannot drift.
+
+Work Log:
+- Confirmed current state: react/react-dom 19.2.3 (hydration fix in), dev server
+  running on :3000, Python studio service running on :8765 via
+  .zscripts/daemon.py (restart = kill PID + relaunch daemon.py), next.config has
+  no ignoreBuildErrors, stage-1 all green.
+- Read pipeline.py (compile_svg_master/edit_bundle/validate_runtime_contract/
+  make_export), app.py routes, models.py, ai.py, detailed-board.ts (full),
+  canvas-workspace.tsx, studio-api.ts.
+
+Stage Summary — THE STAGE-2 CONTRACT (authoritative for tasks 9-a and 9-b):
+
+(1) EDGES (true vs artificial boundaries) — regions.json ADDITIVE extension:
+  geometry.edges?: EdgeEntry[]  (absent/empty ⇒ legacy behavior: region paths
+  stroke with the current global style; NO visual regression for old bundles)
+  geometry.boundaryStyle?: { artwork: {stroke: string, strokeWidth: number, dash?: string},
+                             subdivision: {stroke: string, strokeWidth: number, dash?: string} }
+  EdgeEntry = { id: "e-####" (SAFE_ID), d: string (M/L/C/Q path, open or closed,
+               matches ^M[\s\d.,eE+\-MLQCZz]+$), kind: "artwork" | "subdivision",
+               leftRegion: string | null, rightRegion: string | null }
+  RENDER RULE (both renderers): when edges is a non-empty array, region paths
+  render FILL-ONLY (no stroke) and boundaries are drawn by an edges overlay
+  group ABOVE masks/ink, BELOW labels:
+   - artwork:      dark solid,  strokeWidth 1.6 (default #22333B / geometry.stroke), no dash
+   - subdivision:  light dashed, strokeWidth 0.85 (default #7A8C94), dash "3 2.2" userSpace
+  boundaryStyle (when present) overrides the defaults above. Runtime export keeps
+  edges + boundaryStyle in the lean geometry. Schema JSON gains both (optional).
+  Compiler emission: SVG-master verbatim regions → their region d as artwork
+  edges; derived (covered) regions → outline segments classified by proximity
+  (segments within ~1.5px of a master-shape boundary = artwork, else subdivision).
+  Raster compiles: emit nothing (fallback look) in v1. Cut/pen/draw edits emit
+  classified edges (below). validate_runtime_contract + JSON schema + BOTH
+  adapters validate edge entries (d pattern, kind enum, region refs exist).
+
+(2) CUT TOOL — edit action "cut": EditRequest gains
+  d: str | None (pattern ^M[\s\d.,eE+\-MLQCZz]+$), region_ids = exactly ONE.
+  Server: flatten d to polyline (curves.py), extend across the target's bbox on
+  both ends, split region_polygon(target) with the line (shapely split +
+  make_valid). Must yield ≥2 pieces each ≥ min playable size, else ValueError
+  with actionable text. Each piece → pack_region refit, id "r-c-<hash12>",
+  paletteId/objectId inherited, label recomputed. Edges: remove the target's
+  old edge entries touching it; for each piece, split its flattened outline
+  into consecutive segments classified by proximity to the cut polyline
+  (within ~1.5px ⇒ subdivision; else artwork — inherits prior classification
+  if the prior outline was already classified), merge same-kind runs, emit
+  with left/right = adjacent new piece ids (or null at canvas boundary).
+
+(3) PEN TOOL — edit action "draw": d = CLOSED path (M…Z), palette_id required,
+  group optional. Server: polygon from flattened d; area ≥ min; visible =
+  polygon MINUS union of all existing region polygons (acceptance rule: masks
+  never overlap). Empty ⇒ ValueError. New region id "r-p-<hash12>",
+  source="pen-drawn". Edges: outline segments near the drawn path ⇒ artwork;
+  subtraction cut segments ⇒ subdivision. paint.json: NO new paint path (the
+  pen region is a gameplay-only surface; it renders as a white tap target that
+  colors in — by design, artist recolors/paints later).
+
+(4) FREE COLOR (true custom colors, any #RRGGBB):
+  Board session: freeColors: Record<RegionId, string-hex>; board.setFreeColor(hex)
+  validates #RRGGBB and becomes the active free color (palette swatches in free
+  mode set it to that palette's hex — palette stays quick-access). paint() in
+  free mode stores hex; NO palette mismatch/mistake in free mode. refresh():
+  completed region in free mode fills with the stored hex DIRECTLY (flat fill,
+  not gradient). BoardState gains customColor: string | null. Adapter (mjs)
+  mirrors this. UI: Artwork palette → recent colors (in-memory; studio may
+  persist recents in localStorage OUTSIDE the board) → custom picker
+  (<input type=color> + hex field). palette.json unchanged.
+
+(5) DIFFICULTY PROFILE — pipeline.difficulty_profile(bundle) computed in
+  emit_bundle (and therefore every edit); manifest.difficulty becomes:
+  { rating: "easy"|"medium"|"hard"|"master", score: 0-100, metrics: {
+      regionCount, medianRegionArea, tinyRegionPct, requiredZoom,
+      labelClearance: "ok"|"tight"|"conflict", paletteAmbiguity:
+      "low"|"medium"|"high", paletteGroups, avgNeighbors, subdivisionEdges,
+      objectDensity } }
+  requiredZoom = worst-case zoom for a 44px touch target from a fit viewport
+  (min inscribed-diameter proxy = 2*sqrt(area/pi)). Score = weighted sum;
+  easy<25 ≤ medium<50 ≤ hard<75 ≤ master. rating replaces "unrated";
+  difficultyValidatedByPlaytest stays false until a real playtest (play-test
+  completion time is surfaced by the UI from the session, not the format).
+  Frontend renders the 4-tier bar profile panel from manifest.difficulty.
+
+(6) DETERMINISTIC AUTO-SUBDIVIDE (closes the "true vector ⇒ only ~54 regions"
+  gap): BuildSettings.auto_subdivide: bool = False. When true (SVG-master and
+  multistage builds), after region derivation, while len(regions) <
+  target_regions and the largest region ≥ 2× min playable size: split the
+  largest region with an ORGANIC cut (straight line through centroid,
+  perpendicular to major axis, ± small sine wiggle as sampled polyline),
+  refit both pieces, emit SUBDIVISION edges for the new boundary. Loop bound
+  (e.g. ≤ 1200 splits). Regions stay true-vector (no raster).
+
+(7) AI MULTI-STAGE NATIVE-VECTOR GENERATION — GenerateSvgRequest gains
+  mode: "single"|"multistage" (default single) + target_regions (60..1200,
+  default 300). Multistage in ai.py:
+    stage 1 scene_plan (chat model, strict json_schema): 6–10 objects,
+    each {name, description, z, bbox [x,y,w,h] in viewBox units,
+    shapes 6–30, fills [hex]}, global palette; cap total shapes ~240.
+    stage 2 per object: "emit ONE complete <svg viewBox='bx by bw bh'>…</svg>
+    containing ONLY this object's paths, all coordinates inside the bbox,
+    N≈shapes bounded color areas" → sanitize each fragment via the svg_master
+    importer, re-id gradients/shapes with an object prefix, compose the master
+    (z order). stage 3: route stores pendingBuildSettings =
+    {auto_subdivide: true, target_regions} on the project so the next Build
+    applies (6). app.py: /generate-svg accepts mode/target_regions and passes
+    them; provenance records stages + per-call usage. Single mode unchanged.
+
+(8) HIGH-PERFORMANCE RENDERER (studio + shipped adapter):
+  - Cached underpainting: serialize the paint+ink layers (+defs) ONCE per
+    bundle into a standalone SVG string with the BASE viewBox → Image →
+    offscreen canvas (long side capped ~2048) → single <image> element as the
+    art layer. 200k+ live path commands leave the live DOM. Fallback to the
+    live-path layer if serialization fails.
+  - Gestures: pointermove/wheel handlers become rAF-batched (store latest
+    event, one scheduled frame). During drag/pinch, do NOT touch the SVG
+    viewBox: apply a GPU CSS transform (translate+scale, origin at gesture
+    anchor) to the board, and only applyView() at gesture END (then clear the
+    transform). updateLabelVisibility skipped while a gesture is active.
+  - Path2D hit-testing unchanged (already client-side).
+
+(9) API surface additions: EditAction += "cut" | "draw" (EditRequest.d);
+  GenerateSvgRequest += mode, target_regions; BuildSettings += auto_subdivide;
+  config.version → "0.3.0" with backends listing the new capabilities (the
+  frontend polls this to know the backend upgrade landed).
+
+File ownership: 9-a owns mini-services/color-duel-studio/** (studio/*.py,
+schemas/, integration/detailed-board.mjs, web/detailed-board.mjs, tests/)
+AND mini-services/ai-bridge/index.ts (add POST /v1/json: generic strict-JSON
+extraction endpoint for the scene planner — fenced tolerated, one repair
+pass, responsesApiWrap output; existing endpoints untouched). 9-b owns src/**
+(detailed-board.ts, studio components, studio-api.ts). Neither agent touches
+the other's tree. After both land, task 10 verifies end-to-end via
+agent-browser through the :81 gateway.
+
+Contract addenda:
+- EditRequest.region_ids: relax to plain list (no min length); edit_bundle
+  validates per action (merge ≥2, split/cut/label = 1, draw = 0, others ≥1).
+- The studio service .env and the ai-bridge daemon are currently DOWN (env
+  reset); 9-a must recreate mini-services/color-duel-studio/.env with
+  OPENAI_API_KEY=<non-empty local value> and AI_BASE_URL=http://127.0.0.1:8787/v1/
+  then (re)start ai-bridge (bun run dev via .zscripts/daemon.py, port 8787)
+  and restart the studio service on 8765 (kill old PID first).
+- Shipped adapter (integration/ + web/detailed-board.mjs) scope for 9-a:
+  contract-correct edges validation + rendering, setFreeColor/freeColors hex,
+  rAF-batched gestures. The full cached-underpainting renderer is built in
+  src/lib/detailed-board.ts by 9-b; porting it to the mjs adapter is task 10.
+---
+Task ID: 9-a
+Agent: general-purpose (backend)
+Task: Stage-2 backend per the Task 8 shared contract — cut/pen region tools, edges kinds + boundaryStyle, deterministic auto-subdivide, difficulty analyzer, AI multi-stage SVG generation, free-color + rAF adapter upgrades, ai-bridge /v1/json.
+Work Log:
+- Context: a prior partial run of THIS task had already landed most of the contract code without finishing (no worklog entry, docs stale, live pen verification failed). This session audited every contract §1-§9 + addendum against the code, completed the gaps, re-verified everything and wrote this entry.
+- models.py: EditRequest actions "cut"/"draw" + `d` (pattern ^M[\s\d.,eE+\-MLQCZz]+$), region_ids relaxed to a plain list (per-action counts validated in edit_bundle: merge>=2, split/cut/label=1, draw=0, others>=1); GenerateSvgRequest mode single/multistage + target_regions (60..1200, default 300); BuildSettings.auto_subdivide.
+- pipeline.py: geometry engine — flatten_d / polyline_d / cut_polygon (line extended across the bbox, shapely split + make_valid, buffered-corridor fallback), classify_outline (segment-midpoint proximity, 1.5px tol, run merging), _RegionIndex + _edge_sides neighbor probing, EdgeEntry emission (id e-####, d, kind artwork|subdivision, left/rightRegion).
+  - IMPROVED this session: _emit_edge now probes the run's LONGEST boundary segment (the old start->end chord could return non-bordering regions) and takes self_id so cut-piece/pen/master outline edges guarantee left/right = adjacent region ids (or null) exactly per contract §2.
+  - edit_bundle "cut": split the one selected region; >=2 pieces each >= min_region_pixels else actionable ValueError; pieces pack_region refit as r-c-<sha12> inheriting paletteId/objectId/masterShapeId, labels recomputed; prior artwork edges of the target are inherited via prior_art_lines reclassification; target's stale edges dropped; new edges near the cut = subdivision, else artwork; partitionTolerance extended by the measured refit deviation.
+  - edit_bundle "draw": closed pen path -> polygon; visible = polygon MINUS union of all existing region+decoration polygons (empty or < min -> actionable ValueError); new regions r-p-<sha12> source "pen-drawn"; NO paint.json path (gameplay-only surface); edges near the drawn path = artwork, subtraction segments = subdivision; merge/split/decorate prune edge entries referencing deleted region ids.
+  - compile_svg_master: emits geometry.edges + boundaryStyle (verbatim regions -> their own d as artwork edge with a probed outside neighbour; derived visible-surface regions -> outline classified against master-shape boundaries at 1.5px); auto_subdivide splits the largest region with a seeded ORGANIC cut (line through the centroid perpendicular to the major axis + sine wiggle, 2-4% amplitude) while regions < target and largest >= 2x min size (loop bound 1200), each new boundary emitted as subdivision edge with the two new piece ids, stale piece edges pruned, fully deterministic; validate_bundle must pass. Raster compile_image emits no edges (v1 fallback look).
+  - difficulty_profile(bundle): metrics regionCount, medianRegionArea, tinyRegionPct, requiredZoom (44px touch target from a 380px fit viewport, inscribed-diameter proxy), labelClearance ok/tight/conflict, paletteAmbiguity low/medium/high (closest RGB pair), paletteGroups, avgNeighbors (STRtree adjacency, capped sample), subdivisionEdges, objectDensity; weighted score 0-100; easy<25<=medium<50<=hard<75<=master; called in emit_bundle so manifest.difficulty replaces "unrated" on every build AND every edit; validation.json gains a difficulty section; difficultyValidatedByPlaytest stays false.
+  - validate_runtime_contract: validates optional edges (SAFE id, open-or-closed M/L/C/Q/Z path, kind enum, region refs exist) and boundaryStyle (hex stroke, strokeWidth>0, dash string); _runtime_geometry keep-list += edges, boundaryStyle so the LEAN export carries them; IMPORT.md in the export documents edge kinds and the fill-only render rule.
+  - BACKENDS registry + config: pen-cut-tools, auto-subdivide, difficulty-analyzer (local, available) and provider-svg-multistage (paid, available iff AI configured).
+- app.py: /generate-svg mode=multistage -> Provider.svg_multistage + persists p['pendingBuildSettings']={'auto_subdivide':True,'target_regions':N}; /build applies pending settings one-shot unless the request sets those fields explicitly (then consumes them); /api/config version "0.3.0" with the new backends.
+- ai.py: scene_plan (strict json_schema: 6-10 objects {name, description, z, bbox, shapes, fills}, total<=240) via the NEW bridge endpoint /v1/json; svg_object per-object <svg viewBox=bbox> fragment through the existing /v1/svg route; svg_multistage composes fragments in z order — each fragment sanitized with svg_master.import_master, shapes/gradients re-ided with an object prefix, <=10 objects (trailing merged) so <=12 provider calls, 400KB fragment / 1.5MB master budgets, bbox placement sanity, clear ValueError on any failure (no partial master, no paid retries). Single-shot svg() untouched.
+- ai-bridge/index.ts: NEW POST /v1/json — generic strict-JSON extraction (fences tolerated, first balanced JSON object, ONE repair pass, responsesApiWrap output, 502 unparsable_json); json_schema described into the prompt for models without native structured output; existing endpoints untouched. Bridge restarted via .zscripts/daemon.py (bun run dev, port 8787, healthz OK).
+- schemas/regions.schema.json: additive optional geometry.edges ($defs edge: id/d/kind/leftRegion/rightRegion) + boundaryStyle ($defs boundaryStyle/boundaryStroke).
+- integration/detailed-board.mjs + web/detailed-board.mjs (byte-identical, cmp-verified): validateBundle accepts/rejects edges + boundaryStyle exactly per contract; render — edges non-empty => region paths fill-only + an edges overlay group ABOVE masks/ink BELOW labels (artwork solid geometry.stroke width 1.6; subdivision #7A8C94 width 0.85 dash "3 2.2" userSpace; boundaryStyle overrides; absent => exact legacy rendering); setFreeColor(hex) + freeColors hex records + flat fills on completion + no mistakes in free mode + palette swatch -> its hex + BoardState.customColor; normalizeSession keeps hex freeColors and drops legacy numeric values; pointermove/wheel rAF-batched with label updates skipped during gestures; header contract comment updated (edges, free color, rAF). Underpaint cache intentionally NOT added (task 10 ports it).
+- Studio service .env recreated (OPENAI_API_KEY=local-bridge, AI_BASE_URL=http://127.0.0.1:8787/v1/); studio restarted via daemon.py; /api/config -> version 0.3.0, ai.configured true.
+- Tests: test_pipeline.py +12 (cut ok/bad, draw ok/bad/needs-palette/rejects-selection, auto-subdivide reaches ~target with validate passing + both edge kinds, difficulty profile present+valid, edges survive the lean runtime export, merge prunes stale edges, pen edges reference the pen region), test_api.py +4 (config 0.3.0 + new backends; live cut + draw edit routes; cut-missing-d fails with actionable job message; multistage with a mocked transport asserting 1 /json call + N /svg fragment calls <= 12, pendingBuildSettings stored then consumed by the next build which auto-subdivides), test_game_adapter.py +4 (shipped adapter accepts edges bundle; rejects bad kind/unknown region ref; free-color + edges board API via the new headless tests/adapter-board-check.mjs).
+- Docs: FORMAT.md (edges/boundaryStyle/difficulty sections), INTEGRATION.md (edges + free color + rAF in the shared contract list), README.md stage-2 feature list.
+Stage Summary:
+- Full suite: 56 passed (38 baseline + 18 new; baseline not regressed). Live services: studio :8765 (version 0.3.0, ai.configured), ai-bridge :8787 (healthz ok).
+- LIVE verification on art-9761ab8df8004aa3 (fresh, after the final code state + restart; revisions v0.16.0 build -> v0.17.0 cut -> v0.18.0 draw):
+  - POST /build {"auto_subdivide": true, "target_regions": 160} -> 160 regions, 121 subdivision-split pieces, 531 edges (248 artwork / 283 subdivision), boundaryStyle emitted, manifest.difficulty hard 51.8 with all 10 metrics, QA passed.
+  - POST /edit cut (crossing line M 194 -14 L 194 197 through the largest region, computed from its bbox) -> 2 new r-c-* regions (9488 + 9299 px^2), old region gone, validation passes, 5 edges reference the pieces incl. cut-side subdivision edges carrying BOTH piece ids.
+  - POST /edit draw on a computed uncovered hole -> r-p-4b76caf14cc6 (71.5 px^2, source pen-drawn, palette 19, group pen-test), no paint.json path added, 3 edges reference it (artwork near the drawn path, subdivision on subtraction), validation passes, difficulty recomputed (hard 59.2).
+  - GET export -> runtime ZIP (7 entries) unzipped to /tmp: lean regions.json carries edges + boundaryStyle, regions stripped of master/flat/rings, pen region survives, manifest difficulty hard 59.2, difficultyValidatedByPlaytest false, all edge region refs resolve; the SHIPPED adapter (scripts/adapter-contract-check.mjs) passes on the unzipped runtime bundle ("162 regions (78 curved)").
+- Deviations / notes:
+  - Live pen verification: art-9761ab8df8004aa3's sky rect covers the whole canvas, so the only uncovered spots are sub-pixel fit bands; the draw target was computed geometrically (largest uncovered hole, 72.5 px^2). Drawing over a covered area correctly fails with the actionable error (observed live from the earlier failed job: "The drawn shape overlaps fully with existing regions; draw over empty canvas instead").
+  - Edge left/right fidelity improvement (longest-segment probe + self_id) was added this session after observing probed neighbours that do not border the boundary; no test regressions.
+  - The parallel frontend agent (9-b) hit the same shared project through the gateway during verification (their build appears as v0.14.0 target-200 in the history); the v0.16-v0.18 chain is this backend verification. Nothing in src/** was touched.
+
+---
+Task ID: 9-b
+Agent: full-stack-developer (frontend; implementation landed by the subagent,
+verified & completed by task 10 after the agent session was cut before its
+own verification/worklog step)
+Task: Frontend stage-2 — VectorBoard edges/free-color/cached-underpainting/rAF
+renderer, Cut+Pen tool UI, free-color picker, difficulty panel, multistage
+generate UI, studio-api extensions.
+
+Work Log:
+- src/lib/detailed-board.ts: EdgeEntry/BoundaryStyle types + validation;
+  edges overlay group above ink / below labels (artwork solid 1.6 /
+  subdivision #7A8C94 0.85 dashed "3 2.2", boundaryStyle overrides; region
+  paths fill-only when edges present); freeColors Record<regionId,#hex> +
+  setFreeColor + swatch quick-access (setPalette in free mode loads the
+  palette hex) + flat hex fills + no mistakes in free mode + BoardState.
+  customColor; public hitRegion(); cached underpainting (paint+ink layers +
+  gradient defs serialized once per bundle to standalone SVG → blob URL →
+  single <image> node, live-path fallback); rAF-batched pointermove/wheel;
+  GPU CSS transform during drag/pinch with applyView at gesture end;
+  updateLabelVisibility skipped mid-gesture.
+- src/lib/studio-api.ts: EditAction += cut/draw + EditPayload.d;
+  generate-svg body mode/target_regions; BuildSettings.auto_subdivide;
+  Project.pendingBuildSettings; DifficultyProfile types.
+- src/components/studio/use-studio.tsx: cutRegion/drawRegion actions (full
+  job-polling + revision reload); tool state select/cut/pen; freeColor +
+  recentColors (localStorage, outside the board); svgGenMode; pendingBuildSettings
+  prefill of the build form.
+- src/components/studio/canvas-workspace.tsx: inspect-view tool row
+  (Select/Cut/Pen + per-tool hints), drawing overlay SVG (client→art via
+  board.clientToArt, live stroke, RDP simplify ε≈1.2), cut confirm
+  (region via hitRegion at stroke midpoint), pen confirm dialog (number
+  group + optional object group), free-mode custom color cluster
+  (input[type=color] + hex field + Apply + Active badge + recents),
+  difficulty mini-summary.
+- src/components/studio/difficulty.tsx (new): 4-tier segmented bar
+  (Easy/Medium/Hard/Master), score, metric rows, legacy "unrated" fallback.
+- src/components/studio/right-panel.tsx: DifficultyPanel, Auto-subdivide
+  switch (+ pendingBuildSettings prefill note); left-panel.tsx: SVG
+  generation mode select (One-shot / Multi-stage vector) + target regions.
+
+Stage Summary:
+- Implementation complete; lint + tsc clean; the agent session ended before
+  browser verification — verification evidence is recorded under task 10.
+
+---
+Task ID: 10
+Agent: main (Z.ai Code)
+Task: End-to-end integration verification of stage-2 through the gateway
+(:81) with agent-browser + VLM; fixes if needed; final worklog.
+
+Work Log:
+- Services: studio :8765 config 0.3.0 (9 backends, ai configured via
+  ai-bridge :8787), Next dev :3000, gateway :81. Page loads with 0 errors /
+  0 console issues (reloaded clean at the end too).
+- Board DOM (treehouse v0.18, 162 regions): 2 blob-URL underpaint <image>
+  nodes, 0 live paint/ink paths; regions fill-only (stroke none); 524 edges
+  (245 artwork / 279 subdivision) with correct attrs (artwork: stroke 1.6
+  solid; subdivision: #7A8C94 0.85 dash "3 2.2"); 162 labels.
+- VLM screenshot verification (treehouse, Vector view): artwork fully
+  rendered (treehouse, gradients), dark solid artwork contours AND lighter
+  dashed subdivision lines both visible — the exact visual contract.
+- VLM screenshot verification (fresh simple SVG-master project): 4 colored
+  shapes + white pentagon pen region + solid outlines visible. (An initial
+  "blank canvas" report was traced to the test page being scrolled — the
+  canvas was above the viewport; after scrollIntoView everything renders.
+  The blob underpaint was also pixel-verified directly: redRect
+  [196,90,61]=#C45A3D, circle [61,107,140]=#3D6B8C — exact.)
+- Free color: hex #FF7348 applied via Apply → Active badge → tap painted
+  r-00003 with exactly #FF7348 (flat), 0 mistakes, color pushed to recents.
+- Number mode: wrong-palette tap → fill stays #FFFFFF, "1 incorrect
+  attempts" counted. Reset test works.
+- Gestures: drag applies CSS translate(100px,80px) scale(1) during the
+  gesture (no viewBox writes), applyView at pointerup (view panned
+  56.1,124.4 → 0,29.1), transform cleared, NO accidental paint (progress
+  unchanged). Wheel zoom works (viewBox 576 → 401.86).
+- CUT TOOL (live, treehouse v0.18 → v0.19): drew a stroke across r-00004
+  via the overlay → confirm dialog → job → 163 regions + 4 r-c-* pieces
+  (9488/9299/10504/3980 px²), old region gone, cut line emitted as
+  subdivision edges with both piece ids on each side, outer boundaries stay
+  artwork edges (correct neighbor refs incl. decorations), QA passed,
+  difficulty recomputed.
+- PEN TOOL (live, fresh simple-SVG project v0.2 → v0.3): uploaded a
+  4-shape SVG master (rights confirmed), built (4 regions), drew a
+  pentagon on empty canvas → confirm (number group + object group) →
+  r-p-34384e9ca674 (5438 px²), NO paint.json path added (gameplay-only
+  white tap target), edges classified (drawn outline artwork). Play-tested
+  it: taps paint it correctly (progress 1/5).
+  Negative paths verified live: pen over covered canvas → actionable error
+  "overlaps fully…" (toast via job failure); pen over the thin fit-band
+  sliver → correctly rejected by label-ownership validation.
+- Restore revision flow works (v0.3 restored after an accidental rebuild —
+  the rebuild itself was a test-tooling misclick, not an app bug).
+- Auto-subdivide: verified at API level by 9-a (treehouse → 160 regions,
+  531 edges, difficulty hard 51.8, QA passed); UI switch present, build
+  path identical to normal builds.
+- Multistage AI generation: implemented + mock-tested (9-a); UI (mode
+  select + target regions + pendingBuildSettings prefill) present; NOT
+  live-tested — no paid AI calls without explicit user confirmation.
+- Difficulty panel: 4-tier bar (HARD highlighted), score 59/100, all 10
+  metrics rendered from manifest.difficulty (regionCount 162, requiredZoom
+  7.0×, palette ambiguity high, subdivision edges 279, label clearance
+  conflict…).
+- Mobile 390×844: 0 horizontal overflow, board 328px wide, footer pushed
+  naturally on the long page; sticky-footer structure (min-h-screen flex
+  col + mt-auto + safe-area-inset) intact.
+- Final: bun run lint clean, bunx tsc --noEmit clean, dev.log clean
+  (GET / 200), Python suite 56 passed.
+
+Stage Summary:
+- All six stage-2 features are implemented and live-verified end-to-end:
+  (1) real Cut and Pen region creation with server-side topology rebuild;
+  (2) true-vs-artificial boundary kinds rendered distinctly (VLM-confirmed
+  solid vs dashed) and carried through the lean runtime export; (3) AI
+  multi-stage native-vector generation (mock-tested, UI wired, awaits a
+  confirmed paid run); (4) true free-color (#RRGGBB any hex + recents +
+  palette quick access); (5) difficulty analyzer with the 4-tier profile
+  panel; (6) cached-underpainting + rAF/GPU-transform renderer (the 200k+
+  path commands leave the live DOM).
+- Remaining known gaps (documented, next stage): node editing (drag
+  boundary anchors), the mjs adapter port of the full underpainting cache
+  (adapter currently has edges/free-color/rAF only), multistage live run
+  (paid), and play-test-time inclusion in the difficulty profile.

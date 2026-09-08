@@ -1,0 +1,1253 @@
+     1→/**
+     2→ * VectorBoard — dependency-free region renderer for Color Duel detailed-vector bundles.
+     3→ * Ported from the vanilla-JS `web/detailed-board.mjs` (see docs/PROVENANCE.md upstream).
+     4→ *
+     5→ * Consume trusted, validated JSON only; never inject arbitrary uploaded SVG markup.
+     6→ * Changes vs. the original:
+     7→ *  - `loadArtwork` (browser-relative URL resolution) is replaced by `loadBundle(pid, rev)`
+     8→ *    which fetches through the gateway with an explicit `XTransformPort` query.
+     9→ *  - No localStorage session persistence: authoring play-tests must not write player
+    10→ *    progress. Sessions live in memory only.
+    11→ *
+    12→ * Stage 2 (contract §8 performance):
+    13→ *  - the paint + ink appearance is cached ONCE per bundle as standalone SVG
+    14→ *    <image> elements (see buildUnderpainting) — one image node replaces the
+    15→ *    200k+ live path commands a big bundle carries;
+    16→ *  - pointermove/wheel are rAF-batched, and during drag/pinch the viewBox is
+    17→ *    untouched: a GPU CSS transform moves the whole board, and the final view
+    18→ *    is applied once at gesture end (see bindGestures).
+    19→ */
+    20→
+    21→import type { DifficultyProfile } from "./studio-api";
+    22→
+    23→const NS = "http://www.w3.org/2000/svg";
+    24→let sequence = 0;
+    25→
+    26→const clamp = (x: number, min: number, max: number) => Math.max(min, Math.min(max, x));
+    27→
+    28→type Attrs = Record<string, string | number | undefined>;
+    29→
+    30→function svgNode(tag: string, attrs: Attrs = {}): SVGElement {
+    31→  const el = document.createElementNS(NS, tag);
+    32→  for (const [key, value] of Object.entries(attrs)) el.setAttribute(key, String(value));
+    33→  return el;
+    34→}
+    35→
+    36→// ---------------------------------------------------------------------------
+    37→// Underpainting serialization (contract §8) — standalone SVG documents
+    38→// ---------------------------------------------------------------------------
+    39→
+    40→const XML_ESCAPES: Record<string, string> = { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&apos;" };
+    41→const escapeXml = (value: string): string => value.replace(/[&<>"']/g, (c) => XML_ESCAPES[c]);
+    42→
+    43→/** Clone the paint gradient defs into the standalone document (the hatch
+    44→ *  pattern and palette gradients stay live in the board DOM). */
+    45→function serializeGradientDefs(gradients: PaintGradient[]): string {
+    46→  const parts: string[] = [];
+    47→  for (const g of gradients) {
+    48→    const tag = g.type === "linear" ? "linearGradient" : "radialGradient";
+    49→    const attrs = [`id="${escapeXml(g.id)}"`, 'gradientUnits="userSpaceOnUse"'];
+    50→    const params: Array<[string, number | undefined]> =
+    51→      g.type === "linear"
+    52→        ? [
+    53→            ["x1", g.x1],
+    54→            ["y1", g.y1],
+    55→            ["x2", g.x2],
+    56→            ["y2", g.y2],
+    57→          ]
+    58→        : [
+    59→            ["cx", g.cx],
+    60→            ["cy", g.cy],
+    61→            ["r", g.r],
+    62→            ["fx", g.fx],
+    63→            ["fy", g.fy],
+    64→          ];
+    65→    for (const [key, value] of params) if (value != null) attrs.push(`${key}="${value}"`);
+    66→    const stops = g.stops
+    67→      .map((s) => {
+    68→        const sa = [`offset="${s.offset}"`, `stop-color="${escapeXml(s.color)}"`];
+    69→        if (s.opacity != null && s.opacity !== 1) sa.push(`stop-opacity="${s.opacity}"`);
+    70→        return `<stop ${sa.join(" ")}/>`;
+    71→      })
+    72→      .join("");
+    73→    parts.push(`<${tag} ${attrs.join(" ")}>${stops}</${tag}>`);
+    74→  }
+    75→  return parts.join("");
+    76→}
+    77→
+    78→/** Art-layer path (below the masks): closed fills, z-sorted — the exact
+    79→ *  attribute logic the live `vector-paint` group uses in mount(). */
+    80→function serializeArtPath(p: PaintPath): string | null {
+    81→  if (p.filled === false || (p.strokeWidth != null && !p.fill.startsWith("#"))) return null;
+    82→  const gradientFill = p.fill.startsWith("url(#");
+    83→  const attrs = [`d="${escapeXml(p.d)}"`, `fill="${escapeXml(p.fill)}"`, `fill-rule="${p.fillRule ?? "evenodd"}"`];
+    84→  if (!gradientFill) {
+    85→    attrs.push(`stroke="${escapeXml(p.stroke ?? p.fill)}"`, `stroke-width="${p.strokeWidth ?? 0.55}"`, 'stroke-linejoin="round"');
+    86→  }
+    87→  if (p.fillOpacity != null && p.fillOpacity < 0.999) attrs.push(`fill-opacity="${p.fillOpacity}"`);
+    88→  if (p.opacity != null && p.opacity < 0.999) attrs.push(`opacity="${p.opacity}"`);
+    89→  return `<path ${attrs.join(" ")}/>`;
+    90→}
+    91→
+    92→/** Ink-layer path (above the masks): open stroke line art + closed ink
+    93→ *  shapes — the exact attribute logic the live `ink` group uses in mount(). */
+    94→function serializeInkPath(p: PaintPath): string {
+    95→  if (p.strokeWidth != null || p.filled === false) {
+    96→    return `<path d="${escapeXml(p.d)}" fill="none" stroke="${escapeXml(p.fill)}" stroke-width="${p.strokeWidth ?? 1.5}" stroke-linecap="round" stroke-linejoin="round"/>`;
+    97→  }
+    98→  const attrs = [`d="${escapeXml(p.d)}"`, `fill="${escapeXml(p.fill)}"`, `fill-rule="${p.fillRule ?? "evenodd"}"`];
+    99→  if (p.opacity != null && p.opacity < 0.999) attrs.push(`opacity="${p.opacity}"`);
+   100→  if (p.fillOpacity != null && p.fillOpacity < 0.999) attrs.push(`fill-opacity="${p.fillOpacity}"`);
+   101→  return `<path ${attrs.join(" ")}/>`;
+   102→}
+   103→
+   104→function wrapStandaloneSvg(defs: string, body: string[], bx: number, by: number, bw: number, bh: number): string {
+   105→  return (
+   106→    `<svg xmlns="${NS}" viewBox="${bx} ${by} ${bw} ${bh}" width="${bw}" height="${bh}">` +
+   107→    (defs ? `<defs>${defs}</defs>` : "") +
+   108→    body.join("") +
+   109→    "</svg>"
+   110→  );
+   111→}
+   112→
+   113→// ---------------------------------------------------------------------------
+   114→// Bundle types (modelled on examples/compiled-treehouse/*.json + schemas)
+   115→// ---------------------------------------------------------------------------
+   116→
+   117→export interface PaletteStop {
+   118→  offset: number;
+   119→  color: string;
+   120→}
+   121→
+   122→export interface PaletteEntry {
+   123→  id: number;
+   124→  number: number;
+   125→  name: string;
+   126→  hex: string;
+   127→  paint: { type: string; stops: PaletteStop[] };
+   128→}
+   129→
+   130→export interface RegionLabel {
+   131→  x: number;
+   132→  y: number;
+   133→  fontSize: number;
+   134→  minScreenPx: number;
+   135→  clearance: number;
+   136→}
+   137→
+   138→export interface RegionEntry {
+   139→  id: string;
+   140→  paletteId: number;
+   141→  objectId?: string;
+   142→  d: string;
+   143→  fillRule: "evenodd" | "nonzero";
+   144→  masterShapeId?: string;
+   145→  rings: number[][][];
+   146→  bbox: number[];
+   147→  area: number;
+   148→  label: RegionLabel;
+   149→}
+   150→
+   151→export interface DetailPath {
+   152→  d: string;
+   153→  stroke: string;
+   154→  strokeWidth: number;
+   155→  opacity?: number;
+   156→}
+   157→
+   158→/** Stage-2 boundary kinds: true artwork outlines vs artificial subdivisions. */
+   159→export interface EdgeEntry {
+   160→  id: string;
+   161→  /** M/L/C/Q path, open or closed (matches the safe-path regexes). */
+   162→  d: string;
+   163→  kind: "artwork" | "subdivision";
+   164→  leftRegion?: string | null;
+   165→  rightRegion?: string | null;
+   166→}
+   167→
+   168→export interface BoundaryStyleEntry {
+   169→  stroke: string;
+   170→  strokeWidth: number;
+   171→  dash?: string;
+   172→}
+   173→
+   174→export interface BoundaryStyle {
+   175→  artwork: BoundaryStyleEntry;
+   176→  subdivision: BoundaryStyleEntry;
+   177→}
+   178→
+   179→export interface Geometry {
+   180→  schemaVersion: number;
+   181→  artworkId: string;
+   182→  artworkVersion: string;
+   183→  viewBox: number[];
+   184→  fillRule: "evenodd" | "nonzero";
+   185→  stroke: string;
+   186→  strokeWidth: number;
+   187→  regions: RegionEntry[];
+   188→  decorations: RegionEntry[];
+   189→  detailPaths: DetailPath[];
+   190→  /** Non-empty ⇒ regions render fill-only and boundaries come from the edges
+   191→   *  overlay (artwork solid, subdivision dashed). Absent/empty ⇒ legacy look. */
+   192→  edges?: EdgeEntry[];
+   193→  boundaryStyle?: BoundaryStyle;
+   194→}
+   195→
+   196→export interface PaintPath {
+   197→  fill: string; // #RRGGBB or url(#gradient-id)
+   198→  d: string;
+   199→  strokeWidth?: number; // present on stroked ink paths (open line art)
+   200→  filled?: boolean; // false = stroke-rendered ink, not a closed fill
+   201→  fillRule?: "evenodd" | "nonzero"; // source fill rule (schema 2)
+   202→  fillOpacity?: number; // 0..1, preserved from the source SVG
+   203→  opacity?: number; // 0..1, preserved from the source SVG
+   204→  stroke?: string; // outline color on FILLED shapes (preserved)
+   205→  z?: number; // document order: paint + ink render merged by z
+   206→  shapeId?: string; // link to the sanitized master shape (authoring)
+   207→}
+   208→
+   209→export interface PaintGradientStop {
+   210→  offset: number;
+   211→  color: string;
+   212→  opacity?: number;
+   213→}
+   214→
+   215→export interface PaintGradient {
+   216→  id: string;
+   217→  type: "linear" | "radial";
+   218→  stops: PaintGradientStop[];
+   219→  // linear params
+   220→  x1?: number;
+   221→  y1?: number;
+   222→  x2?: number;
+   223→  y2?: number;
+   224→  // radial params
+   225→  cx?: number;
+   226→  cy?: number;
+   227→  r?: number;
+   228→  fx?: number;
+   229→  fy?: number;
+   230→}
+   231→
+   232→export interface PaintLayer {
+   233→  schemaVersion: number;
+   234→  artworkId: string;
+   235→  viewBox?: number[];
+   236→  paths: PaintPath[];
+   237→  inkPaths: PaintPath[];
+   238→  gradients?: PaintGradient[];
+   239→}
+   240→
+   241→export interface ObjectGroup {
+   242→  id: string;
+   243→  regionIds: string[];
+   244→}
+   245→
+   246→export interface Manifest {
+   247→  schemaVersion: number;
+   248→  format: "color-duel-vector-1" | "color-duel-detailed-vector-1";
+   249→  id: string;
+   250→  version: string;
+   251→  title: string;
+   252→  description?: string;
+   253→  regionCount: number;
+   254→  paletteCount?: number;
+   255→  objectGroups?: ObjectGroup[];
+   256→  assets: { regions: string; palette: string; paint?: string; [key: string]: string | undefined };
+   257→  contentHash: string;
+   258→  /** Legacy bundles carry the string "unrated"; new ones carry the full
+   259→   *  profile (contract §5). The UI normalizes both. */
+   260→  difficulty?: string | DifficultyProfile;
+   261→}
+   262→
+   263→export interface Bundle {
+   264→  manifest: Manifest;
+   265→  geometry: Geometry;
+   266→  palette: PaletteEntry[];
+   267→  paint: PaintLayer | null;
+   268→}
+   269→
+   270→// ---------------------------------------------------------------------------
+   271→// Validation
+   272→// ---------------------------------------------------------------------------
+   273→
+   274→const SAFE_PATH = /^M[\s\d.,eE+\-MLQCZ]+Z$/;
+   275→const SAFE_PATH_OPEN = /^M[\s\d.,eE+\-MLQCZ]+$/;
+   276→const SAFE_HEX = /^#[0-9A-Fa-f]{6}$/;
+   277→const SAFE_GRADIENT_REF = /^url\(#g-[a-zA-Z0-9_-]+\)$/;
+   278→
+   279→export function validateBundle(bundle: Bundle): Bundle {
+   280→  const { manifest: m, geometry: g } = bundle || ({} as Bundle);
+   281→  const p = bundle?.palette;
+   282→  if (!m || !g || !Array.isArray(p) || !["color-duel-vector-1", "color-duel-detailed-vector-1"].includes(m.format))
+   283→    throw new Error("Unsupported artwork bundle");
+   284→  if (m.id !== g.artworkId || m.version !== g.artworkVersion || m.regionCount !== g.regions?.length)
+   285→    throw new Error("Artwork identity/count mismatch");
+   286→  if (
+   287→    !Array.isArray(g.viewBox) ||
+   288→    g.viewBox.length !== 4 ||
+   289→    g.viewBox.some((x) => !Number.isFinite(x)) ||
+   290→    g.viewBox[2] <= 0 ||
+   291→    g.viewBox[3] <= 0
+   292→  )
+   293→    throw new Error("Invalid viewBox");
+   294→  const paletteIds = new Set(p.map((x) => x.id));
+   295→  if (paletteIds.size !== p.length) throw new Error("Duplicate palette ID");
+   296→  const ids = new Set<string>();
+   297→  for (const r of [...g.regions, ...(g.decorations ?? [])]) {
+   298→    if (ids.has(r.id) || !/^[a-zA-Z0-9_-]+$/.test(r.id)) throw new Error("Duplicate or unsafe region ID");
+   299→    ids.add(r.id);
+   300→    const rule = r.fillRule ?? "evenodd";
+   301→    if (!paletteIds.has(r.paletteId) || !["evenodd", "nonzero"].includes(rule) || !SAFE_PATH.test(r.d))
+   302→      throw new Error("Invalid region geometry or palette");
+   303→  }
+   304→  // Edges overlay (contract §1): optional, additive, validated like the rest.
+   305→  if (g.edges !== undefined) {
+   306→    if (!Array.isArray(g.edges)) throw new Error("Invalid edges");
+   307→    const edgeIds = new Set<string>();
+   308→    for (const e of g.edges) {
+   309→      if (!e || typeof e.id !== "string" || !/^[a-zA-Z0-9_-]+$/.test(e.id)) throw new Error("Invalid edge ID");
+   310→      if (edgeIds.has(e.id)) throw new Error("Duplicate edge ID");
+   311→      edgeIds.add(e.id);
+   312→      if (typeof e.d !== "string" || !(SAFE_PATH.test(e.d) || SAFE_PATH_OPEN.test(e.d)))
+   313→        throw new Error("Invalid edge path");
+   314→      if (e.kind !== "artwork" && e.kind !== "subdivision") throw new Error("Invalid edge kind");
+   315→      if (e.leftRegion != null && !ids.has(e.leftRegion)) throw new Error("Edge references unknown region");
+   316→      if (e.rightRegion != null && !ids.has(e.rightRegion)) throw new Error("Edge references unknown region");
+   317→    }
+   318→    if (g.boundaryStyle !== undefined) {
+   319→      const bs = g.boundaryStyle;
+   320→      if (!bs || typeof bs !== "object") throw new Error("Invalid boundary style");
+   321→      for (const key of ["artwork", "subdivision"] as const) {
+   322→        const entry = bs[key];
+   323→        if (entry === undefined || entry === null) continue; // per-kind optional
+   324→        if (
+   325→          typeof entry !== "object" ||
+   326→          typeof entry.stroke !== "string" ||
+   327→          entry.stroke.length === 0 ||
+   328→          !Number.isFinite(entry.strokeWidth)
+   329→        )
+   330→          throw new Error("Invalid boundary style");
+   331→        if (entry.dash !== undefined && typeof entry.dash !== "string") throw new Error("Invalid boundary dash");
+   332→      }
+   333→    }
+   334→  }
+   335→  if (m.format === "color-duel-detailed-vector-1") {
+   336→    const paint = bundle.paint;
+   337→    if (!paint || paint.artworkId !== m.id || !Array.isArray(paint.paths) || !Array.isArray(paint.inkPaths))
+   338→      throw new Error("Missing detailed vector paint");
+   339→    const gradientIds = new Set((paint.gradients ?? []).map((x) => x.id));
+   340→    for (const path of paint.paths) {
+   341→      const okFill = SAFE_HEX.test(path.fill) ||
+   342→        (SAFE_GRADIENT_REF.test(path.fill) && gradientIds.has(path.fill.slice(5, -1)));
+   343→      if (!okFill || !SAFE_PATH.test(path.d)) throw new Error("Invalid paint path");
+   344→      if (path.fillRule !== undefined && !["evenodd", "nonzero"].includes(path.fillRule))
+   345→        throw new Error("Invalid paint fill rule");
+   346→      for (const key of ["opacity", "fillOpacity", "strokeWidth", "z"] as const) {
+   347→        const v = path[key];
+   348→        if (v !== undefined && !Number.isFinite(v)) throw new Error(`Invalid paint ${key}`);
+   349→      }
+   350→    }
+   351→    // Ink layer holds closed filled shapes OR open stroke line art.
+   352→    for (const path of paint.inkPaths) {
+   353→      const okFill = SAFE_HEX.test(path.fill) ||
+   354→        (SAFE_GRADIENT_REF.test(path.fill) && gradientIds.has(path.fill.slice(5, -1)));
+   355→      const okPath = path.strokeWidth != null || path.filled === false ? SAFE_PATH_OPEN.test(path.d) : SAFE_PATH.test(path.d);
+   356→      if (!okFill || !okPath) throw new Error("Invalid ink path");
+   357→    }
+   358→  }
+   359→  return bundle;
+   360→}
+   361→
+   362→// ---------------------------------------------------------------------------
+   363→// Loader — gateway-aware (XTransformPort must survive in the URL)
+   364→// ---------------------------------------------------------------------------
+   365→
+   366→async function fetchJson<T>(url: string): Promise<T> {
+   367→  const res = await fetch(url, { headers: { "X-Studio-Request": "1" } });
+   368→  if (!res.ok) throw new Error(`Artwork request failed: ${res.status}`);
+   369→  return res.json() as Promise<T>;
+   370→}
+   371→
+   372→/** Fetch + validate the four bundle files for a revision, through the gateway. */
+   373→export async function loadBundle(pid: string, rev: string): Promise<Bundle> {
+   374→  const base = `/api/projects/${pid}/revisions/${rev}/files/`;
+   375→  const q = "?XTransformPort=8765";
+   376→  const [manifest, geometry, palette, paint] = await Promise.all([
+   377→    fetchJson<Manifest>(base + "artwork.json" + q),
+   378→    fetchJson<Geometry>(base + "regions.json" + q),
+   379→    fetchJson<PaletteEntry[]>(base + "palette.json" + q),
+   380→    fetchJson<PaintLayer | null>(base + "paint.json" + q),
+   381→  ]);
+   382→  return validateBundle({ manifest, geometry, palette, paint });
+   383→}
+   384→
+   385→// ---------------------------------------------------------------------------
+   386→// Board state
+   387→// ---------------------------------------------------------------------------
+   388→
+   389→export type PaintResult = "ignored" | "already-complete" | "wrong-color" | "painted";
+   390→export type BoardMode = "number" | "memory" | "free";
+   391→export type ChangeReason = "render" | "paint" | "wrong-color" | "viewport" | string;
+   392→
+   393→export interface BoardState {
+   394→  mode: BoardMode;
+   395→  artworkId: string;
+   396→  artworkVersion: string;
+   397→  completedRegionIds: string[];
+   398→  selectedPaletteId: number;
+   399→  /** Active free-mode color (#RRGGBB); null until a custom color is chosen. */
+   400→  customColor: string | null;
+   401→  mistakes: number;
+   402→  total: number;
+   403→  completed: number;
+   404→  progress: number;
+   405→  objects: Record<string, { completed: number; total: number }>;
+   406→  preview: boolean;
+   407→  zoom: number;
+   408→}
+   409→
+   410→interface Session {
+   411→  artworkId: string;
+   412→  artworkVersion: string;
+   413→  mode: BoardMode;
+   414→  completedRegionIds: string[];
+   415→  selectedPaletteId: number;
+   416→  /** Region id → applied #RRGGBB (free mode stores true hex, not palette ids). */
+   417→  freeColors: Record<string, string>;
+   418→  mistakes: number;
+   419→  updatedAt: string;
+   420→}
+   421→
+   422→export interface BoardOptions {
+   423→  mode?: BoardMode;
+   424→  persist?: boolean;
+   425→  onChange?: (state: BoardState, reason: ChangeReason) => void;
+   426→}
+   427→
+   428→// ---------------------------------------------------------------------------
+   429→// VectorBoard
+   430→// ---------------------------------------------------------------------------
+   431→
+   432→export class VectorBoard {
+   433→  readonly svg: SVGSVGElement;
+   434→  readonly bundle: Bundle;
+   435→  readonly options: BoardOptions;
+   436→  mode: BoardMode;
+   437→  readonly prefix: string;
+   438→  /** Active free-mode color (#RRGGBB) — null until a custom color is chosen.
+   439→   *  In free mode this is what paint() applies; palette swatches load their
+   440→   *  entry's hex here as a quick access. */
+   441→  customColor: string | null = null;
+   442→  private handlers: Array<() => void> = [];
+   443→  private pointers = new Map<number, { x: number; y: number }>();
+   444→  private history: Array<{ id: string; wasCompleted: boolean; oldColor?: string }> = [];
+   445→  preview = false;
+   446→  private ctx: CanvasRenderingContext2D | null;
+   447→  regions = new Map<string, RegionEntry>();
+   448→  private paths = new Map<string, Path2D>();
+   449→  readonly elements = new Map<string, SVGPathElement>();
+   450→  private labels = new Map<string, SVGTextElement>();
+   451→  private session: Session;
+   452→  private completed = new Set<string>();
+   453→  private base: number[];
+   454→  private view: number[];
+   455→  private detailed: boolean;
+   456→  /** Non-empty edges overlay ⇒ fill-only region paths (boundaries drawn by the overlay). */
+   457→  private edgesMode = false;
+   458→  /** Live appearance groups replaced by cached underpainting <image> elements. */
+   459→  private artLayer: SVGGElement | null = null;
+   460→  private inkLayer: SVGGElement | null = null;
+   461→  private blobUrls: string[] = [];
+   462→  private destroyed = false;
+   463→  private rafId = 0;
+   464→  private flushGestureFrame: (() => void) | null = null;
+   465→  /** View the in-flight gesture targets; applied once at gesture end. */
+   466→  private pendingView: number[] | null = null;
+   467→  /** Gesture-start bounding rect (the CSS transform would corrupt fresh reads). */
+   468→  private gestureRect: DOMRect | null = null;
+   469→  private drag: { x: number; y: number; view: number[]; inverse: DOMMatrix; anchor: DOMPoint | null; moved: boolean } | null = null;
+   470→  private pinch: { distance: number; view: number[]; inverse: DOMMatrix; anchor: DOMPoint | null; mid0: { x: number; y: number } } | null = null;
+   471→  private suppressTap = false;
+   472→  /** Set by the wrapper (clientToArt override) — last art-space point of a tap. */
+   473→  lastTapPoint: DOMPoint | null = null;
+   474→
+   475→  constructor(svg: SVGSVGElement, bundle: Bundle, options: BoardOptions = {}) {
+   476→    if (!(svg instanceof SVGSVGElement)) throw new Error("Pass an <svg> element to VectorBoard");
+   477→    validateBundle(bundle);
+   478→    this.svg = svg;
+   479→    this.bundle = bundle;
+   480→    this.options = options;
+   481→    this.mode = options.mode ?? "number";
+   482→    if (!["number", "memory", "free"].includes(this.mode)) throw new Error("Invalid coloring mode");
+   483→    this.prefix = `cdv-${++sequence}-`;
+   484→    this.ctx = document.createElement("canvas").getContext("2d");
+   485→    if (!this.ctx) throw new Error("Canvas hit-testing is unavailable");
+   486→    this.regions = new Map(bundle.geometry.regions.map((r) => [r.id, r]));
+   487→    this.paths = new Map([...this.regions].map(([id, r]) => [id, new Path2D(r.d)]));
+   488→    const paletteIds = [...new Set(bundle.palette.map((p) => p.id))].sort((a, b) => a - b);
+   489→    this.session = {
+   490→      artworkId: bundle.manifest.id,
+   491→      artworkVersion: bundle.manifest.version,
+   492→      mode: this.mode,
+   493→      completedRegionIds: [],
+   494→      selectedPaletteId: paletteIds[0] ?? 1,
+   495→      freeColors: {},
+   496→      mistakes: 0,
+   497→      updatedAt: new Date().toISOString(),
+   498→    };
+   499→    this.completed = new Set(this.session.completedRegionIds);
+   500→    this.base = [...bundle.geometry.viewBox];
+   501→    this.view = [...this.base];
+   502→    this.detailed = bundle.manifest.format === "color-duel-detailed-vector-1";
+   503→    this.edgesMode = Array.isArray(bundle.geometry.edges) && bundle.geometry.edges.length > 0;
+   504→    this.mount();
+   505→    this.bindGestures();
+   506→    this.refresh();
+   507→    this.buildUnderpainting();
+   508→  }
+   509→
+   510→  /** Tap-to-fill. Kept as an overridable field so authoring modes can intercept. */
+   511→  paint: (id: string | null) => PaintResult | string = (id) => {
+   512→    const r = id ? this.regions.get(id) : undefined;
+   513→    if (!r || this.preview) return "ignored";
+   514→    if (this.completed.has(id!) && this.mode !== "free") return "already-complete";
+   515→    if (this.mode !== "free" && r.paletteId !== this.session.selectedPaletteId) {
+   516→      this.session.mistakes++;
+   517→      this.save();
+   518→      this.notify("wrong-color");
+   519→      return "wrong-color";
+   520→    }
+   521→    if (this.mode === "free") {
+   522→      // Free mode: any #RRGGBB is legal — no palette check, no mistake
+   523→      // counting. Falls back to the selected palette entry's hex until a
+   524→      // custom color is chosen (palette swatches double as quick access).
+   525→      const hex = this.customColor ?? this.paletteHex(this.session.selectedPaletteId) ?? "#FFFFFF";
+   526→      if (this.completed.has(id!) && this.session.freeColors[id!] === hex) return "already-complete";
+   527→      this.history.push({ id: id!, wasCompleted: this.completed.has(id!), oldColor: this.session.freeColors[id!] });
+   528→      this.completed.add(id!);
+   529→      this.session.freeColors[id!] = hex;
+   530→      this.save();
+   531→      this.refresh();
+   532→      this.notify("paint");
+   533→      return "painted";
+   534→    }
+   535→    this.history.push({ id: id!, wasCompleted: this.completed.has(id!), oldColor: this.session.freeColors[id!] });
+   536→    this.completed.add(id!);
+   537→    this.save();
+   538→    this.refresh();
+   539→    this.notify("paint");
+   540→    return "painted";
+   541→  };
+   542→
+   543→  /** Client-space → artwork-space transform. Overridable (used to capture tap points). */
+   544→  clientToArt: (x: number, y: number, matrix?: DOMMatrix | null) => DOMPoint | null = (x, y, matrix) => {
+   545→    const ctm = matrix ?? this.svg.getScreenCTM()?.inverse() ?? null;
+   546→    if (!ctm) return null;
+   547→    return new DOMPoint(x, y).matrixTransform(ctm);
+   548→  };
+   549→
+   550→  private mount() {
+   551→    this.svg.replaceChildren();
+   552→    this.svg.setAttribute("viewBox", this.view.join(" "));
+   553→    this.svg.setAttribute("aria-label", `${this.bundle.manifest.title}, interactive coloring artwork`);
+   554→    this.svg.setAttribute("role", "group");
+   555→    this.svg.style.touchAction = "none";
+   556→    const defs = svgNode("defs");
+   557→    for (const p of this.bundle.palette) {
+   558→      const grad = svgNode("linearGradient", {
+   559→        id: `${this.prefix}paint-${p.id}`,
+   560→        x1: "0%",
+   561→        y1: "0%",
+   562→        x2: "100%",
+   563→        y2: "100%",
+   564→      });
+   565→      for (const stop of p.paint.stops) grad.append(svgNode("stop", { offset: stop.offset, "stop-color": stop.color }));
+   566→      defs.append(grad);
+   567→    }
+   568→    if (this.detailed && this.bundle.paint?.gradients) {
+   569→      for (const g of this.bundle.paint.gradients) {
+   570→        const attrs: Attrs =
+   571→          g.type === "linear"
+   572→            ? { id: g.id, gradientUnits: "userSpaceOnUse", x1: g.x1, y1: g.y1, x2: g.x2, y2: g.y2 }
+   573→            : { id: g.id, gradientUnits: "userSpaceOnUse", cx: g.cx, cy: g.cy, r: g.r, fx: g.fx, fy: g.fy };
+   574→        const node = svgNode(g.type === "linear" ? "linearGradient" : "radialGradient", attrs);
+   575→        for (const stop of g.stops) {
+   576→          const stopAttrs: Attrs = { offset: stop.offset, "stop-color": stop.color };
+   577→          if (stop.opacity != null && stop.opacity !== 1) stopAttrs["stop-opacity"] = stop.opacity;
+   578→          node.append(svgNode("stop", stopAttrs));
+   579→        }
+   580→        defs.append(node);
+   581→      }
+   582→    }
+   583→    const hatch = svgNode("pattern", {
+   584→      id: this.prefix + "selected",
+   585→      width: 12,
+   586→      height: 12,
+   587→      patternUnits: "userSpaceOnUse",
+   588→    });
+   589→    hatch.append(
+   590→      svgNode("rect", { width: 12, height: 12, fill: "#EDF1F4" }),
+   591→      svgNode("path", { d: "M0 0H6V6H0Z M6 6H12V12H6Z", fill: "#C3CED4" })
+   592→    );
+   593→    defs.append(hatch);
+   594→    this.svg.append(defs);
+   595→    const g = this.bundle.geometry;
+   596→    if (this.detailed && this.bundle.paint) {
+   597→      // Appearance layer below the masks: filled paths in ORIGINAL drawing
+   598→      // order (z), honouring per-path fill rule, fill-opacity/opacity and
+   599→      // strokes on filled shapes. Stroke-only ink renders in the ink layer
+   600→      // above the masks so the linework stays visible during play.
+   601→      const art = svgNode("g", { "data-layer": "vector-paint", "pointer-events": "none" }) as SVGGElement;
+   602→      const entries = [...this.bundle.paint.paths, ...this.bundle.paint.inkPaths].sort(
+   603→        (a, b) => (a.z ?? Infinity) - (b.z ?? Infinity)
+   604→      );
+   605→      for (const p of entries) {
+   606→        if (p.filled === false || (p.strokeWidth != null && !p.fill.startsWith("#"))) continue;
+   607→        const gradientFill = p.fill.startsWith("url(#");
+   608→        const attrs: Attrs = { d: p.d, fill: p.fill, "fill-rule": p.fillRule ?? "evenodd" };
+   609→        if (!gradientFill) {
+   610→          attrs.stroke = p.stroke ?? p.fill;
+   611→          attrs["stroke-width"] = p.strokeWidth ?? 0.55;
+   612→          attrs["stroke-linejoin"] = "round";
+   613→        }
+   614→        if (p.fillOpacity != null && p.fillOpacity < 0.999) attrs["fill-opacity"] = p.fillOpacity;
+   615→        if (p.opacity != null && p.opacity < 0.999) attrs.opacity = p.opacity;
+   616→        if (p.stroke && p.strokeWidth && p.strokeWidth > 0 && !gradientFill) {
+   617→          attrs.stroke = p.stroke;
+   618→          attrs["stroke-width"] = p.strokeWidth;
+   619→        }
+   620→        art.append(svgNode("path", attrs));
+   621→      }
+   622→      this.artLayer = art;
+   623→      this.svg.append(art);
+   624→    }
+   625→    // With an edges overlay, region paths render FILL-ONLY: boundaries are
+   626→    // drawn by the overlay (always visible, even for completed regions).
+   627→    const regionGroupAttrs: Attrs = { "stroke-linejoin": "round" };
+   628→    if (!this.edgesMode) {
+   629→      regionGroupAttrs.stroke = g.stroke;
+   630→      regionGroupAttrs["stroke-width"] = g.strokeWidth;
+   631→    }
+   632→    const regions = svgNode("g", regionGroupAttrs);
+   633→    this.elements.clear();
+   634→    this.labels.clear();
+   635→    for (const r of g.regions) {
+   636→      const node = svgNode("path", {
+   637→        id: this.prefix + r.id,
+   638→        "data-region-id": r.id,
+   639→        "data-palette-id": r.paletteId,
+   640→        d: r.d,
+   641→        tabindex: 0,
+   642→        role: "button",
+   643→        "fill-rule": r.fillRule ?? "evenodd",
+   644→        "aria-label": `Region ${r.id}, palette ${this.mode === "memory" ? "hidden" : r.paletteId}`,
+   645→      }) as SVGPathElement;
+   646→      this.elements.set(r.id, node);
+   647→      regions.append(node);
+   648→    }
+   649→    this.svg.append(regions);
+   650→    const fixed = svgNode("g", { "pointer-events": "none", stroke: g.stroke, "stroke-width": 1.3, "stroke-linejoin": "round", "fill-rule": "evenodd" });
+   651→    for (const r of this.detailed ? [] : g.decorations)
+   652→      fixed.append(svgNode("path", { d: r.d, fill: `url(#${this.prefix}paint-${r.paletteId})` }));
+   653→    this.svg.append(fixed);
+   654→    const details = svgNode("g", { "pointer-events": "none", fill: "none", "stroke-linejoin": "round", "stroke-linecap": "round" });
+   655→    for (const d of g.detailPaths)
+   656→      details.append(svgNode("path", { d: d.d, stroke: d.stroke, "stroke-width": d.strokeWidth, opacity: d.opacity }));
+   657→    this.svg.append(details);
+   658→    if (this.detailed && this.bundle.paint) {
+   659→      const ink = svgNode("g", { "data-layer": "ink", "pointer-events": "none" }) as SVGGElement;
+   660→      for (const p of this.bundle.paint.inkPaths) {
+   661→        if (p.strokeWidth != null || p.filled === false) {
+   662→          ink.append(svgNode("path", {
+   663→            d: p.d, fill: "none", stroke: p.fill,
+   664→            "stroke-width": p.strokeWidth ?? 1.5,
+   665→            "stroke-linecap": "round", "stroke-linejoin": "round",
+   666→          }));
+   667→        } else {
+   668→          const attrs: Attrs = { d: p.d, fill: p.fill, "fill-rule": p.fillRule ?? "evenodd" };
+   669→          if (p.opacity != null && p.opacity < 0.999) attrs.opacity = p.opacity;
+   670→          if (p.fillOpacity != null && p.fillOpacity < 0.999) attrs["fill-opacity"] = p.fillOpacity;
+   671→          ink.append(svgNode("path", attrs));
+   672→        }
+   673→      }
+   674→      this.inkLayer = ink;
+   675→      this.svg.append(ink);
+   676→    }
+   677→    // Edges overlay (contract §1): ABOVE the ink layer, BELOW the labels.
+   678→    // Artwork boundaries render solid; subdivision boundaries render light
+   679→    // and dashed. boundaryStyle (if present) overrides the defaults.
+   680→    if (this.edgesMode && g.edges) {
+   681→      const style = g.boundaryStyle;
+   682→      const defaults: Record<EdgeEntry["kind"], { stroke: string; strokeWidth: number; dash?: string }> = {
+   683→        artwork: { stroke: g.stroke || "#22333B", strokeWidth: 1.6 },
+   684→        subdivision: { stroke: "#7A8C94", strokeWidth: 0.85, dash: "3 2.2" },
+   685→      };
+   686→      const edges = svgNode("g", {
+   687→        "data-layer": "edges",
+   688→        "pointer-events": "none",
+   689→        fill: "none",
+   690→        "stroke-linecap": "round",
+   691→        "stroke-linejoin": "round",
+   692→      });
+   693→      for (const e of g.edges) {
+   694→        const base = defaults[e.kind];
+   695→        const custom = style?.[e.kind];
+   696→        const attrs: Attrs = {
+   697→          id: this.prefix + e.id,
+   698→          "data-edge-kind": e.kind,
+   699→          d: e.d,
+   700→          stroke: custom?.stroke ?? base.stroke,
+   701→          "stroke-width": custom?.strokeWidth ?? base.strokeWidth,
+   702→        };
+   703→        const dash = custom?.dash ?? base.dash;
+   704→        if (dash) attrs["stroke-dasharray"] = dash;
+   705→        edges.append(svgNode("path", attrs));
+   706→      }
+   707→      this.svg.append(edges);
+   708→    }
+   709→    const labels = svgNode("g", {
+   710→      "pointer-events": "none",
+   711→      "font-family": "Arial,sans-serif",
+   712→      fill: "#33444C",
+   713→      "text-anchor": "middle",
+   714→      "dominant-baseline": "central",
+   715→    });
+   716→    for (const r of g.regions) {
+   717→      const label = svgNode("text", {
+   718→        "data-label-for": r.id,
+   719→        x: r.label.x,
+   720→        y: r.label.y,
+   721→        "font-size": r.label.fontSize,
+   722→      }) as SVGTextElement;
+   723→      label.textContent = String(r.paletteId);
+   724→      labels.append(label);
+   725→      this.labels.set(r.id, label);
+   726→    }
+   727→    this.svg.append(labels);
+   728→    this.listen(this.svg, "keydown", (event: Event) => {
+   729→      const e = event as KeyboardEvent;
+   730→      const id = (e.target as Element | null)?.getAttribute?.("data-region-id");
+   731→      if (id && (e.key === "Enter" || e.key === " ")) {
+   732→        e.preventDefault();
+   733→        this.paint(id);
+   734→      }
+   735→    });
+   736→  }
+   737→
+   738→  private listen(el: EventTarget, type: string, fn: EventListener, options?: AddEventListenerOptions) {
+   739→    el.addEventListener(type, fn, options);
+   740→    this.handlers.push(() => el.removeEventListener(type, fn, options));
+   741→  }
+   742→
+   743→  state(): BoardState {
+   744→    const completedRegionIds = [...this.completed];
+   745→    const groups = this.bundle.manifest.objectGroups ?? [];
+   746→    const objects: Record<string, { completed: number; total: number }> = {};
+   747→    for (const group of groups)
+   748→      objects[group.id] = {
+   749→        completed: group.regionIds.filter((id) => this.completed.has(id)).length,
+   750→        total: group.regionIds.length,
+   751→      };
+   752→    return {
+   753→      artworkId: this.session.artworkId,
+   754→      artworkVersion: this.session.artworkVersion,
+   755→      mode: this.session.mode,
+   756→      completedRegionIds,
+   757→      selectedPaletteId: this.session.selectedPaletteId,
+   758→      customColor: this.customColor,
+   759→      mistakes: this.session.mistakes,
+   760→      total: this.regions.size,
+   761→      completed: completedRegionIds.length,
+   762→      progress: this.regions.size ? completedRegionIds.length / this.regions.size : 0,
+   763→      objects,
+   764→      preview: this.preview,
+   765→      zoom: this.base[2] / this.view[2],
+   766→    };
+   767→  }
+   768→
+   769→  /** In-memory only — authoring play-tests never write player progress. */
+   770→  private save() {
+   771→    this.session.completedRegionIds = [...this.completed];
+   772→    this.session.updatedAt = new Date().toISOString();
+   773→  }
+   774→
+   775→  private notify(reason: ChangeReason) {
+   776→    this.options.onChange?.(this.state(), reason);
+   777→  }
+   778→
+   779→  refresh() {
+   780→    for (const [id, r] of this.regions) {
+   781→      const done = this.completed.has(id);
+   782→      const node = this.elements.get(id);
+   783→      const label = this.labels.get(id);
+   784→      if (!node) continue;
+   785→      let fill = "#FFFFFF";
+   786→      if (this.preview || done) {
+   787→        if (!this.preview && this.mode === "free") {
+   788→          // Free mode: flat custom hex — never a gradient url.
+   789→          fill = this.session.freeColors[id] ?? "#FFFFFF";
+   790→        } else {
+   791→          fill = `url(#${this.prefix}paint-${r.paletteId})`;
+   792→        }
+   793→      } else if (this.mode === "number" && r.paletteId === this.session.selectedPaletteId) {
+   794→        fill = `url(#${this.prefix}selected)`;
+   795→      }
+   796→      if (this.detailed && (this.preview || (done && this.mode !== "free"))) fill = "none";
+   797→      node.setAttribute("fill", fill);
+   798→      // Edges mode: region paths stay fill-only in EVERY state — the overlay
+   799→      // always draws the boundaries (that is the point of true vs artificial
+   800→      // boundaries: completed regions keep visible outlines too).
+   801→      node.setAttribute(
+   802→        "stroke",
+   803→        this.edgesMode || (this.detailed && (done || this.preview)) ? "none" : this.bundle.geometry.stroke
+   804→      );
+   805→      node.setAttribute("data-completed", String(done));
+   806→      node.setAttribute("tabindex", done && this.mode !== "free" ? "-1" : "0");
+   807→      node.setAttribute("aria-pressed", String(done));
+   808→      if (label) label.style.display = done || this.preview || this.mode !== "number" ? "none" : "";
+   809→    }
+   810→    this.updateLabelVisibility();
+   811→    this.notify("render");
+   812→  }
+   813→
+   814→  updateLabelVisibility(rect?: DOMRect) {
+   815→    if (!this.detailed || this.labels.size === 0) return;
+   816→    // An explicit rect override lets gesture end re-measure against the
+   817→    // UNTRANSFORMED box (the GPU transform is cleared right after applyView,
+   818→    // but getBoundingClientRect inside applyView would already see it).
+   819→    const screen = rect ?? this.svg.getBoundingClientRect();
+   820→    if (!screen.width || !screen.height) return;
+   821→    const scale = Math.min(screen.width / this.view[2], screen.height / this.view[3]);
+   822→    for (const [id, r] of this.regions) {
+   823→      const label = this.labels.get(id);
+   824→      if (!label) continue;
+   825→      const visible = !this.completed.has(id) && !this.preview && this.mode === "number" && r.label.fontSize * scale >= 9;
+   826→      label.style.display = visible ? "" : "none";
+   827→    }
+   828→  }
+   829→
+   830→  setPalette(id: number) {
+   831→    if (!this.bundle.palette.some((p) => p.id === id)) throw new Error("Unknown palette ID");
+   832→    this.session.selectedPaletteId = id;
+   833→    if (this.mode === "free") {
+   834→      // Quick access: in free mode a palette swatch loads that entry's hex
+   835→      // as the active custom color (the palette itself is unchanged).
+   836→      const hex = this.paletteHex(id);
+   837→      if (hex) this.customColor = hex.toUpperCase();
+   838→    }
+   839→    this.save();
+   840→    this.refresh();
+   841→  }
+   842→
+   843→  /** Set the active free-mode color. Validated #RRGGBB — throws otherwise. */
+   844→  setFreeColor(hex: string) {
+   845→    if (typeof hex !== "string" || !SAFE_HEX.test(hex)) throw new Error("Free color must be a #RRGGBB hex value");
+   846→    this.customColor = hex.toUpperCase();
+   847→    this.refresh();
+   848→  }
+   849→
+   850→  setMode(mode: BoardMode) {
+   851→    if (!["number", "memory", "free"].includes(mode)) throw new Error("Invalid coloring mode");
+   852→    this.mode = mode;
+   853→    this.session.mode = mode;
+   854→    this.save();
+   855→    this.refresh();
+   856→  }
+   857→
+   858→  setPreview(value: boolean) {
+   859→    this.preview = !!value;
+   860→    this.refresh();
+   861→  }
+   862→
+   863→  undo(): boolean {
+   864→    if (this.preview) return false;
+   865→    const previous = this.history.pop();
+   866→    if (!previous) return false;
+   867→    if (!previous.wasCompleted) this.completed.delete(previous.id);
+   868→    if (previous.oldColor === undefined) delete this.session.freeColors[previous.id];
+   869→    else this.session.freeColors[previous.id] = previous.oldColor;
+   870→    this.save();
+   871→    this.refresh();
+   872→    return true;
+   873→  }
+   874→
+   875→  reset() {
+   876→    this.completed.clear();
+   877→    this.session.freeColors = {};
+   878→    this.session.mistakes = 0;
+   879→    this.history = [];
+   880→    this.preview = false;
+   881→    this.save();
+   882→    this.refresh();
+   883→    this.fit();
+   884→  }
+   885→
+   886→  private hitTest(x: number, y: number): string | null {
+   887→    // Iterate in reverse document order: the topmost region wins. Regions
+   888→    // are visible surfaces (non-overlapping masks), so this only matters at
+   889→    // shared boundaries; per-region fill rules are honoured.
+   890→    for (const [id, r] of [...this.regions].reverse()) {
+   891→      const b = r.bbox;
+   892→      const rule = r.fillRule ?? "evenodd";
+   893→      if (x >= b[0] && x <= b[2] && y >= b[1] && y <= b[3] && this.ctx!.isPointInPath(this.paths.get(id)!, x, y, rule))
+   894→        return id;
+   895→    }
+   896→    return null;
+   897→  }
+   898→
+   899→  /** Public region lookup in artwork coordinates — the Cut tool uses this
+   900→   *  to find the region under the stroke midpoint. */
+   901→  hitRegion(x: number, y: number): string | null {
+   902→    return this.hitTest(x, y);
+   903→  }
+   904→
+   905→  private paletteHex(id: number): string | null {
+   906→    return this.bundle.palette.find((p) => p.id === id)?.hex ?? null;
+   907→  }
+   908→
+   909→  private applyView(view: number[]) {
+   910→    const [bx, by, bw, bh] = this.base;
+   911→    const w = clamp(view[2], bw / 10, bw);
+   912→    const h = (w * bh) / bw;
+   913→    this.view = [clamp(view[0], bx, bx + bw - w), clamp(view[1], by, by + bh - h), w, h];
+   914→    this.svg.setAttribute("viewBox", this.view.join(" "));
+   915→    this.updateLabelVisibility();
+   916→    this.notify("viewport");
+   917→  }
+   918→
+   919→  fit() {
+   920→    this.applyView([...this.base]);
+   921→  }
+   922→
+   923→  zoom(factor: number, anchor?: { x: number; y: number } | null) {
+   924→    const v = this.view;
+   925→    const a = anchor ?? { x: v[0] + v[2] / 2, y: v[1] + v[3] / 2 };
+   926→    const w = clamp(v[2] / factor, this.base[2] / 10, this.base[2]);
+   927→    const h = (w * this.base[3]) / this.base[2];
+   928→    this.applyView([a.x - ((a.x - v[0]) * w) / v[2], a.y - ((a.y - v[1]) * h) / v[3], w, h]);
+   929→  }
+   930→
+   931→  nextRegion(): string | null {
+   932→    if (this.mode !== "number" || this.preview) return null;
+   933→    const r = [...this.regions.values()].find(
+   934→      (region) => !this.completed.has(region.id) && region.paletteId === this.session.selectedPaletteId
+   935→    );
+   936→    if (!r) return null;
+   937→    const w = Math.max(
+   938→      this.base[2] / 10,
+   939→      Math.min(this.base[2], Math.max(r.bbox[2] - r.bbox[0], (r.bbox[3] - r.bbox[1]) * (this.base[2] / this.base[3])) * 1.6)
+   940→    );
+   941→    this.applyView([r.label.x - w / 2, r.label.y - (w * this.base[3]) / this.base[2] / 2, w, (w * this.base[3]) / this.base[2]]);
+   942→    this.elements.get(r.id)?.focus({ preventScroll: true });
+   943→    return r.id;
+   944→  }
+   945→
+   946→  /**
+   947→   * Center the viewport on a specific region and focus its path element —
+   948→   * used by the QA panel drill-down ("select region & zoom to it").
+   949→   * Unlike nextRegion() this ignores mode/preview and completion state.
+   950→   */
+   951→  focusRegion(id: string): string | null {
+   952→    const r = this.regions.get(id);
+   953→    if (!r) return null;
+   954→    const w = Math.max(
+   955→      this.base[2] / 10,
+   956→      Math.min(
+   957→        this.base[2],
+   958→        Math.max(r.bbox[2] - r.bbox[0], (r.bbox[3] - r.bbox[1]) * (this.base[2] / this.base[3])) * 1.8
+   959→      )
+   960→    );
+   961→    this.applyView([
+   962→      r.label.x - w / 2,
+   963→      r.label.y - (w * this.base[3]) / this.base[2] / 2,
+   964→      w,
+   965→      (w * this.base[3]) / this.base[2],
+   966→    ]);
+   967→    this.elements.get(id)?.focus({ preventScroll: true });
+   968→    return id;
+   969→  }
+   970→
+   971→  private bindGestures() {
+   972→    // High-performance gestures (contract §8):
+   973→    //  - pointermove/wheel store the LATEST event and ONE requestAnimationFrame
+   974→    //    per frame runs the handler (rAF batching);
+   975→    //  - during an active drag/pinch the SVG viewBox is NOT touched — instead a
+   976→    //    GPU CSS transform (translate+scale, transform-origin at the gesture
+   977→    //    anchor in client px) moves the whole board. The transform is computed
+   978→    //    from the same view-math the classic per-move path used (relative to
+   979→    //    the gesture-start view), so the visuals are identical while the
+   980→    //    browser only composites one layer;
+   981→    //  - on gesture END the final view is applied with applyView() FIRST and
+   982→    //    the CSS transform is cleared AFTER (order matters: applyView clamps
+   983→    //    exactly like the classic path and leaves the CTM correct for tap
+   984→    //    detection / drawing tools);
+   985→    //  - updateLabelVisibility is skipped while a gesture is active (no
+   986→    //    applyView calls) and runs once at gesture end.
+   987→    let queuedMove: PointerEvent | null = null;
+   988→    let queuedWheel: WheelEvent | null = null;
+   989→    const runFrame = () => {
+   990→      this.rafId = 0;
+   991→      const move = queuedMove;
+   992→      const wheel = queuedWheel;
+   993→      queuedMove = null;
+   994→      queuedWheel = null;
+   995→      if (move) this.processMove(move);
+   996→      if (wheel) this.processWheel(wheel);
+   997→    };
+   998→    const scheduleFrame = () => {
+   999→      if (!this.rafId) this.rafId = requestAnimationFrame(runFrame);
+  1000→    };
+  1001→    this.flushGestureFrame = () => {
+  1002→      if (this.rafId) {
+  1003→        cancelAnimationFrame(this.rafId);
+  1004→        runFrame();
+  1005→      }
+  1006→    };
+  1007→    const startPinch = () => {
+  1008→      const pts = [...this.pointers.values()];
+  1009→      if (pts.length < 2) return;
+  1010→      const mid = { x: (pts[0].x + pts[1].x) / 2, y: (pts[0].y + pts[1].y) / 2 };
+  1011→      const inverse = this.svg.getScreenCTM()!.inverse();
+  1012→      this.gestureRect = this.svg.getBoundingClientRect();
+  1013→      this.pinch = {
+  1014→        distance: Math.max(1, Math.hypot(pts[0].x - pts[1].x, pts[0].y - pts[1].y)),
+  1015→        view: [...this.view],
+  1016→        inverse,
+  1017→        anchor: this.clientToArt(mid.x, mid.y, inverse),
+  1018→        mid0: mid,
+  1019→      };
+  1020→      this.suppressTap = true;
+  1021→    };
+  1022→    this.listen(this.svg, "pointerdown", (event) => {
+  1023→      const e = event as PointerEvent;
+  1024→      if (e.pointerType === "mouse" && e.button !== 0) return;
+  1025→      this.pointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
+  1026→      // Synthetic/test events and stale pointers can make capture fail; a throw
+  1027→      // here would skip drag setup and break the whole tap flow, so guard it.
+  1028→      try {
+  1029→        this.svg.setPointerCapture(e.pointerId);
+  1030→      } catch {
+  1031→        /* no active pointer with this id — safe to continue without capture */
+  1032→      }
+  1033→      if (this.pointers.size === 1) {
+  1034→        this.suppressTap = false;
+  1035→        this.gestureRect = this.svg.getBoundingClientRect();
+  1036→        const inverse = this.svg.getScreenCTM()!.inverse();
+  1037→        this.drag = {
+  1038→          x: e.clientX,
+  1039→          y: e.clientY,
+  1040→          view: [...this.view],
+  1041→          inverse,
+  1042→          anchor: this.clientToArt(e.clientX, e.clientY, inverse),
+  1043→          moved: false,
+  1044→        };
+  1045→      } else if (this.pointers.size === 2) startPinch();
+  1046→    });
+  1047→    this.listen(this.svg, "pointermove", (event) => {
+  1048→      const e = event as PointerEvent;
+  1049→      if (!this.pointers.has(e.pointerId)) return;
+  1050→      this.pointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
+  1051→      queuedMove = e;
+  1052→      scheduleFrame();
+  1053→    });
+  1054→    const finish = (event: Event, cancel = false) => {
+  1055→      const e = event as PointerEvent;
+  1056→      if (!this.pointers.has(e.pointerId)) return;
+  1057→      // Flush any pending gesture frame so tap detection sees the latest
+  1058→      // movement (a move that arrived just before pointerup must count).
+  1059→      this.flushGestureFrame?.();
+  1060→      const tap = !cancel && this.pointers.size === 1 && !this.suppressTap && !this.drag?.moved;
+  1061→      this.pointers.delete(e.pointerId);
+  1062→      if (this.svg.hasPointerCapture(e.pointerId)) this.svg.releasePointerCapture(e.pointerId);
+  1063→      if (tap) {
+  1064→        const p = this.clientToArt(e.clientX, e.clientY);
+  1065→        if (p) this.paint(this.hitTest(p.x, p.y));
+  1066→      }
+  1067→      if (!this.pointers.size) this.endGesture();
+  1068→      else this.suppressTap = true;
+  1069→    };
+  1070→    this.listen(this.svg, "pointerup", (e) => finish(e));
+  1071→    this.listen(this.svg, "pointercancel", (e) => finish(e, true));
+  1072→    this.listen(
+  1073→      this.svg,
+  1074→      "wheel",
+  1075→      (event) => {
+  1076→        const e = event as WheelEvent;
+  1077→        // preventDefault must stay synchronous (rAF is too late to cancel the
+  1078→        // scroll); the zoom computation itself is rAF-batched.
+  1079→        e.preventDefault();
+  1080→        queuedWheel = e;
+  1081→        scheduleFrame();
+  1082→      },
+  1083→      { passive: false }
+  1084→    );
+  1085→  }
+  1086→
+  1087→  /** Frame handler for a batched pointermove (runs inside one rAF). */
+  1088→  private processMove(e: PointerEvent) {
+  1089→    if (this.pointers.size >= 2 && this.pinch) {
+  1090→      const pts = [...this.pointers.values()];
+  1091→      const mid = { x: (pts[0].x + pts[1].x) / 2, y: (pts[0].y + pts[1].y) / 2 };
+  1092→      const distance = Math.max(1, Math.hypot(pts[0].x - pts[1].x, pts[0].y - pts[1].y));
+  1093→      const p = this.pinch;
+  1094→      const now = this.clientToArt(mid.x, mid.y, p.inverse);
+  1095→      const w = clamp((p.view[2] * p.distance) / distance, this.base[2] / 10, this.base[2]);
+  1096→      const h = (w * this.base[3]) / this.base[2];
+  1097→      if (now && p.anchor) {
+  1098→        // Target view exactly as the classic math computed it; the viewBox is
+  1099→        // only updated at gesture end (see endGesture).
+  1100→        this.pendingView = [
+  1101→          p.anchor.x - ((now.x - p.view[0]) * w) / p.view[2],
+  1102→          p.anchor.y - ((now.y - p.view[1]) * h) / p.view[3],
+  1103→          w,
+  1104→          h,
+  1105→        ];
+  1106→        this.setGestureTransform(mid, p.view[2] / w, p.mid0);
+  1107→      }
+  1108→    } else if (!this.suppressTap && this.drag) {
+  1109→      const d = this.drag;
+  1110→      if (Math.hypot(e.clientX - d.x, e.clientY - d.y) > 6) d.moved = true;
+  1111→      if (d.moved) {
+  1112→        const now = this.clientToArt(e.clientX, e.clientY, d.inverse);
+  1113→        if (now && d.anchor) {
+  1114→          this.pendingView = [d.view[0] - (now.x - d.anchor.x), d.view[1] - (now.y - d.anchor.y), d.view[2], d.view[3]];
+  1115→          // k=1: a pan is a pure translation of (current - start) client px.
+  1116→          this.setGestureTransform({ x: e.clientX, y: e.clientY }, 1, { x: d.x, y: d.y });
+  1117→        }
+  1118→      }
+  1119→    }
+  1120→  }
+  1121→
+  1122→  /** Frame handler for a batched wheel event (zoom applies the view directly). */
+  1123→  private processWheel(e: WheelEvent) {
+  1124→    this.zoom(Math.exp(-e.deltaY * 0.0015), this.clientToArt(e.clientX, e.clientY));
+  1125→  }
+  1126→
+  1127→  /** GPU transform equivalent of the pending view: the art anchor at the
+  1128→   *  gesture start follows the current pointer, everything else scales by k
+  1129→   *  about the start point (derived from the same math as applyView, so the
+  1130→   *  composition at gesture end is pixel-identical to the classic path). */
+  1131→  private setGestureTransform(current: { x: number; y: number }, scale: number, origin: { x: number; y: number }) {
+  1132→    // Cache the rect: once a transform is active, getBoundingClientRect()
+  1133→    // returns the TRANSFORMED box and would corrupt the origin math.
+  1134→    const rect = this.gestureRect ?? this.svg.getBoundingClientRect();
+  1135→    const style = this.svg.style;
+  1136→    style.transformBox = "border-box";
+  1137→    style.transformOrigin = `${origin.x - rect.left}px ${origin.y - rect.top}px`;
+  1138→    style.transform = `translate(${current.x - origin.x}px, ${current.y - origin.y}px) scale(${scale})`;
+  1139→  }
+  1140→
+  1141→  /** Gesture end: apply the final view (clamped), then clear the transform —
+  1142→   *  in THAT order, so the CTM is correct before anything else reads it. */
+  1143→  private endGesture() {
+  1144→    const pending = this.pendingView;
+  1145→    const rect = this.gestureRect;
+  1146→    this.drag = null;
+  1147→    this.pinch = null;
+  1148→    this.suppressTap = false;
+  1149→    this.pendingView = null;
+  1150→    this.gestureRect = null;
+  1151→    if (pending) this.applyView(pending);
+  1152→    this.svg.style.transform = "";
+  1153→    this.svg.style.transformOrigin = "";
+  1154→    // Re-run the label pass against the untransformed box (updateLabelVisibility
+  1155→    // was skipped for the whole gesture; applyView measured a transformed rect).
+  1156→    if (rect) this.updateLabelVisibility(rect);
+  1157→  }
+  1158→
+  1159→  // -------------------------------------------------------------------------
+  1160→  // Cached underpainting (contract §8)
+  1161→  // -------------------------------------------------------------------------
+  1162→
+  1163→  /**
+  1164→   * Serialize the paint + ink appearance ONCE into standalone SVG documents
+  1165→   * (base viewBox, cloned gradient defs only) and swap each appearance group
+  1166→   * for a single <image> element once the blob decodes. Rationale: one image
+  1167→   * node replaces 200k+ live path commands (the 552-region treehouse carries
+  1168→   * ~250k); the browser re-rasterizes a single image cheaply and stays crisp
+  1169→   * at any zoom, where a fixed bitmap would blur.
+  1170→   *
+  1171→   * TWO images are cached — one per z-slot the appearance occupies (the art
+  1172→   * layer BELOW the region masks, the ink layer ABOVE them) — so the classic
+  1173→   * layering (in particular the coloring-book linework above white masks) is
+  1174→   * preserved exactly. Masks, labels, edges overlay and the hatch pattern
+  1175→   * stay live SVG because they are interactive/ARIA-relevant.
+  1176→   *
+  1177→   * If serialization or decoding fails, the live path layers simply remain
+  1178→   * mounted — the fallback is automatic and silent.
+  1179→   */
+  1180→  private buildUnderpainting() {
+  1181→    if (!this.detailed || !this.bundle.paint) return;
+  1182→    const paint = this.bundle.paint;
+  1183→    const defs = serializeGradientDefs(paint.gradients ?? []);
+  1184→    const [bx, by, bw, bh] = this.base;
+  1185→    // Art layer (below the masks): closed fills, z-sorted — mirrors mount().
+  1186→    const artEntries = [...paint.paths, ...paint.inkPaths].sort((a, b) => (a.z ?? Infinity) - (b.z ?? Infinity));
+  1187→    const artBody: string[] = [];
+  1188→    for (const p of artEntries) {
+  1189→      const serialized = serializeArtPath(p);
+  1190→      if (serialized) artBody.push(serialized);
+  1191→    }
+  1192→    // Ink layer (above the masks): open line art + closed ink shapes.
+  1193→    const inkBody = paint.inkPaths.map((p) => serializeInkPath(p));
+  1194→    if (this.artLayer && artBody.length)
+  1195→      this.mountUnderpaintImage(this.artLayer, wrapStandaloneSvg(defs, artBody, bx, by, bw, bh), "underpaint-art");
+  1196→    if (this.inkLayer && inkBody.length)
+  1197→      this.mountUnderpaintImage(this.inkLayer, wrapStandaloneSvg(defs, inkBody, bx, by, bw, bh), "underpaint-ink");
+  1198→  }
+  1199→
+  1200→  /** Load the serialized SVG via a blob URL, verify it decodes with an
+  1201→   *  Image probe, and only then swap the live group children for the image. */
+  1202→  private mountUnderpaintImage(group: SVGGElement, svgString: string, id: string) {
+  1203→    let url: string;
+  1204→    try {
+  1205→      url = URL.createObjectURL(new Blob([svgString], { type: "image/svg+xml" }));
+  1206→    } catch {
+  1207→      return; // silent fallback: live paths stay mounted
+  1208→    }
+  1209→    this.blobUrls.push(url);
+  1210→    const probe = new Image();
+  1211→    probe.onload = () => {
+  1212→      if (this.destroyed) return;
+  1213→      const [bx, by, bw, bh] = this.base;
+  1214→      const image = svgNode("image", {
+  1215→        id: this.prefix + id,
+  1216→        href: url,
+  1217→        x: bx,
+  1218→        y: by,
+  1219→        width: bw,
+  1220→        height: bh,
+  1221→        preserveAspectRatio: "xMidYMid meet",
+  1222→        "pointer-events": "none",
+  1223→      });
+  1224→      // xlink:href for engines that predate SVG2 href on <image>.
+  1225→      image.setAttributeNS("http://www.w3.org/1999/xlink", "xlink:href", url);
+  1226→      group.replaceChildren(image);
+  1227→    };
+  1228→    probe.onerror = () => {
+  1229→      // Silent fallback: keep the live path layer, release the blob.
+  1230→      this.blobUrls = this.blobUrls.filter((u) => u !== url);
+  1231→      URL.revokeObjectURL(url);
+  1232→    };
+  1233→    probe.src = url;
+  1234→  }
+  1235→
+  1236→  destroy() {
+  1237→    this.destroyed = true;
+  1238→    if (this.rafId) cancelAnimationFrame(this.rafId);
+  1239→    this.rafId = 0;
+  1240→    this.flushGestureFrame = null;
+  1241→    for (const remove of this.handlers) remove();
+  1242→    this.handlers = [];
+  1243→    this.svg.replaceChildren();
+  1244→    this.svg.style.transform = "";
+  1245→    this.svg.style.transformOrigin = "";
+  1246→    this.svg.style.transformBox = "";
+  1247→    // Release the underpainting blob URLs (also covers re-measure/re-mount).
+  1248→    for (const url of this.blobUrls) URL.revokeObjectURL(url);
+  1249→    this.blobUrls = [];
+  1250→    this.pointers.clear();
+  1251→  }
+  1252→}
+  1253→

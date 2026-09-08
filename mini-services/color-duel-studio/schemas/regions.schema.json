@@ -58,9 +58,76 @@
     },
     "detailPaths": {
       "type": "array"
+    },
+    "edges": {
+      "type": "array",
+      "description": "Boundary contract (stage 2, optional; absent/empty = legacy stroke rendering). artwork = true master boundary, subdivision = artificial gameplay boundary.",
+      "items": {
+        "$ref": "#/$defs/edge"
+      }
+    },
+    "boundaryStyle": {
+        "$ref": "#/$defs/boundaryStyle"
     }
   },
   "$defs": {
+    "edge": {
+      "type": "object",
+      "required": ["id", "d", "kind"],
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^[a-zA-Z0-9_-]+$"
+        },
+        "d": {
+          "type": "string",
+          "pattern": "^M[\\s\\d.,eE+\\-MLQCZ]+$",
+          "description": "Open or closed M/L/C/Q/Z path data (master units)."
+        },
+        "kind": {
+          "enum": ["artwork", "subdivision"]
+        },
+        "leftRegion": {
+          "type": ["string", "null"],
+          "description": "Region bordering one side of the segment (null at canvas edge or where no region borders it)."
+        },
+        "rightRegion": {
+          "type": ["string", "null"],
+          "description": "Region bordering the other side (null at canvas edge or where no region borders it)."
+        }
+      }
+    },
+    "boundaryStyle": {
+      "type": "object",
+      "description": "Per-kind stroke overrides for the edges overlay; missing kinds use the documented defaults.",
+      "properties": {
+        "artwork": {
+          "$ref": "#/$defs/boundaryStroke"
+        },
+        "subdivision": {
+          "$ref": "#/$defs/boundaryStroke"
+        }
+      }
+    },
+    "boundaryStroke": {
+      "type": "object",
+      "required": ["stroke", "strokeWidth"],
+      "properties": {
+        "stroke": {
+          "type": "string",
+          "pattern": "^#[0-9A-Fa-f]{6}$"
+        },
+        "strokeWidth": {
+          "type": "number",
+          "exclusiveMinimum": 0
+        },
+        "dash": {
+          "type": "string",
+          "maxLength": 40,
+          "description": "SVG stroke-dasharray value (user space), e.g. '3 2.2'."
+        }
+      }
+    },
     "region": {
       "type": "object",
       "required": [

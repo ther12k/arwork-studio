@@ -4,6 +4,7 @@
  * A private, server-to-server OpenAI-compatible shim backed by z-ai-web-dev-sdk.
  * The Python studio's Provider (studio/ai.py) points AI_BASE_URL at this service:
  *   POST /v1/responses            -> art-direction chat (brief refinement, JSON {reply, brief})
+ *   POST /v1/json                  -> generic strict-JSON extraction (scene planner)
  *   POST /v1/svg                   -> separate SVG-generation route (model authors the master)
  *   POST /v1/images/generations   -> master image generation from the brief
  *   POST /v1/images/edits         -> owned-image / current-master editing (multipart)
@@ -285,6 +286,97 @@ function extractSvg(text: string): string | null {
   return doc.length > 100 ? doc : null;
 }
 
+/** Pull the first balanced JSON object out of a model answer (fences tolerated). */
+function extractAnyJson(text: string): AnyObj | null {
+  let t = (text || '').trim();
+  const fence = t.match(/```(?:json)?\s*([\s\S]*?)```/i);
+  if (fence) t = fence[1].trim();
+  const start = t.indexOf('{');
+  if (start === -1) return null;
+  let depth = 0;
+  let inStr = false;
+  let esc = false;
+  for (let i = start; i < t.length; i++) {
+    const c = t[i];
+    if (inStr) {
+      if (esc) esc = false;
+      else if (c === '\\') esc = true;
+      else if (c === '"') inStr = false;
+      continue;
+    }
+    if (c === '"') inStr = true;
+    else if (c === '{') depth++;
+    else if (c === '}') {
+      depth--;
+      if (depth === 0) {
+        try {
+          const obj = JSON.parse(t.slice(start, i + 1));
+          return obj && typeof obj === 'object' && !Array.isArray(obj) ? (obj as AnyObj) : null;
+        } catch {
+          return null;
+        }
+      }
+    }
+  }
+  return null;
+}
+
+const GENERIC_JSON_CONTRACT =
+  'Respond with ONLY one valid JSON object - no markdown, no code fences, ' +
+  'no commentary outside the JSON.';
+
+/** POST /v1/json — generic strict-JSON extraction (scene planner etc.).
+ * Tolerates code fences and prose around the object; one repair pass asks
+ * the model to re-emit its answer as clean JSON before failing. */
+async function handleJson(req: Request): Promise<Response> {
+  let payload: AnyObj;
+  try {
+    payload = (await req.json()) as AnyObj;
+  } catch {
+    return fail(400, 'invalid_json', 'Request body is not valid JSON.');
+  }
+  const model = typeof payload.model === 'string' ? payload.model : 'glm-4.6';
+  let { messages } = toZaiMessages(payload, GENERIC_JSON_CONTRACT);
+  // Honor a responses-style strict json_schema by describing it in the prompt.
+  const format = (payload.text as AnyObj | undefined)?.format as AnyObj | undefined;
+  const schema = format?.schema;
+  if (schema && messages.length) {
+    const describe =
+      ` The required JSON shape (strict): ${JSON.stringify(schema)}. ` +
+      'Return exactly one JSON object matching that shape.';
+    messages = [{ ...messages[0], content: String(messages[0].content) + describe }, ...messages.slice(1)];
+  }
+  if (!messages.length) return fail(400, 'invalid_request', 'No chat input supplied.');
+  try {
+    const zai = await client();
+    const completion = await zai.chat.completions.create({ messages, thinking: { type: 'disabled' } });
+    const raw = completion.choices[0]?.message?.content ?? '';
+    let obj = extractAnyJson(raw);
+    if (!obj) {
+      // One normalization pass: ask the model to re-emit its answer as clean JSON.
+      const repair = await zai.chat.completions.create({
+        messages: [
+          {
+            role: 'assistant',
+            content:
+              'You convert drafts into strict JSON. Return only the JSON object, ' +
+              'preserving the substance of the draft; never invent new content.',
+          },
+          { role: 'user', content: raw.slice(0, 12000) },
+        ],
+        thinking: { type: 'disabled' },
+      });
+      obj = extractAnyJson(repair.choices[0]?.message?.content ?? '');
+    }
+    if (!obj) {
+      return fail(502, 'unparsable_json', 'The model did not return a usable JSON object.');
+    }
+    return json(responsesApiWrap(JSON.stringify(obj), model));
+  } catch (err) {
+    return fail(502, 'provider_error', err instanceof Error ? err.message : String(err));
+  }
+}
+
 const SVG_CONTRACT =
   'Respond with ONLY the raw SVG document: a single <svg>…</svg> element, no markdown, ' +
   'no fences, no commentary outside the SVG.';
@@ -344,6 +436,7 @@ const server = Bun.serve({
         return json({ ok: true, service: 'color-duel-ai-bridge' });
       }
       if (req.method === 'POST' && url.pathname === '/v1/responses') return await handleResponses(req);
+      if (req.method === 'POST' && url.pathname === '/v1/json') return await handleJson(req);
       if (req.method === 'POST' && url.pathname === '/v1/svg') return await handleSvg(req);
       if (req.method === 'POST' && url.pathname === '/v1/images/generations') return await handleGenerations(req);
       if (req.method === 'POST' && url.pathname === '/v1/images/edits') return await handleEdits(req);

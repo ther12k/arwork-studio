@@ -81,6 +81,10 @@ def create_app(workspace: Path|None=None, transport=None):
                     if result.get('chat'):
                         c=result['chat'];p['messages']+=c['messages'];p['brief']=c['brief'];p['aiUsage'].append(c['usage'])
                     if result.get('usage'): p['aiUsage'].append(result['usage'])
+                    if result.get('pendingBuildSettings'):
+                        p['pendingBuildSettings']=result['pendingBuildSettings']
+                    if result.get('consumePending'):
+                        p.pop('pendingBuildSettings',None)
                     p['job'].update(status='done',progress=1,message='Ready',finishedAt=now());save(p)
             except Exception as exc:
                 with lock:
@@ -111,11 +115,11 @@ def create_app(workspace: Path|None=None, transport=None):
     def config():
         ai = provider.config()
         for backend in BACKENDS:
-            if backend['id'] == 'provider-svg-generation':
+            if backend['id'] in ('provider-svg-generation', 'provider-svg-multistage'):
                 backend['available'] = bool(ai['configured'])
             if backend['id'] == 'provider-vectorizer':
                 backend['available'] = bool(os.getenv('VECTORIZER_API_KEY'))
-        return {'ai': ai, 'localOnly': True, 'version': '0.2.0', 'supportedFormat': 'color-duel-detailed-vector-1',
+        return {'ai': ai, 'localOnly': True, 'version': '0.3.0', 'supportedFormat': 'color-duel-detailed-vector-1',
                 'geometrySchema': 2, 'maxUploadMB': 12, 'backends': BACKENDS}
     @app.get('/api/projects')
     def list_projects():
@@ -254,6 +258,23 @@ def create_app(workspace: Path|None=None, transport=None):
             if body.include_reference and p.get('reference'):
                 ref = folder(pid) / p['reference']['file']
         def run(tick):
+            if body.mode == 'multistage':
+                # Multi-stage native-vector generation (contract 7): scene plan
+                # (strict JSON) -> one SVG fragment per object -> composed,
+                # sanitized master. The next build auto-subdivides to target.
+                tick(.08, 'Planning the scene (multi-stage vector generation)')
+                svg_text, meta = provider.svg_multistage(body.prompt, body.aspect, ref,
+                                                         body.target_regions, tick)
+                tick(.9, 'Sanitizing the composed SVG master')
+                name = f'master-{ident()}.svg'
+                im = clean_svg(svg_text.encode('utf-8'), folder(pid) / name)
+                write_json(folder(pid) / (name + '.provenance.json'),
+                           {'prompt': body.prompt, 'request': body.model_dump(exclude={'confirm_paid'}), **meta,
+                            'sanitizerReport': im.get('summary', {}).get('warnings', [])})
+                return {'master': {'file': name, **im, 'source': 'AI multi-stage SVG via ' + meta.get('model', 'chat') + ' (scene plan + per-object fragments; sanitized, curves preserved)',
+                                   'rightsConfirmed': False, 'createdAt': now()},
+                        'usage': {'at': now(), **meta, 'kind': 'svg-multistage'},
+                        'pendingBuildSettings': {'auto_subdivide': True, 'target_regions': int(body.target_regions)}}
             tick(.15, 'Requesting an SVG master from the AI provider')
             svg_text, meta = provider.svg(body.prompt, body.aspect, ref)
             tick(.55, 'Sanitizing the generated SVG master')
@@ -272,20 +293,36 @@ def create_app(workspace: Path|None=None, transport=None):
         if not p['master']:raise HTTPException(400,'Upload your own master, load an example, or generate one first.')
         rev='rev-'+ident();version=f'0.{len(p["revisions"])+1}.0'
         is_svg=p['master'].get('kind')=='svg'
+        # Multistage generation stores pendingBuildSettings; the next build
+        # applies them unless the request explicitly overrides the fields.
+        pending=p.get('pendingBuildSettings') or {}
+        explicit=body.model_fields_set
+        effective=body
+        if is_svg and pending:
+            changed={}
+            if pending.get('auto_subdivide') is not None and 'auto_subdivide' not in explicit:
+                changed['auto_subdivide']=bool(pending['auto_subdivide'])
+            if pending.get('target_regions') and 'target_regions' not in explicit:
+                changed['target_regions']=int(pending['target_regions'])
+            if changed:
+                effective=body.model_copy(update=changed)
         def run(tick):
             if is_svg:
                 result=compile_svg_master(folder(pid)/p['master']['file'],folder(pid)/'revisions'/rev,
-                    artwork_id=pid,version=version,title=p['title'],settings=body,
+                    artwork_id=pid,version=version,title=p['title'],settings=effective,
                     provenance={'source':p['master']['source'],'sourceHash':p['master']['sha256'],
                         'rightsConfirmedByUser':p['master'].get('rightsConfirmed',False),'legalClearanceVerified':False},progress=tick)
             else:
                 result=compile_image(folder(pid)/p['master']['file'],folder(pid)/'revisions'/rev,
-                    artwork_id=pid,version=version,title=p['title'],settings=body,
+                    artwork_id=pid,version=version,title=p['title'],settings=effective,
                     provenance={'source':p['master']['source'],'sourceHash':p['master']['sha256'],
                         'rightsConfirmedByUser':p['master'].get('rightsConfirmed',False),'legalClearanceVerified':False},progress=tick)
-            return {'revision':{'id':rev,'version':version,'createdAt':now(),'kind':'build','sourceHash':p['master']['sha256'],
+            reply={'revision':{'id':rev,'version':version,'createdAt':now(),'kind':'build','sourceHash':p['master']['sha256'],
                 'regionCount':result['manifest']['regionCount'],'qa':result['validation'],
                 'manifestUrl':f'/api/projects/{pid}/revisions/{rev}/files/artwork.json'}}
+            if pending and effective is not body:
+                reply['consumePending']=True   # one-shot: applied by this build
+            return reply
         return start(pid,'vector compilation',run)
     @app.post('/api/projects/{pid}/edit')
     def edit(pid:str,body:EditRequest):

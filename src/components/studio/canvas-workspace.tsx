@@ -1,19 +1,52 @@
 "use client";
 
-/** Center panel — artwork workspace: header, brief, canvas, palette, job status. */
+/** Center panel — artwork workspace: header, brief, canvas, palette, job status.
+ *  Stage 2 adds: the inspect-view tool row (Select / Cut / Pen) with a drawing
+ *  overlay for cut lines and pen shapes (AlertDialog / Popover confirmations),
+ *  the play-test coloring-mode switch, the free-color cluster (custom hex +
+ *  recents) and the compact difficulty mini-panel. */
 
-import { Crosshair, Maximize2, RotateCcw, Search, Sparkles, Undo2, ZoomIn, ZoomOut } from "lucide-react";
+import { useRef, useState } from "react";
+import { Gauge, Maximize2, MousePointer2, PenTool, RotateCcw, Scissors, Search, Sparkles, Undo2, ZoomIn, ZoomOut } from "lucide-react";
 import { toast } from "sonner";
 
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from "@/components/ui/alert-dialog";
 import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import { Popover, PopoverAnchor, PopoverContent } from "@/components/ui/popover";
 import { Progress } from "@/components/ui/progress";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Textarea } from "@/components/ui/textarea";
-import { imageUrl, masterSvgUrl } from "@/lib/studio-api";
-import { VIEW_LABELS, type StudioView, useStudioContext } from "./use-studio";
+import type { BoardMode, VectorBoard } from "@/lib/detailed-board";
+import { imageUrl, masterSvgUrl, type DifficultyProfile } from "@/lib/studio-api";
+import { VIEW_LABELS, type StudioTool, type StudioView, useStudioContext } from "./use-studio";
+import { DIFFICULTY_TIERS, normalizeDifficulty } from "./difficulty";
 import ZoomLab from "./zoom-lab";
 
 const VIEW_ORDER: StudioView[] = ["master", "colored", "numbered", "play", "inspect", "zoomlab"];
+
+const TOOL_HINTS: Record<StudioTool, string> = {
+  select: "Tap regions to select",
+  cut: "Drag a line across a region to cut it",
+  pen: "Draw a closed shape to create a region",
+};
+
+const MODE_HINTS: Record<BoardMode, string> = {
+  number: "Match palette numbers — wrong taps count as mistakes.",
+  memory: "Numbers hidden — remember which group each region needs.",
+  free: "Any color, any region — no mistakes, full freedom.",
+};
+
+const FREE_HEX_RE = /^#[0-9A-Fa-f]{6}$/;
 
 function canvasTag(view: StudioView): string {
   if (view === "inspect") return "Select · merge · group · fix labels";
@@ -28,6 +61,152 @@ function swatchTextColor(hex: string): string {
   return rgb[0] * 0.299 + rgb[1] * 0.587 + rgb[2] * 0.114 > 150 ? "#152a2a" : "white";
 }
 
+// ---------------------------------------------------------------- stroke math
+
+type ArtPt = { x: number; y: number };
+
+/** Drop points closer than `minDist` art units to the previous kept point. */
+function dropDensePoints(pts: ArtPt[], minDist: number): ArtPt[] {
+  const out: ArtPt[] = [];
+  for (const p of pts) {
+    const last = out[out.length - 1];
+    if (!last || Math.hypot(p.x - last.x, p.y - last.y) >= minDist) out.push(p);
+  }
+  return out;
+}
+
+function perpendicularDistance(p: ArtPt, a: ArtPt, b: ArtPt): number {
+  const dx = b.x - a.x;
+  const dy = b.y - a.y;
+  const len = Math.hypot(dx, dy);
+  if (len < 1e-9) return Math.hypot(p.x - a.x, p.y - a.y);
+  return Math.abs(dy * p.x - dx * p.y + b.x * a.y - b.y * a.x) / len;
+}
+
+/** Ramer–Douglas–Peucker simplification (art units). */
+function rdp(pts: ArtPt[], epsilon: number): ArtPt[] {
+  if (pts.length < 3) return pts;
+  const a = pts[0];
+  const b = pts[pts.length - 1];
+  let maxDist = 0;
+  let index = 0;
+  for (let i = 1; i < pts.length - 1; i++) {
+    const d = perpendicularDistance(pts[i], a, b);
+    if (d > maxDist) {
+      maxDist = d;
+      index = i;
+    }
+  }
+  if (maxDist > epsilon) {
+    const left = rdp(pts.slice(0, index + 1), epsilon);
+    const right = rdp(pts.slice(index), epsilon);
+    return [...left.slice(0, -1), ...right];
+  }
+  return [a, b];
+}
+
+/** Shoelace area of a closed polygon (art units²). */
+function polygonArea(pts: ArtPt[]): number {
+  let sum = 0;
+  for (let i = 0; i < pts.length; i++) {
+    const a = pts[i];
+    const b = pts[(i + 1) % pts.length];
+    sum += a.x * b.y - b.x * a.y;
+  }
+  return Math.abs(sum) / 2;
+}
+
+/** Point at half the total arc length of the polyline (stroke midpoint). */
+function polylineMidpoint(pts: ArtPt[]): ArtPt | null {
+  if (!pts.length) return null;
+  const segs: number[] = [];
+  let total = 0;
+  for (let i = 1; i < pts.length; i++) {
+    const d = Math.hypot(pts[i].x - pts[i - 1].x, pts[i].y - pts[i - 1].y);
+    segs.push(d);
+    total += d;
+  }
+  if (!segs.length) return pts[0];
+  let half = total / 2;
+  for (let i = 0; i < segs.length; i++) {
+    if (half <= segs[i]) {
+      const t = segs[i] > 0 ? half / segs[i] : 0;
+      return { x: pts[i].x + (pts[i + 1].x - pts[i].x) * t, y: pts[i].y + (pts[i + 1].y - pts[i].y) * t };
+    }
+    half -= segs[i];
+  }
+  return pts[pts.length - 1];
+}
+
+const fmt = (n: number) => (Math.round(n * 100) / 100).toString();
+
+/** Build the edit-action path string: `M x,y L …` (+ ` Z` when closed). */
+function pathFromPoints(pts: ArtPt[], close: boolean): string {
+  return `M ${pts.map((p) => `${fmt(p.x)},${fmt(p.y)}`).join(" L ")}${close ? " Z" : ""}`;
+}
+
+/** Art-space point → canvas-container-relative CSS position (px, clamped
+ *  inside the canvas; "50%" center fallback). Anchors the Pen confirm
+ *  popover at the drawn shape's centroid. */
+function artPointToCanvas(board: VectorBoard, x: number, y: number): { left: number | string; top: number | string } {
+  try {
+    const ctm = board.svg.getScreenCTM();
+    const host = board.svg.parentElement;
+    if (!ctm || !host) return { left: "50%", top: "50%" };
+    const screen = new DOMPoint(x, y).matrixTransform(ctm);
+    const rect = host.getBoundingClientRect();
+    if (!rect.width || !rect.height) return { left: "50%", top: "50%" };
+    const clamp = (v: number, lo: number, hi: number) => Math.max(lo, Math.min(hi, v));
+    return { left: clamp(screen.x - rect.left, 48, rect.width - 48), top: clamp(screen.y - rect.top, 48, rect.height - 48) };
+  } catch {
+    return { left: "50%", top: "50%" };
+  }
+}
+
+/** Compact difficulty summary (contract §5): 4-tier bar + score in one row.
+ *  Legacy "unrated" strings normalize to a muted note; the full metric table
+ *  lives in the right panel (DifficultyPanel). */
+function DifficultyMini({ raw }: { raw: string | DifficultyProfile | undefined }) {
+  const d = normalizeDifficulty(raw);
+  if (!d) {
+    return (
+      <p className="mt-2.5 flex items-center gap-1.5 text-[10px] text-[#778481]" role="status">
+        <Gauge className="size-3.5 shrink-0" aria-hidden />
+        Difficulty · <span className="italic">unrated</span>
+        <span aria-hidden>·</span>
+        rebuild to analyze
+      </p>
+    );
+  }
+  return (
+    <div
+      className="mt-2.5 flex flex-wrap items-center gap-x-2.5 gap-y-1 rounded-lg border border-[#e1e5df] bg-white/70 px-3 py-2"
+      role="status"
+      aria-label={`Difficulty ${d.tier.label}, score ${d.score} of 100`}
+    >
+      <span className="flex items-center gap-1.5 text-[10px] font-semibold text-[#657671]">
+        <Gauge className="size-3.5" aria-hidden />
+        Difficulty
+      </span>
+      <span className="flex h-2 w-24 gap-0.5 overflow-hidden rounded-full sm:w-28" aria-hidden>
+        {DIFFICULTY_TIERS.map((t, i) => {
+          const fill = Math.max(0, Math.min(1, (d.score - i * 25) / 25));
+          return (
+            <span key={t.key} className="relative h-full flex-1 rounded-[2px] bg-[#e1e5df]" title={`${t.label}: ${i * 25}–${t.max}`}>
+              <span className="absolute inset-y-0 left-0 rounded-[2px]" style={{ width: `${fill * 100}%`, background: t.color }} />
+            </span>
+          );
+        })}
+      </span>
+      <span className="text-[10px] font-bold" style={{ color: d.tier.color }}>
+        {d.tier.label} · {d.score}/100
+      </span>
+    </div>
+  );
+}
+
+// ------------------------------------------------------------------ component
+
 export function CanvasWorkspace() {
   const studio = useStudioContext();
   const {
@@ -41,6 +220,17 @@ export function CanvasWorkspace() {
     svgRef,
     canvasRef,
     zoomRef,
+    boardRef,
+    tool,
+    setTool,
+    cutRegion,
+    drawRegion,
+    freeColor,
+    setBoardFreeColor,
+    recentColors,
+    boardMode,
+    setBoardMode,
+    objectGroup,
     briefInput,
     setBriefInput,
     generationSource,
@@ -79,6 +269,141 @@ export function CanvasWorkspace() {
     } catch (e) {
       toast((e as Error).message);
     }
+  };
+
+  // ------------------------------------------------ drawing overlay (Cut / Pen)
+
+  const strokeRef = useRef<ArtPt[]>([]);
+  const [strokePts, setStrokePts] = useState<ArtPt[]>([]);
+  const [strokeViewBox, setStrokeViewBox] = useState<string | null>(null);
+  const [pendingCut, setPendingCut] = useState<{ regionId: string; d: string } | null>(null);
+  const [pendingDraw, setPendingDraw] = useState<{
+    d: string;
+    area: number;
+    /** Popover anchor (CSS left/top within the canvas container). */
+    anchor: { left: number | string; top: number | string };
+  } | null>(null);
+  const [penPalette, setPenPalette] = useState("1");
+  const [penGroup, setPenGroup] = useState("");
+
+  const toolActive = view === "inspect" && hasBundle && tool !== "select" && !busy;
+
+  const strokeWidthArt = (() => {
+    const vb = strokeViewBox?.split(/\s+/).map(Number);
+    const w = vb && vb.length === 4 && Number.isFinite(vb[2]) ? vb[2] : 576;
+    return Math.max(1.2, w / 240);
+  })();
+
+  const beginStroke = (e: React.PointerEvent<SVGSVGElement>) => {
+    const board = boardRef.current;
+    if (!board) return;
+    const p = board.clientToArt(e.clientX, e.clientY);
+    if (!p) return;
+    // Freeze the overlay to the board's CURRENT viewBox: the overlay eats the
+    // pointer events, so the board view cannot change mid-stroke.
+    setStrokeViewBox(board.svg.getAttribute("viewBox") ?? null);
+    strokeRef.current = [{ x: p.x, y: p.y }];
+    setStrokePts([{ x: p.x, y: p.y }]);
+    setPendingCut(null);
+    setPendingDraw(null);
+    try {
+      e.currentTarget.setPointerCapture(e.pointerId);
+    } catch {
+      /* synthetic events / stale ids — continue without capture */
+    }
+  };
+
+  const extendStroke = (e: React.PointerEvent<SVGSVGElement>) => {
+    if (!strokeRef.current.length) return;
+    const board = boardRef.current;
+    if (!board) return;
+    const p = board.clientToArt(e.clientX, e.clientY);
+    if (!p) return;
+    const last = strokeRef.current[strokeRef.current.length - 1];
+    if (Math.hypot(p.x - last.x, p.y - last.y) < 1.5) return;
+    strokeRef.current.push({ x: p.x, y: p.y });
+    setStrokePts([...strokeRef.current]);
+  };
+
+  const endStroke = (e: React.PointerEvent<SVGSVGElement>) => {
+    const raw = strokeRef.current;
+    strokeRef.current = [];
+    setStrokePts([]);
+    if (e.currentTarget.hasPointerCapture?.(e.pointerId)) {
+      try {
+        e.currentTarget.releasePointerCapture(e.pointerId);
+      } catch {
+        /* pointer already released */
+      }
+    }
+    const board = boardRef.current;
+    if (!board || !raw.length || tool !== "cut" && tool !== "pen") return;
+    const pts = rdp(dropDensePoints(raw, 2), 1.2);
+    if (tool === "cut") {
+      if (pts.length < 2) {
+        toast("Draw a longer cut line.");
+        return;
+      }
+      const mid = polylineMidpoint(pts);
+      const regionId = mid ? board.hitRegion(mid.x, mid.y) : null;
+      if (!regionId) {
+        toast("Start and end the cut line inside the same region.");
+        return;
+      }
+      setPendingCut({ regionId, d: pathFromPoints(pts, false) });
+    } else {
+      if (pts.length < 3) {
+        toast("Draw a closed shape with at least 3 points.");
+        return;
+      }
+      const area = polygonArea(pts);
+      if (area < 120) {
+        toast("Draw a larger shape — the region needs ~120 px² or more.");
+        return;
+      }
+      setPenPalette(String(boardState?.selectedPaletteId ?? paletteEntries[0]?.id ?? 1));
+      setPenGroup(objectGroup || "");
+      const cx = pts.reduce((s, p) => s + p.x, 0) / pts.length;
+      const cy = pts.reduce((s, p) => s + p.y, 0) / pts.length;
+      setPendingDraw({ d: pathFromPoints(pts, true), area, anchor: artPointToCanvas(board, cx, cy) });
+    }
+  };
+
+  const confirmCut = () => {
+    const cut = pendingCut;
+    if (!cut) return;
+    setPendingCut(null);
+    void cutRegion(cut.regionId, cut.d).catch((e: Error) => toast(e.message));
+  };
+
+  const confirmDraw = () => {
+    const draw = pendingDraw;
+    if (!draw) return;
+    const paletteId = Number(penPalette) || 1;
+    setPendingDraw(null);
+    void drawRegion(draw.d, paletteId, penGroup.trim() || undefined).catch((e: Error) => toast(e.message));
+  };
+
+  // ----------------------------------------------------- free color (play view)
+
+  const [freeHex, setFreeHex] = useState(freeColor);
+  // Keep the hex field in sync with context-level changes (recent swatch or
+  // palette quick-access) — the React "adjust state when a prop changes"
+  // pattern, no effect needed.
+  const [syncedFreeColor, setSyncedFreeColor] = useState(freeColor);
+  if (freeColor !== syncedFreeColor) {
+    setSyncedFreeColor(freeColor);
+    setFreeHex(freeColor);
+  }
+  const freeHexValid = FREE_HEX_RE.test(freeHex);
+
+  const applyFreeColor = (hex: string) => {
+    if (!FREE_HEX_RE.test(hex)) {
+      toast("Enter a 6-digit hex color like #66AA33.");
+      return;
+    }
+    setFreeHex(hex.toUpperCase());
+    setBoardFreeColor(hex);
   };
 
   return (
@@ -279,6 +604,128 @@ export function CanvasWorkspace() {
           }`}
           aria-label="Interactive vector artwork"
         />
+        {/* Cut / Pen drawing overlay — same box as the board svg (inset-3.5
+            matches the canvas p-3.5), pointer events active only while a tool
+            is selected. The board keeps rendering below. NOTE: the svg itself
+            is a REPLACED element — absolute insets alone do not stretch it
+            (it would fall back to the intrinsic 300×150), so it fills a
+            stretched wrapper div that mirrors the board svg's exact box
+            (identical viewBox + identical rendered box ⇒ identical
+            letterboxing ⇒ art-unit strokes land pixel-exact). */}
+        {toolActive && (
+          <div className="absolute inset-3.5 z-[3]">
+            <svg
+              xmlns="http://www.w3.org/2000/svg"
+              viewBox={strokeViewBox ?? undefined}
+              className="h-full w-full touch-none select-none"
+              style={{ pointerEvents: "auto", cursor: "crosshair" }}
+              role="img"
+              aria-label={`Drawing layer — ${tool === "cut" ? "cut line" : "pen shape"} in progress`}
+              onPointerDown={beginStroke}
+              onPointerMove={extendStroke}
+              onPointerUp={endStroke}
+              onPointerCancel={endStroke}
+            >
+              {strokePts.length > 1 && (
+                <polyline
+                  points={strokePts.map((p) => `${p.x},${p.y}`).join(" ")}
+                  fill="none"
+                  stroke={tool === "cut" ? "#ba463f" : "#087f74"}
+                  strokeWidth={strokeWidthArt}
+                  strokeDasharray={tool === "cut" ? "8 5" : undefined}
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                />
+              )}
+            </svg>
+          </div>
+        )}
+        {/* Pen confirm popover (contract §3): anchored at the drawn shape's
+            centroid inside the canvas; click-away / Escape cancels the shape.
+            The anchor is inert — PopoverContent portals above the overlay. */}
+        <Popover
+          open={toolActive && !!pendingDraw}
+          onOpenChange={(open) => {
+            if (!open) setPendingDraw(null);
+          }}
+        >
+          <PopoverAnchor
+            className="pointer-events-none absolute size-0"
+            style={
+              pendingDraw
+                ? { left: pendingDraw.anchor.left, top: pendingDraw.anchor.top }
+                : { left: "50%", top: "50%" }
+            }
+            aria-hidden
+          />
+          <PopoverContent
+            className="w-80 rounded-xl border-[#cfe6db] bg-[#edf6f2] p-3.5"
+            align="center"
+            sideOffset={10}
+            aria-label="Confirm new pen-drawn region"
+          >
+            <p className="text-[11px] font-semibold text-[#183837]">Create a region from the drawn shape?</p>
+            <p className="mt-0.5 text-[10px] leading-relaxed text-[#657671]">
+              Closes a {pendingDraw ? Math.round(pendingDraw.area).toLocaleString("en-US") : "…"} px² surface. It
+              becomes a white tap target (gameplay-only — the artist paints it later).
+            </p>
+            <div className="mt-2.5 grid grid-cols-2 gap-2">
+              <div>
+                <label htmlFor="studio-pen-palette" className="text-[10px] leading-snug text-[#657671]">
+                  Number group
+                </label>
+                <Select value={penPalette} onValueChange={setPenPalette} disabled={busy}>
+                  <SelectTrigger
+                    id="studio-pen-palette"
+                    className="mt-1 h-9 w-full rounded-md border-[#e1e5df] bg-white text-xs"
+                    aria-label="Palette group for the new region"
+                  >
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {paletteEntries.map((p) => (
+                      <SelectItem key={p.id} value={String(p.id)}>
+                        {p.id} · {p.name}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              </div>
+              <div>
+                <label htmlFor="studio-pen-group" className="text-[10px] leading-snug text-[#657671]">
+                  Object group (optional)
+                </label>
+                <Input
+                  id="studio-pen-group"
+                  value={penGroup}
+                  placeholder="roof"
+                  pattern="[a-z0-9]+(-[a-z0-9]+)*"
+                  onChange={(e) => setPenGroup(e.target.value)}
+                  className="mt-1 h-9 rounded-md bg-white text-xs"
+                />
+              </div>
+            </div>
+            <div className="mt-2.5 flex flex-wrap justify-end gap-2">
+              <Button
+                variant="outline"
+                size="sm"
+                className="h-9 rounded-md border-[#e1e5df] bg-white text-[10px]"
+                onClick={() => setPendingDraw(null)}
+              >
+                Cancel
+              </Button>
+              <Button
+                size="sm"
+                className="h-9 rounded-md bg-[#087f74] text-[10px] font-semibold text-white hover:bg-[#056c62]"
+                disabled={busy || !paletteEntries.length}
+                onClick={confirmDraw}
+              >
+                <PenTool className="size-3.5" aria-hidden />
+                {busy ? "Creating…" : "Create region"}
+              </Button>
+            </div>
+          </PopoverContent>
+        </Popover>
         {hasBundle && view !== "master" && (
           <div className="pointer-events-none absolute bottom-5 left-5 z-[2] rounded-md bg-white/90 px-2.5 py-1.5 text-[9px] text-[#607767]">
             {canvasTag(view)}
@@ -286,9 +733,121 @@ export function CanvasWorkspace() {
         )}
       </div>
 
+      {/* Compact difficulty mini-panel (contract §5) — full metrics live in
+          the right panel (DifficultyPanel). */}
+      {hasBundle && view !== "master" && view !== "zoomlab" && (
+        <DifficultyMini raw={bundle?.manifest.difficulty} />
+      )}
+
+      {/* Tools row (inspect view only) */}
+      {view === "inspect" && hasBundle && (
+        <div className="mt-2.5 flex flex-wrap items-center gap-2.5">
+          <div
+            className="flex flex-wrap gap-0.5 rounded-[9px] bg-[#e8ece5] p-1"
+            role="group"
+            aria-label="Region editing tool"
+          >
+            {(
+              [
+                { key: "select", label: "Select", icon: MousePointer2 },
+                { key: "cut", label: "Cut", icon: Scissors },
+                { key: "pen", label: "Pen", icon: PenTool },
+              ] as Array<{ key: StudioTool; label: string; icon: typeof MousePointer2 }>
+            ).map((t) => (
+              <button
+                key={t.key}
+                type="button"
+                aria-pressed={tool === t.key}
+                disabled={busy}
+                onClick={() => {
+                  // Switching tools discards any pending cut/pen confirm.
+                  setPendingCut(null);
+                  setPendingDraw(null);
+                  setTool(t.key);
+                }}
+                className={`flex min-h-11 items-center gap-1.5 rounded-md px-3 text-[10px] font-medium transition-colors disabled:opacity-50 ${
+                  tool === t.key
+                    ? "bg-white text-[#087f74] shadow-[0_1px_4px_rgba(18,47,34,0.13)]"
+                    : "text-[#657671] hover:text-[#183837]"
+                }`}
+              >
+                <t.icon className="size-3.5" aria-hidden />
+                {t.label}
+              </button>
+            ))}
+          </div>
+          <span className="text-[10px] text-[#778481]" role="status">
+            {busy ? "Waiting for the current job…" : TOOL_HINTS[tool]}
+          </span>
+        </div>
+      )}
+
+      {/* Cut confirmation (contract §2) — modal: the board behind stays
+          visible, Cancel / Escape / overlay-click all cancel the stroke. */}
+      <AlertDialog
+        open={toolActive && !!pendingCut}
+        onOpenChange={(open) => {
+          if (!open) setPendingCut(null);
+        }}
+      >
+        <AlertDialogContent className="rounded-xl border-[#cfe6db] sm:max-w-md">
+          <AlertDialogHeader>
+            <AlertDialogTitle className="text-left text-sm text-[#183837]">
+              Cut region {pendingCut?.regionId} along the drawn line?
+            </AlertDialogTitle>
+            <AlertDialogDescription className="text-left text-[11px] leading-relaxed text-[#657671]">
+              Creates a new revision; both pieces stay playable tap targets and the new boundary is drawn as a
+              dashed subdivision edge.
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter className="gap-2 sm:justify-end">
+            <AlertDialogCancel className="h-9 rounded-md border-[#e1e5df] bg-white text-[10px]">
+              Cancel
+            </AlertDialogCancel>
+            <AlertDialogAction
+              className="h-9 rounded-md bg-[#087f74] text-[10px] font-semibold text-white hover:bg-[#056c62]"
+              disabled={busy}
+              onClick={confirmCut}
+            >
+              <Scissors className="size-3.5" aria-hidden />
+              {busy ? "Cutting…" : "Cut region"}
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+
       {/* Palette bar */}
       {hasBundle && view !== "master" && view !== "colored" && view !== "zoomlab" && (
         <div className="mt-2.5">
+          {/* Coloring mode switch (play test) */}
+          {view === "play" && (
+            <div className="mb-1.5 flex flex-wrap items-center justify-between gap-1.5">
+              <div
+                className="flex flex-wrap gap-0.5 rounded-[9px] bg-[#e8ece5] p-0.5"
+                role="group"
+                aria-label="Coloring mode"
+              >
+                {(["number", "memory", "free"] as BoardMode[]).map((m) => (
+                  <button
+                    key={m}
+                    type="button"
+                    aria-pressed={boardMode === m}
+                    onClick={() => setBoardMode(m)}
+                    className={`rounded-md px-2.5 py-1.5 text-[10px] font-medium capitalize transition-colors ${
+                      boardMode === m
+                        ? "bg-white text-[#087f74] shadow-[0_1px_4px_rgba(18,47,34,0.13)]"
+                        : "text-[#657671] hover:text-[#183837]"
+                    }`}
+                  >
+                    {m === "number" ? "Numbered" : m === "memory" ? "Memory" : "Free"}
+                  </button>
+                ))}
+              </div>
+              <span className="text-[9px] text-[#778481]" role="status">
+                {MODE_HINTS[boardMode]}
+              </span>
+            </div>
+          )}
           <div className="mb-1 flex flex-wrap items-center justify-between gap-1.5 text-[10px] text-[#778481]">
             <span id="studio-progress-text">
               {boardState
@@ -336,8 +895,8 @@ export function CanvasWorkspace() {
                 key={p.id}
                 type="button"
                 onClick={() => setSwatch(p.id)}
-                title={`${p.name} · group ${p.id}`}
-                aria-label={`${p.name}, group ${p.id}`}
+                title={`${p.name} · group ${p.id}${boardMode === "free" ? " · quick color" : ""}`}
+                aria-label={`${p.name}, group ${p.id}${boardMode === "free" ? ", use as free color" : ""}`}
                 aria-pressed={selectedPaletteId === p.id}
                 className={`flex size-9 shrink-0 items-center justify-center rounded-full border-2 border-white text-[11px] font-semibold shadow-[0_0_0_1px_rgba(189,199,189,0.5)] transition-transform ${
                   selectedPaletteId === p.id ? "scale-105 shadow-[0_0_0_3px_#087f74]" : "hover:scale-105"
@@ -348,6 +907,83 @@ export function CanvasWorkspace() {
               </button>
             ))}
           </div>
+
+          {/* Free color cluster — true custom colors (contract §4). Palette
+              swatches in free mode double as quick access (they load their hex
+              as the active color inside VectorBoard.setPalette). */}
+          {view === "play" && boardMode === "free" && (
+            <div className="mt-1.5 rounded-lg border border-[#dce4dd] bg-white/70 p-2.5">
+              <div className="flex flex-wrap items-center gap-2">
+                <span className="text-[10px] font-semibold text-[#657671]">Custom color</span>
+                <input
+                  type="color"
+                  value={freeHexValid ? freeHex : "#66AA33"}
+                  onChange={(e) => applyFreeColor(e.target.value.toUpperCase())}
+                  className="h-8 w-10 shrink-0 cursor-pointer rounded-md border border-[#e1e5df] bg-white p-0.5"
+                  aria-label="Pick a custom free color"
+                />
+                <Input
+                  value={freeHex}
+                  onChange={(e) => setFreeHex(e.target.value.trim().toUpperCase())}
+                  onBlur={() => {
+                    const t = freeHex.trim().toUpperCase();
+                    setFreeHex(/^[0-9A-F]{6}$/.test(t) ? `#${t}` : t);
+                  }}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter") applyFreeColor(freeHex);
+                  }}
+                  placeholder="#RRGGBB"
+                  spellCheck={false}
+                  autoComplete="off"
+                  className="h-8 w-24 rounded-md bg-white font-mono text-xs"
+                  aria-label="Custom color hex value"
+                  aria-invalid={!freeHexValid}
+                />
+                <Button
+                  variant="outline"
+                  size="sm"
+                  className="h-8 rounded-md border-[#e1e5df] bg-white text-[10px] hover:bg-[#f0f7f3]"
+                  disabled={!freeHexValid}
+                  onClick={() => applyFreeColor(freeHex)}
+                >
+                  Apply
+                </Button>
+                {boardState?.customColor && (
+                  <span className="ml-auto flex items-center gap-1.5 text-[9px] text-[#657671]">
+                    Active
+                    <span
+                      className="inline-block size-3.5 rounded-full border border-[#c3ced4]"
+                      style={{ background: boardState.customColor }}
+                      aria-hidden
+                    />
+                    <span className="font-mono">{boardState.customColor}</span>
+                  </span>
+                )}
+              </div>
+              {recentColors.length > 0 && (
+                <div className="mt-1.5 flex flex-wrap items-center gap-1.5">
+                  <span className="text-[9px] text-[#778481]">Recent</span>
+                  {recentColors.map((c) => (
+                    <button
+                      key={c}
+                      type="button"
+                      onClick={() => applyFreeColor(c)}
+                      title={`Reuse ${c}`}
+                      aria-label={`Reuse recent color ${c}`}
+                      className={`size-6 shrink-0 rounded-full border shadow-[0_0_0_1px_rgba(189,199,189,0.5)] transition-transform hover:scale-110 ${
+                        freeColor === c ? "border-[#087f74] shadow-[0_0_0_2px_#087f74]" : "border-white"
+                      }`}
+                      style={{ background: c }}
+                    />
+                  ))}
+                </div>
+              )}
+              <p className="mt-1.5 text-[9px] leading-relaxed text-[#778481]">
+                In free mode every region accepts this color — no palette checks, no mistakes. Palette swatches
+                above stay clickable as quick access.
+              </p>
+            </div>
+          )}
         </div>
       )}
 

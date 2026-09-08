@@ -7,7 +7,7 @@
 
 `paletteId` answers "which palette button accepts this region?" `id` answers "which exact region has been filled?" Regions sharing a palette group do not fill simultaneously. Swatches represent a paint family; a revealed region may contain several shading colors.
 
-All files use the same `[0, 0, width, height]` viewBox. `rings[0]` is the exterior boundary; subsequent rings are holes. Both rendering and hit testing MUST use `evenodd`. Paths contain only absolute M/L/Z commands in artwork coordinates. Region rings and path strings are emitted from the same coordinates.
+All files use the same `[0, 0, width, height]` viewBox. `rings[0]` is the exterior boundary; subsequent rings are holes. Regions use curved M/L/C/Q/Z masters (schema 2); flattened rings are derived approximations. Both rendering and hit testing honor the per-region `fillRule` (`evenodd` default, source rule preserved).
 
 ## Layer order
 
@@ -23,6 +23,14 @@ On completion: remove that region's mask and number, revealing the aligned under
 The compiler uses SLIC draft segmentation, adjacency-only tiny-fragment merging, polygonization of a label grid, and exact shared pixel-edge coordinates. No independent per-region simplification is applied because that would create gaps/overlaps between neighbors.
 
 The validator checks polygon validity, positive areas, viewBox bounds, unique IDs, palette membership, paths/rings equivalence, label anchors, complete canvas union, zero overlap and a raster coverage roundtrip. It reports areas that cannot fit conservative labels as precolored decorations excluded from progress. A geometric pass does not prove good artistic boundaries, legal clearance or balanced gameplay.
+
+## Edges and boundary style (schema 2, optional)
+
+`regions.json` may carry `geometry.edges`: boundary entries `{id, d, kind, leftRegion, rightRegion}` where `kind` is `"artwork"` (a true master boundary) or `"subdivision"` (an artificial gameplay boundary created by cuts, pen subtraction or auto-subdivide). `leftRegion`/`rightRegion` name the bordering regions or are null. When `edges` is a non-empty array, region paths render fill-only and boundaries are drawn by an edges overlay above masks/ink, below labels: artwork = solid `geometry.stroke` width 1.6; subdivision = `#7A8C94` width 0.85 dashed `3 2.2` (userSpace). `geometry.boundaryStyle` (`{artwork: {stroke, strokeWidth, dash?}, subdivision: {...}}`) overrides the defaults per kind. Absent/empty `edges` keeps the legacy region-stroke rendering. Raster compiles emit no edges in v1; the runtime export keeps both fields.
+
+## Difficulty profile
+
+`artwork.json` carries `manifest.difficulty = {rating, score, metrics}` computed deterministically for every revision: `rating` is easy (<25) / medium (<50) / hard (<75) / master; `score` is a 0–100 weighted sum over `regionCount, medianRegionArea, tinyRegionPct, requiredZoom` (worst-case zoom for a 44px touch target from a fit viewport), `labelClearance` (ok/tight/conflict), `paletteAmbiguity` (low/medium/high), `paletteGroups, avgNeighbors, subdivisionEdges, objectDensity`. It replaces the old `"unrated"` placeholder; `difficultyValidatedByPlaytest` stays false until a real playtest.
 
 ## Versioning and state
 

@@ -216,3 +216,80 @@ def test_recolor_changes_appearance_and_palette_changes_group(svg_bundle, tmp_pa
     original_fills = {p['fill'] for p in bundle['paint']['paths']}
     after_fills = {p['fill'] for p in regrouped['paint']['paths']}
     assert original_fills == after_fills, 'palette action must NOT change the visible artwork'
+
+
+# ---------------------------------------------------------------------------
+# Stage-2 contract: shipped adapter accepts edges bundles + free-color API
+# ---------------------------------------------------------------------------
+
+BOARD_CHECK = ROOT / 'tests' / 'adapter-board-check.mjs'
+
+
+def _write_bundle(folder: Path, edges=None, boundary_style=None):
+    geometry = {
+        'geometrySchema': 2, 'artworkId': 'edge-test', 'artworkVersion': '0.1.0',
+        'viewBox': [0, 0, 100, 100], 'fillRule': 'evenodd', 'stroke': '#29383E', 'strokeWidth': 0.65,
+        'regions': [{'id': 'r-00001', 'paletteId': 1, 'objectId': 'unassigned',
+                     'd': 'M 10,10 L 50,10 L 50,50 L 10,50 Z', 'fillRule': 'evenodd',
+                     'bbox': [10, 10, 50, 50], 'area': 1600,
+                     'label': {'x': 30, 'y': 30, 'fontSize': 10, 'minScreenPx': 9, 'clearance': 15}}],
+        'decorations': [], 'detailPaths': [],
+    }
+    if edges is not None:
+        geometry['edges'] = edges
+    if boundary_style is not None:
+        geometry['boundaryStyle'] = boundary_style
+    folder.mkdir(parents=True, exist_ok=True)
+    (folder / 'artwork.json').write_text(json.dumps({
+        'schemaVersion': 1, 'format': 'color-duel-detailed-vector-1', 'id': 'edge-test',
+        'version': '0.1.0', 'title': 'Edge contract', 'regionCount': 1, 'contentHash': 'h1',
+        'objectGroups': [], 'qa': {'status': 'draft'},
+        'assets': {'regions': 'regions.json', 'palette': 'palette.json', 'paint': 'paint.json'}}))
+    (folder / 'regions.json').write_text(json.dumps(geometry))
+    (folder / 'palette.json').write_text(json.dumps([
+        {'id': 1, 'number': 1, 'name': 'Tone 01', 'hex': '#3366AA',
+         'paint': {'type': 'linearGradient', 'stops': [{'offset': 0, 'color': '#3366AA'}, {'offset': 1, 'color': '#3366AA'}]}}]))
+    (folder / 'paint.json').write_text(json.dumps(
+        {'artworkId': 'edge-test', 'viewBox': [0, 0, 100, 100], 'paths': [], 'inkPaths': [], 'gradients': []}))
+    return folder
+
+
+def test_shipped_adapter_accepts_edges_bundle(tmp_path):
+    edges = [
+        {'id': 'e-0001', 'd': 'M 10,10 L 50,10 L 50,50 L 10,50 Z', 'kind': 'artwork',
+         'leftRegion': 'r-00001', 'rightRegion': None},
+        {'id': 'e-0002', 'd': 'M 30,10 L 30,50', 'kind': 'subdivision',
+         'leftRegion': 'r-00001', 'rightRegion': None},
+    ]
+    style = {'artwork': {'stroke': '#22333B', 'strokeWidth': 1.6},
+             'subdivision': {'stroke': '#7A8C94', 'strokeWidth': 0.85, 'dash': '3 2.2'}}
+    folder = _write_bundle(tmp_path / 'edges', edges, style)
+    proc = _run_adapter(folder)
+    assert proc.returncode == 0, f'shipped adapter rejected an edges bundle:\n{proc.stdout}\n{proc.stderr}'
+
+
+def test_shipped_adapter_rejects_invalid_edges(tmp_path):
+    edges = [{'id': 'e-0001', 'd': 'M 10,10 L 50,10', 'kind': 'scribble',
+              'leftRegion': 'r-00001', 'rightRegion': None}]
+    folder = _write_bundle(tmp_path / 'bad-edges', edges)
+    proc = _run_adapter(folder)
+    assert proc.returncode != 0, 'shipped adapter accepted an invalid edge kind'
+
+
+def test_shipped_adapter_rejects_edge_unknown_region_ref(tmp_path):
+    edges = [{'id': 'e-0001', 'd': 'M 10,10 L 50,10', 'kind': 'artwork',
+              'leftRegion': 'r-404', 'rightRegion': None}]
+    folder = _write_bundle(tmp_path / 'bad-ref', edges)
+    proc = _run_adapter(folder)
+    assert proc.returncode != 0, 'shipped adapter accepted an unknown edge region reference'
+
+
+def test_adapter_free_color_and_board_api():
+    """Headless board API check: setFreeColor/freeColors hex semantics,
+    no mistake counting in free mode, edges overlay rendering."""
+    if shutil.which('bun') is None:
+        pytest.skip('bun runtime unavailable')
+    proc = subprocess.run(['bun', str(BOARD_CHECK)], capture_output=True, text=True,
+                          cwd=str(ROOT), timeout=120)
+    assert proc.returncode == 0, f'adapter free-color/edges board check failed:\n{proc.stdout}\n{proc.stderr}'
+    assert '0 failures' in proc.stdout

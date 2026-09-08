@@ -6,6 +6,15 @@ A runnable **single-user local artwork authoring tool**, not another mockup or a
 
 The compiler, editor, validation and export work **without any API key**. AI chat, image generation and image edits require your own server-side OpenAI key and incur provider charges. These calls never happen automatically during a build.
 
+## Stage-2 feature set (0.3.0)
+
+- **Cut & pen region tools**: cut one region along a drawn line (`r-c-*` pieces, subdivision edges classified by proximity) and draw new pen regions on empty canvas (`r-p-*`, masks never overlap; gameplay-only surfaces, the artist paints them later).
+- **Edges + boundary style**: `geometry.edges` distinguishes true artwork boundaries (solid) from artificial subdivision boundaries (light dashed); optional `boundaryStyle` overrides. Legacy bundles render unchanged.
+- **Deterministic auto-subdivide**: `auto_subdivide: true` splits oversized regions with seeded organic cuts until `target_regions` — true-vector, no rasterization (SVG-master and multi-stage builds).
+- **Difficulty analyzer**: every revision's manifest carries a deterministic `difficulty` profile (rating/score/metrics: region count, required zoom, tiny regions, label clearance, palette ambiguity, adjacency, subdivision edges).
+- **AI multi-stage SVG generation** (paid, explicit confirm): strict-JSON scene plan → per-object vector fragments → one composed sanitized master; the next build auto-applies the target region count.
+- **Free color**: any `#RRGGBB` in free mode (flat fills, no mistakes); rAF-batched board gestures.
+
 ## Start locally
 
 Use Python 3.12 or 3.13. On Linux, install Cairo if it is not already present (`sudo apt-get install libcairo2`). On macOS, `brew install cairo` provides the native renderer. Docker is the simpler option for Windows or native-library issues.
@@ -97,7 +106,7 @@ python scripts/compile_artwork.py examples/treehouse-source.png output/my-art --
 
 ## Important limits
 
-This is a working local **MVP**, not a hosted production service. Automatic segmentation is image-aware, not semantic: it may split a flower or combine an unwanted part of a roof. Review, merge, fix labels and assign objects before shipping. Freehand boundary drawing/splitting and semantic segmentation are next-stage work, not implemented features.
+This is a working local **MVP**, not a hosted production service. Automatic segmentation is image-aware, not semantic: it may split a flower or combine an unwanted part of a roof. Review, merge, fix labels and assign objects before shipping. Semantic segmentation and node-level boundary editing remain next-stage work; the cut/pen tools, auto-subdivide and edges layers cover the region-topology part of that gap.
 
 The generated paint layer approximates the master through a finite color trace with cleanup. Fine texture is intentionally simplified; high-detail tracing increases file size. Exact pixel-edge boundaries avoid gaps, but may look stair-stepped at extreme zoom. Device performance and ranked-duel balance need separate validation.
 

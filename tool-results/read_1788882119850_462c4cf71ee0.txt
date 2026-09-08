@@ -1,0 +1,501 @@
+     1→/** Dependency-free region renderer. Copyright/provenance: see docs/PROVENANCE.md.
+     2→ * Consume our trusted, validated JSON; do NOT inject arbitrary uploaded SVG markup.
+     3→ * The demo is an offline solo asset tester, not an authoritative multiplayer server.
+     4→ *
+     5→ * SHARED FORMAT CONTRACT (detailed-vector schema 2) — this validator and the
+     6→ * studio's src/lib/detailed-board.ts accept the same field set, and the studio's
+     7→ * export pipeline (pipeline.validate_runtime_contract) mirrors these rules:
+     8→ *  - geometry.geometrySchema 1 (legacy polygons) or 2 (curved masters)
+     9→ *  - regions[*].d uses M/L/C/Q/Z path commands (curves preserved)
+    10→ *  - regions[*].fillRule is 'evenodd' (default) or 'nonzero' (source rule kept)
+    11→ *  - paint.paths[*] fill is #RRGGBB or url(#g-...) referencing paint.gradients
+    12→ *  - paint paths carry optional fillRule/fillOpacity/opacity/stroke/strokeWidth/z
+    13→ *  - paint.inkPaths may be OPEN paths (stroke line art) when strokeWidth/filled=false
+    14→ *  - Regions are VISIBLE SURFACES: masks do not overlap, so any fill order
+    15→ *    colors correctly (fill-order independence).
+    16→ *  - geometry.edges (stage 2, optional): boundary entries {id, d (M/L/C/Q/Z,
+    17→ *    open or closed), kind: 'artwork' | 'subdivision', leftRegion/rightRegion
+    18→ *    (null or an existing region id)} plus optional geometry.boundaryStyle
+    19→ *    overrides. When edges is a non-empty array, region paths render FILL-ONLY
+    20→ *    and an edges overlay group (above masks/ink, below labels) draws the
+    21→ *    boundaries: artwork = solid (geometry.stroke, width 1.6, round caps),
+    22→ *    subdivision = light dashed (#7A8C94, width 0.85, dash '3 2.2' userSpace).
+    23→ *    Absent/empty edges = legacy stroke rendering, unchanged.
+    24→ *  - Free color: session.freeColors maps regionId -> #RRGGBB hex (flat fill,
+    25→ *    no gradient); board.setFreeColor(hex) is the custom brush; palette swatch
+    26→ *    selection in free mode sets the free color to that palette's hex; no
+    27→ *    mistake counting in free mode. BoardState.customColor exposes the brush.
+    28→ */
+    29→const NS = 'http://www.w3.org/2000/svg';
+    30→let sequence = 0;
+    31→const clamp = (x, min, max) => Math.max(min, Math.min(max, x));
+    32→function svgNode(tag, attrs = {}) {
+    33→  const el = document.createElementNS(NS, tag);
+    34→  for (const [key, value] of Object.entries(attrs)) el.setAttribute(key, String(value));
+    35→  return el;
+    36→}
+    37→
+    38→const SAFE_PATH = /^M[\s\d.,eE+\-MLQCZ]+Z$/;
+    39→const SAFE_PATH_OPEN = /^M[\s\d.,eE+\-MLQCZ]+$/;
+    40→const SAFE_HEX = /^#[0-9A-Fa-f]{6}$/;
+    41→const SAFE_GRADIENT_REF = /^url\(#g-[a-zA-Z0-9_-]+\)$/;
+    42→const SAFE_GRADIENT_ID = /^g-[a-zA-Z0-9_-]+$/;
+    43→const finite = (v) => Number.isFinite(v);
+    44→
+    45→export function validateBundle(bundle) {
+    46→  const {manifest: m, geometry: g, palette: p} = bundle || {};
+    47→  if (!m || !g || !Array.isArray(p) || !['color-duel-vector-1','color-duel-detailed-vector-1'].includes(m.format)) throw new Error('Unsupported artwork bundle');
+    48→  if (m.id !== g.artworkId || m.version !== g.artworkVersion || m.regionCount !== g.regions?.length) throw new Error('Artwork identity/count mismatch');
+    49→  if (!Array.isArray(g.viewBox) || g.viewBox.length !== 4 || g.viewBox.some(x => !Number.isFinite(x)) || g.viewBox[2] <= 0 || g.viewBox[3] <= 0) throw new Error('Invalid viewBox');
+    50→  const paletteIds = new Set(p.map(x => x.id));
+    51→  if (paletteIds.size !== p.length) throw new Error('Duplicate palette ID');
+    52→  const ids = new Set();
+    53→  for (const r of [...g.regions, ...g.decorations]) {
+    54→    if (ids.has(r.id) || !/^[a-zA-Z0-9_-]+$/.test(r.id)) throw new Error('Duplicate or unsafe region ID');
+    55→    ids.add(r.id);
+    56→    const rule = r.fillRule === undefined ? 'evenodd' : r.fillRule;
+    57→    if (!paletteIds.has(r.paletteId) || !['evenodd','nonzero'].includes(rule) || !SAFE_PATH.test(r.d)) throw new Error('Invalid region geometry or palette');
+    58→  }
+    59→  // Stage-2 boundary contract: optional edges + boundaryStyle (absent = legacy).
+    60→  if (g.edges !== undefined) {
+    61→    if (!Array.isArray(g.edges)) throw new Error('Invalid edges');
+    62→    const edgeIds = new Set();
+    63→    for (const e of g.edges) {
+    64→      if (!e || typeof e !== 'object') throw new Error('Invalid edge entry');
+    65→      if (!/^[a-zA-Z0-9_-]+$/.test(e.id) || edgeIds.has(e.id)) throw new Error('Duplicate or unsafe edge ID');
+    66→      edgeIds.add(e.id);
+    67→      if (typeof e.d !== 'string' || !SAFE_PATH_OPEN.test(e.d)) throw new Error('Invalid edge path');
+    68→      if (!['artwork','subdivision'].includes(e.kind)) throw new Error('Invalid edge kind');
+    69→      for (const side of ['leftRegion','rightRegion']) {
+    70→        const v = e[side];
+    71→        if (v !== undefined && v !== null && !ids.has(v)) throw new Error('Edge references unknown region');
+    72→      }
+    73→    }
+    74→    if (g.boundaryStyle !== undefined) {
+    75→      const bs = g.boundaryStyle;
+    76→      if (!bs || typeof bs !== 'object' || Array.isArray(bs)) throw new Error('Invalid boundaryStyle');
+    77→      for (const kind of ['artwork','subdivision']) {
+    78→        const s = bs[kind];
+    79→        if (s === undefined || s === null) continue;
+    80→        if (typeof s !== 'object' || !SAFE_HEX.test(s.stroke) || !finite(s.strokeWidth) || s.strokeWidth <= 0) throw new Error(`Invalid boundaryStyle ${kind}`);
+    81→        if (s.dash !== undefined && s.dash !== null && (typeof s.dash !== 'string' || s.dash.length > 40)) throw new Error(`Invalid boundaryStyle ${kind} dash`);
+    82→      }
+    83→    }
+    84→  }
+    85→  if (m.format === 'color-duel-detailed-vector-1') {
+    86→    const paint = bundle.paint;
+    87→    if (!paint || paint.artworkId !== m.id || !Array.isArray(paint.paths) || !Array.isArray(paint.inkPaths)) throw new Error('Missing detailed vector paint');
+    88→    const gradientIds = new Set((paint.gradients ?? []).map(x => x.id));
+    89→    for (const gr of paint.gradients ?? []) {
+    90→      if (!SAFE_GRADIENT_ID.test(gr.id) || !['linear','radial'].includes(gr.type) || !Array.isArray(gr.stops) || !gr.stops.length) throw new Error('Invalid gradient definition');
+    91→      for (const s of gr.stops) if (!SAFE_HEX.test(s.color) || !finite(s.offset)) throw new Error('Invalid gradient stop');
+    92→    }
+    93→    for (const path of paint.paths) {
+    94→      const fill = path.fill;
+    95→      const okFill = SAFE_HEX.test(fill) || (SAFE_GRADIENT_REF.test(fill) && gradientIds.has(fill.slice(5, -1)));
+    96→      if (!okFill || !SAFE_PATH.test(path.d)) throw new Error('Invalid paint path');
+    97→      if (path.fillRule !== undefined && !['evenodd','nonzero'].includes(path.fillRule)) throw new Error('Invalid paint fill rule');
+    98→      for (const key of ['opacity','fillOpacity','strokeWidth','z']) {
+    99→        const v = path[key];
+   100→        if (v !== undefined && !finite(v)) throw new Error(`Invalid paint ${key}`);
+   101→      }
+   102→      if (path.opacity !== undefined && (path.opacity < 0 || path.opacity > 1)) throw new Error('Invalid paint opacity');
+   103→      if (path.fillOpacity !== undefined && (path.fillOpacity < 0 || path.fillOpacity > 1)) throw new Error('Invalid paint fill-opacity');
+   104→    }
+   105→    // Ink layer holds closed filled shapes OR open stroke line art.
+   106→    for (const path of paint.inkPaths) {
+   107→      const fill = path.fill;
+   108→      const okFill = SAFE_HEX.test(fill) || (SAFE_GRADIENT_REF.test(fill) && gradientIds.has(fill.slice(5, -1)));
+   109→      const okPath = path.strokeWidth != null || path.filled === false ? SAFE_PATH_OPEN.test(path.d) : SAFE_PATH.test(path.d);
+   110→      if (!okFill || !okPath) throw new Error('Invalid ink path');
+   111→    }
+   112→  }
+   113→  return bundle;
+   114→}
+   115→
+   116→/** URL must point at artwork.json. Relative paths are resolved beside that manifest. */
+   117→export async function loadArtwork(manifestUrl, {signal} = {}) {
+   118→  async function get(url) {
+   119→    const res = await fetch(url, {signal});
+   120→    if (!res.ok) throw new Error(`Artwork request failed: ${res.status} (${url})`);
+   121→    return res.json();
+   122→  }
+   123→  const absolute = new URL(manifestUrl, document.baseURI).href;
+   124→  const manifest = await get(absolute);
+   125→  const [geometry, palette, paint] = await Promise.all([
+   126→    get(new URL(manifest.assets.regions, absolute)),
+   127→    get(new URL(manifest.assets.palette, absolute)),
+   128→    manifest.assets.paint ? get(new URL(manifest.assets.paint, absolute)) : Promise.resolve(null)
+   129→  ]);
+   130→  return validateBundle({manifest, geometry, palette, paint});
+   131→}
+   132→
+   133→/** Drop stale/unknown IDs; never restore progress across different geometry hashes. */
+   134→export function normalizeSession(bundle, raw, mode = 'number') {
+   135→  validateBundle(bundle);
+   136→  const m = bundle.manifest, valid = new Set(bundle.geometry.regions.map(r => r.id));
+   137→  const ids = new Set(mode === 'free' ? bundle.palette.map(p => p.id) : bundle.geometry.regions.map(r => r.paletteId));
+   138→  const clean = {schemaVersion:1, artworkId:m.id, artworkVersion:m.version,
+   139→    contentHash:m.contentHash, mode, completedRegionIds:[], selectedPaletteId:[...ids].sort((a,b)=>a-b)[0],
+   140→    freeColors:{}, mistakes:0, updatedAt:new Date().toISOString()};
+   141→  if (!raw || raw.schemaVersion !== 1 || raw.artworkId !== m.id || raw.artworkVersion !== m.version || raw.contentHash !== m.contentHash || raw.mode !== mode) return clean;
+   142→  clean.completedRegionIds = [...new Set(Array.isArray(raw.completedRegionIds) ? raw.completedRegionIds.filter(id => valid.has(id)) : [])];
+   143→  if (ids.has(raw.selectedPaletteId)) clean.selectedPaletteId = raw.selectedPaletteId;
+   144→  if (Number.isSafeInteger(raw.mistakes) && raw.mistakes >= 0) clean.mistakes = raw.mistakes;
+   145→  if (mode === 'free' && raw.freeColors && typeof raw.freeColors === 'object') {
+   146→    // Stage-2 free colors: values are #RRGGBB hexes (legacy numeric values drop).
+   147→    for (const id of clean.completedRegionIds) {
+   148→      const c = raw.freeColors[id];
+   149→      if (typeof c === 'string' && SAFE_HEX.test(c)) clean.freeColors[id] = c;
+   150→    }
+   151→    clean.completedRegionIds = clean.completedRegionIds.filter(id => id in clean.freeColors);
+   152→  }
+   153→  return clean;
+   154→}
+   155→
+   156→export class VectorBoard {
+   157→  constructor(svg, bundle, options = {}) {
+   158→    if (!(svg instanceof SVGSVGElement)) throw new Error('Pass an <svg> element to VectorBoard');
+   159→    validateBundle(bundle);
+   160→    this.svg = svg; this.bundle = bundle; this.options = options;
+   161→    this.mode = options.mode || 'number';
+   162→    if (!['number','memory','free'].includes(this.mode)) throw new Error('Invalid coloring mode');
+   163→    this.prefix = `cdv-${++sequence}-`;
+   164→    this.handlers = []; this.pointers = new Map(); this.history = []; this.preview = false;
+   165→    this.ctx = document.createElement('canvas').getContext('2d');
+   166→    if (!this.ctx) throw new Error('Canvas hit-testing is unavailable');
+   167→    this.regions = new Map(bundle.geometry.regions.map(r => [r.id, r]));
+   168→    this.paths = new Map([...this.regions].map(([id,r]) => [id,new Path2D(r.d)]));
+   169→    this.edges = Array.isArray(bundle.geometry.edges) && bundle.geometry.edges.length ? bundle.geometry.edges : null;
+   170→    this.edgeMode = !!this.edges;
+   171→    this.storageKey = `color-duel:vector:${bundle.manifest.id}:${bundle.manifest.version}:${bundle.manifest.contentHash}:${this.mode}`;
+   172→    let stored = options.session || null;
+   173→    if (!stored && options.persist !== false) {
+   174→      try { stored = JSON.parse(localStorage.getItem(this.storageKey) || 'null'); } catch { this.storageWarning = true; }
+   175→    }
+   176→    this.session = normalizeSession(bundle,stored,this.mode);
+   177→    this.completed = new Set(this.session.completedRegionIds);
+   178→    this.base = [...bundle.geometry.viewBox]; this.view = [...this.base];
+   179→    this.mount(); this.bindGestures(); this.refresh();
+   180→  }
+   181→  mount() {
+   182→    this.svg.replaceChildren();
+   183→    this.svg.setAttribute('viewBox', this.view.join(' '));
+   184→    this.svg.setAttribute('aria-label', `${this.bundle.manifest.title}, interactive coloring artwork`);
+   185→    this.svg.setAttribute('role','group');
+   186→    this.svg.style.touchAction = 'none';
+   187→    const defs = svgNode('defs');
+   188→    for (const p of this.bundle.palette) {
+   189→      const grad = svgNode('linearGradient',{id:`${this.prefix}paint-${p.id}`, x1:'0%',y1:'0%',x2:'100%',y2:'100%'});
+   190→      for (const stop of p.paint.stops) grad.append(svgNode('stop',{offset:stop.offset,'stop-color':stop.color}));
+   191→      defs.append(grad);
+   192→    }
+   193→    if (this.bundle.paint?.gradients) {
+   194→      for (const g of this.bundle.paint.gradients) {
+   195→        const attrs = g.type === 'linear'
+   196→          ? {id: g.id, gradientUnits: 'userSpaceOnUse', x1: g.x1, y1: g.y1, x2: g.x2, y2: g.y2}
+   197→          : {id: g.id, gradientUnits: 'userSpaceOnUse', cx: g.cx, cy: g.cy, r: g.r, fx: g.fx, fy: g.fy};
+   198→        const node = svgNode(g.type === 'linear' ? 'linearGradient' : 'radialGradient', attrs);
+   199→        for (const stop of g.stops) {
+   200→          const stopAttrs = {offset: stop.offset, 'stop-color': stop.color};
+   201→          if (stop.opacity != null && stop.opacity !== 1) stopAttrs['stop-opacity'] = stop.opacity;
+   202→          node.append(svgNode('stop', stopAttrs));
+   203→        }
+   204→        defs.append(node);
+   205→      }
+   206→    }
+   207→    const hatch = svgNode('pattern',{id:this.prefix+'selected',width:12,height:12,patternUnits:'userSpaceOnUse'});
+   208→    hatch.append(svgNode('rect',{width:12,height:12,fill:'#EDF1F4'}),svgNode('path',{d:'M0 0H6V6H0Z M6 6H12V12H6Z',fill:'#C3CED4'}));
+   209→    defs.append(hatch); this.svg.append(defs);
+   210→    const g = this.bundle.geometry;
+   211→    this.detailed = this.bundle.manifest.format === 'color-duel-detailed-vector-1';
+   212→    if (this.detailed) {
+   213→      // Appearance layer below the masks: filled paths in ORIGINAL drawing
+   214→      // order (z), honouring per-path fill rule, opacity and strokes.
+   215→      // (Stroke ink is rendered above the masks in the ink layer so the
+   216→      // linework stays visible during play; see the numbered.svg preview.)
+   217→      const art = svgNode('g',{'data-layer':'vector-paint','pointer-events':'none'});
+   218→      for (const p of this.orderedPaint()) {
+   219→        if (p.filled === false || (p.strokeWidth != null && !SAFE_HEX.test(p.fill))) {
+   220→          continue; // stroke-only ink: rendered in the ink layer above masks
+   221→        }
+   222→        const gradientFill = p.fill.startsWith('url(#');
+   223→        const attrs = {d: p.d, fill: p.fill, 'fill-rule': p.fillRule || 'evenodd'};
+   224→        if (!gradientFill) { attrs.stroke = p.stroke || p.fill; attrs['stroke-width'] = p.strokeWidth ?? 0.55; attrs['stroke-linejoin'] = 'round'; }
+   225→        if (p.fillOpacity != null && p.fillOpacity < 0.999) attrs['fill-opacity'] = p.fillOpacity;
+   226→        if (p.opacity != null && p.opacity < 0.999) attrs.opacity = p.opacity;
+   227→        if (p.stroke && p.strokeWidth > 0) { attrs.stroke = p.stroke; attrs['stroke-width'] = p.strokeWidth; attrs['stroke-linejoin'] = 'round'; }
+   228→        art.append(svgNode('path', attrs));
+   229→      }
+   230→      this.svg.append(art);
+   231→    }
+   232→    const regions = svgNode('g',{'stroke': this.edgeMode ? 'none' : g.stroke,'stroke-width':g.strokeWidth,'stroke-linejoin':'round'});
+   233→    this.elements = new Map(); this.labels = new Map();
+   234→    for (const r of g.regions) {
+   235→      const node = svgNode('path',{id:this.prefix+r.id,'data-region-id':r.id,'data-palette-id':r.paletteId,d:r.d,tabindex:0,role:'button',
+   236→        'fill-rule': r.fillRule || 'evenodd',
+   237→        'aria-label':`Region ${r.id}, palette ${this.mode==='memory'?'hidden':r.paletteId}`});
+   238→      this.elements.set(r.id,node); regions.append(node);
+   239→    }
+   240→    this.svg.append(regions);
+   241→    const fixed = svgNode('g',{'pointer-events':'none','stroke':g.stroke,'stroke-width':1.3,'stroke-linejoin':'round','fill-rule':'evenodd'});
+   242→    for (const r of (this.detailed ? [] : g.decorations)) fixed.append(svgNode('path',{d:r.d,fill:`url(#${this.prefix}paint-${r.paletteId})`}));
+   243→    this.svg.append(fixed);
+   244→    const details = svgNode('g',{'pointer-events':'none',fill:'none','stroke-linejoin':'round','stroke-linecap':'round'});
+   245→    for (const d of g.detailPaths) details.append(svgNode('path',{d:d.d,stroke:d.stroke,'stroke-width':d.strokeWidth,opacity:d.opacity}));
+   246→    this.svg.append(details);
+   247→    if (this.detailed) {
+   248→      const ink = svgNode('g',{'data-layer':'ink','pointer-events':'none'});
+   249→      for (const p of this.bundle.paint.inkPaths) {
+   250→        if (p.strokeWidth != null || p.filled === false) {
+   251→          ink.append(svgNode('path',{d:p.d, fill:'none', stroke:p.fill,
+   252→            'stroke-width':p.strokeWidth ?? 1.5, 'stroke-linecap':'round', 'stroke-linejoin':'round'}));
+   253→        } else {
+   254→          ink.append(svgNode('path',{d:p.d, fill:p.fill, 'fill-rule':p.fillRule || 'evenodd',
+   255→            ...(p.opacity != null && p.opacity < 0.999 ? {opacity: p.opacity} : {})}));
+   256→        }
+   257→      }
+   258→      this.svg.append(ink);
+   259→    }
+   260→    if (this.edges) {
+   261→      // Stage-2 edges overlay: ABOVE masks/ink, BELOW labels. Region paths
+   262→      // render fill-only; boundaries are drawn here per kind (boundaryStyle
+   263→      // overrides the documented defaults).
+   264→      const bs = g.boundaryStyle || {};
+   265→      const styleOf = (kind) => {
+   266→        const base = kind === 'artwork'
+   267→          ? {stroke: g.stroke || '#22333B', 'stroke-width': 1.6}
+   268→          : {stroke: '#7A8C94', 'stroke-width': 0.85, 'stroke-dasharray': '3 2.2'};
+   269→        const custom = bs[kind];
+   270→        if (custom) {
+   271→          if (custom.stroke !== undefined) base.stroke = custom.stroke;
+   272→          if (custom.strokeWidth !== undefined) base['stroke-width'] = custom.strokeWidth;
+   273→          if (custom.dash !== undefined) base['stroke-dasharray'] = custom.dash;
+   274→        }
+   275→        return base;
+   276→      };
+   277→      const styles = {artwork: styleOf('artwork'), subdivision: styleOf('subdivision')};
+   278→      const overlay = svgNode('g',{'data-layer':'edges','pointer-events':'none','fill':'none','stroke-linecap':'round','stroke-linejoin':'round'});
+   279→      for (const e of this.edges) {
+   280→        const s = styles[e.kind] || styles.artwork;
+   281→        overlay.append(svgNode('path',{id:this.prefix+e.id,'data-edge-kind':e.kind,d:e.d,...s}));
+   282→      }
+   283→      this.svg.append(overlay);
+   284→    }
+   285→    const labels = svgNode('g',{'pointer-events':'none','font-family':'Arial,sans-serif',fill:'#33444C','text-anchor':'middle','dominant-baseline':'central'});
+   286→    for (const r of g.regions) {
+   287→      const label = svgNode('text',{'data-label-for':r.id,x:r.label.x,y:r.label.y,'font-size':r.label.fontSize});
+   288→      label.textContent = String(r.paletteId); labels.append(label); this.labels.set(r.id,label);
+   289→    }
+   290→    this.svg.append(labels);
+   291→    this.listen(this.svg,'keydown',e => {
+   292→      const id = e.target.getAttribute?.('data-region-id');
+   293→      if (id && (e.key==='Enter' || e.key===' ')) {e.preventDefault();this.paint(id);}
+   294→    });
+   295→  }
+   296→  /** Paint + ink entries merged into original drawing order (by z). */
+   297→  orderedPaint() {
+   298→    const paint = this.bundle.paint;
+   299→    if (!paint) return [];
+   300→    const entries = [...(paint.paths ?? []), ...(paint.inkPaths ?? [])];
+   301→    return entries.sort((a, b) => (a.z ?? Infinity) - (b.z ?? Infinity) || 0);
+   302→  }
+   303→  listen(el,type,fn,options) {el.addEventListener(type,fn,options);this.handlers.push(()=>el.removeEventListener(type,fn,options));}
+   304→  state() {
+   305→    const completedRegionIds = [...this.completed];
+   306→    const objects = Object.fromEntries(this.bundle.manifest.objectGroups.map(group => [group.id,
+   307→      {completed:group.regionIds.filter(id=>this.completed.has(id)).length,total:group.regionIds.length}]));
+   308→    return {...this.session, completedRegionIds, freeColors:{...this.session.freeColors},
+   309→      customColor: this.session.freeColor ?? null,
+   310→      total:this.regions.size, completed:completedRegionIds.length, progress:completedRegionIds.length/this.regions.size,
+   311→      objects,preview:this.preview,zoom:this.base[2]/this.view[2],storageWarning:!!this.storageWarning};
+   312→  }
+   313→  save() {
+   314→    this.session.completedRegionIds = [...this.completed]; this.session.updatedAt = new Date().toISOString();
+   315→    if (this.options.persist !== false) try { localStorage.setItem(this.storageKey,JSON.stringify(this.session)); }
+   316→      catch { this.storageWarning = true; }
+   317→  }
+   318→  notify(reason) {this.options.onChange?.(this.state(),reason);}
+   319→  refresh() {
+   320→    for (const [id,r] of this.regions) {
+   321→      const done = this.completed.has(id), node = this.elements.get(id), label = this.labels.get(id);
+   322→      let fill = '#FFFFFF';
+   323→      if (this.preview || done) {
+   324→        if (this.mode==='free' && !this.preview) {
+   325→          fill = this.session.freeColors[id] || '#FFFFFF';   // flat hex, not a gradient
+   326→        } else {
+   327→          fill = `url(#${this.prefix}paint-${r.paletteId})`;
+   328→        }
+   329→      } else if (this.mode==='number' && r.paletteId===this.session.selectedPaletteId) fill=`url(#${this.prefix}selected)`;
+   330→      if (this.detailed && (this.preview || (done && this.mode!=='free'))) fill='none';
+   331→      node.setAttribute('fill',fill);
+   332→      node.setAttribute('stroke',this.edgeMode || (this.detailed && (done || this.preview)) ? 'none' : this.bundle.geometry.stroke);
+   333→      node.dataset.completed=String(done);
+   334→      node.setAttribute('tabindex',done && this.mode!=='free' ? '-1':'0');
+   335→      node.setAttribute('aria-pressed',String(done));
+   336→      label.style.display = done || this.preview || this.mode!=='number' ? 'none':'';
+   337→    }
+   338→    this.updateLabelVisibility();
+   339→    this.notify('render');
+   340→  }
+   341→  updateLabelVisibility() {
+   342→    if (!this.detailed || !this.labels) return;
+   343→    if (this.pointers && this.pointers.size) return;   // skip while a gesture is active
+   344→    const screen = this.svg.getBoundingClientRect();
+   345→    const scale = Math.min(screen.width/this.view[2],screen.height/this.view[3]);
+   346→    for (const [id,r] of this.regions) {
+   347→      const visible = !this.completed.has(id) && !this.preview && this.mode==='number' && r.label.fontSize*scale >= 9;
+   348→      this.labels.get(id).style.display = visible ? '' : 'none';
+   349→    }
+   350→  }
+   351→  setPalette(id) {
+   352→    const entry = this.bundle.palette.find(p=>p.id===id);
+   353→    if (!entry) throw new Error('Unknown palette ID');
+   354→    if (this.mode==='free') {
+   355→      // Palette swatches in free mode are quick access to that palette's hex.
+   356→      this.session.freeColor = entry.hex; this.save(); this.refresh(); return;
+   357→    }
+   358→    this.session.selectedPaletteId=id; this.save(); this.refresh();
+   359→  }
+   360→  /** Free-mode custom color brush: any #RRGGBB hex (flat fill, no gradient). */
+   361→  setFreeColor(hex) {
+   362→    if (typeof hex !== 'string' || !SAFE_HEX.test(hex)) throw new Error('Use a #RRGGBB hex color');
+   363→    this.session.freeColor = hex; this.save(); this.refresh();
+   364→  }
+   365→  paletteHex(id) { const p = this.bundle.palette.find(q=>q.id===id); return p ? p.hex : null; }
+   366→  paint(id) {
+   367→    const r=this.regions.get(id);
+   368→    if (!r || this.preview) return 'ignored';
+   369→    if (this.completed.has(id) && this.mode!=='free') return 'already-complete';
+   370→    if (this.mode!=='free' && r.paletteId!==this.session.selectedPaletteId) {
+   371→      this.session.mistakes++;this.save();this.notify('wrong-color');return 'wrong-color';
+   372→    }
+   373→    if (this.mode==='free') {
+   374→      // Free mode: store the active hex (custom brush or the selected palette's
+   375→      // hex); repainting with a different color re-colors; NO mistake counting.
+   376→      const hex = this.session.freeColor || this.paletteHex(this.session.selectedPaletteId) || '#9AA7AD';
+   377→      if (this.completed.has(id) && this.session.freeColors[id]===hex) return 'already-complete';
+   378→      this.history.push({id,wasCompleted:this.completed.has(id),oldColor:this.session.freeColors[id]});
+   379→      this.completed.add(id);
+   380→      this.session.freeColors[id]=hex;
+   381→      this.save();this.refresh();this.notify('paint');return 'painted';
+   382→    }
+   383→    this.history.push({id,wasCompleted:this.completed.has(id),oldColor:this.session.freeColors[id]});
+   384→    this.completed.add(id);
+   385→    this.save();this.refresh();this.notify('paint');return 'painted';
+   386→  }
+   387→  undo() {
+   388→    if (this.preview) return false;
+   389→    const previous=this.history.pop(); if (!previous) return false;
+   390→    if (!previous.wasCompleted) this.completed.delete(previous.id);
+   391→    if (previous.oldColor===undefined) delete this.session.freeColors[previous.id]; else this.session.freeColors[previous.id]=previous.oldColor;
+   392→    this.save();this.refresh();return true;
+   393→  }
+   394→  reset() {
+   395→    this.completed.clear();this.session.freeColors={};this.session.mistakes=0;this.history=[];this.preview=false;
+   396→    this.save();this.refresh();this.fit();
+   397→  }
+   398→  setPreview(value) {this.preview=!!value;this.refresh();}
+   399→  hitTest(x,y) {
+   400→    // Iterate in reverse document order (topmost wins). Regions are visible
+   401→    // surfaces and must not overlap; per-region fill rules are honoured.
+   402→    for (const [id,r] of [...this.regions].reverse()) {
+   403→      const b=r.bbox;
+   404→      const rule = r.fillRule || 'evenodd';
+   405→      if (x>=b[0] && x<=b[2] && y>=b[1] && y<=b[3] && this.ctx.isPointInPath(this.paths.get(id),x,y,rule)) return id;
+   406→    }
+   407→    return null;
+   408→  }
+   409→  clientToArt(x,y,matrix=null) {
+   410→    const ctm=matrix || this.svg.getScreenCTM()?.inverse();
+   411→    if (!ctm) return null;
+   412→    return new DOMPoint(x,y).matrixTransform(ctm);
+   413→  }
+   414→  applyView(view) {
+   415→    const [bx,by,bw,bh]=this.base;
+   416→    const w=clamp(view[2],bw/10,bw),h=w*bh/bw;
+   417→    this.view=[clamp(view[0],bx,bx+bw-w),clamp(view[1],by,by+bh-h),w,h];
+   418→    this.svg.setAttribute('viewBox',this.view.join(' '));this.updateLabelVisibility();this.notify('viewport');
+   419→  }
+   420→  fit() {this.applyView([...this.base]);}
+   421→  zoom(factor,anchor=null) {
+   422→    const v=this.view, a=anchor || {x:v[0]+v[2]/2,y:v[1]+v[3]/2};
+   423→    const w=clamp(v[2]/factor,this.base[2]/10,this.base[2]),h=w*this.base[3]/this.base[2];
+   424→    this.applyView([a.x-(a.x-v[0])*w/v[2],a.y-(a.y-v[1])*h/v[3],w,h]);
+   425→  }
+   426→  nextRegion() {
+   427→    if (this.mode!=='number' || this.preview) return null;
+   428→    const r=[...this.regions.values()].find(r=>!this.completed.has(r.id) && r.paletteId===this.session.selectedPaletteId);
+   429→    if (!r) return null;
+   430→    const w=Math.max(this.base[2]/10,Math.min(this.base[2],Math.max(r.bbox[2]-r.bbox[0],(r.bbox[3]-r.bbox[1])*this.base[2]/this.base[3])*1.6));
+   431→    this.applyView([r.label.x-w/2,r.label.y-w*this.base[3]/this.base[2]/2,w,w*this.base[3]/this.base[2]]);
+   432→    this.elements.get(r.id).focus({preventScroll:true});return r.id;
+   433→  }
+   434→  bindGestures() {
+   435→    // rAF-batched pointermove/wheel: store the latest event, run ONE scheduled
+   436→    // frame per batch (high-frequency gestures no longer thrash the DOM).
+   437→    this._rafPending=false; this._lastMove=null; this._lastWheel=null;
+   438→    const raf = typeof requestAnimationFrame === 'function' ? requestAnimationFrame : (cb)=>setTimeout(cb,16);
+   439→    const schedule = (fn) => {
+   440→      if (this._rafPending) return;
+   441→      this._rafPending = true;
+   442→      raf(() => { this._rafPending = false; fn(); });
+   443→    };
+   444→    const startPinch=()=>{
+   445→      const pts=[...this.pointers.values()];
+   446→      const mid={x:(pts[0].x+pts[1].x)/2,y:(pts[0].y+pts[1].y)/2};
+   447→      const inverse=this.svg.getScreenCTM().inverse();
+   448→      this.pinch={distance:Math.max(1,Math.hypot(pts[0].x-pts[1].x,pts[0].y-pts[1].y)),view:[...this.view],inverse,anchor:this.clientToArt(mid.x,mid.y,inverse)};
+   449→      this.suppressTap=true;
+   450→    };
+   451→    this.listen(this.svg,'pointerdown',e=>{
+   452→      if (e.pointerType==='mouse' && e.button!==0)return;
+   453→      this.pointers.set(e.pointerId,{x:e.clientX,y:e.clientY});
+   454→      try { this.svg.setPointerCapture(e.pointerId); } catch { /* synthetic/stale pointer */ }
+   455→      if (this.pointers.size===1) {
+   456→        this.suppressTap=false;
+   457→        const inverse=this.svg.getScreenCTM().inverse();
+   458→        this.drag={x:e.clientX,y:e.clientY,view:[...this.view],inverse,anchor:this.clientToArt(e.clientX,e.clientY,inverse),moved:false};
+   459→      } else if (this.pointers.size===2) startPinch();
+   460→    });
+   461→    this.listen(this.svg,'pointermove',e=>{
+   462→      if (!this.pointers.has(e.pointerId))return;
+   463→      this.pointers.set(e.pointerId,{x:e.clientX,y:e.clientY});
+   464→      this._lastMove = e;
+   465→      schedule(() => { const ev = this._lastMove; if (ev) this.handleMove(ev); });
+   466→    });
+   467→    const finish=(e,cancel=false)=>{
+   468→      if (!this.pointers.has(e.pointerId))return;
+   469→      const tap=!cancel && this.pointers.size===1 && !this.suppressTap && !this.drag?.moved;
+   470→      this.pointers.delete(e.pointerId);
+   471→      if (this.svg.hasPointerCapture(e.pointerId))this.svg.releasePointerCapture(e.pointerId);
+   472→      if (tap) {const p=this.clientToArt(e.clientX,e.clientY);if(p)this.paint(this.hitTest(p.x,p.y));}
+   473→      if (!this.pointers.size) {this.drag=null;this.pinch=null;this.suppressTap=false;} else this.suppressTap=true;
+   474→    };
+   475→    this.listen(this.svg,'pointerup',e=>finish(e));
+   476→    this.listen(this.svg,'pointercancel',e=>finish(e,true));
+   477→    this.listen(this.svg,'wheel',e=>{
+   478→      e.preventDefault();                       // must stay synchronous
+   479→      this._lastWheel = e;
+   480→      schedule(() => {
+   481→        const ev = this._lastWheel; if (!ev) return;
+   482→        this.zoom(Math.exp(-ev.deltaY*.0015), this.clientToArt(ev.clientX,ev.clientY));
+   483→      });
+   484→    },{passive:false});
+   485→  }
+   486→  /** Deferred per-frame gesture math (pan + pinch); runs inside one rAF. */
+   487→  handleMove(e) {
+   488→    if (this.pointers.size>=2 && this.pinch) {
+   489→      const pts=[...this.pointers.values()], mid={x:(pts[0].x+pts[1].x)/2,y:(pts[0].y+pts[1].y)/2};
+   490→      const distance=Math.max(1,Math.hypot(pts[0].x-pts[1].x,pts[0].y-pts[1].y));
+   491→      const p=this.pinch, now=this.clientToArt(mid.x,mid.y,p.inverse),w=clamp(p.view[2]*p.distance/distance,this.base[2]/10,this.base[2]),h=w*this.base[3]/this.base[2];
+   492→      this.applyView([p.anchor.x-(now.x-p.view[0])*w/p.view[2],p.anchor.y-(now.y-p.view[1])*h/p.view[3],w,h]);
+   493→    } else if (!this.suppressTap && this.drag) {
+   494→      const d=this.drag;
+   495→      if (Math.hypot(e.clientX-d.x,e.clientY-d.y)>6) d.moved=true;
+   496→      if (d.moved) {const now=this.clientToArt(e.clientX,e.clientY,d.inverse);this.applyView([d.view[0]-(now.x-d.anchor.x),d.view[1]-(now.y-d.anchor.y),d.view[2],d.view[3]]);}
+   497→    }
+   498→  }
+   499→  destroy() {for(const remove of this.handlers)remove();this.handlers=[];this.svg.replaceChildren();this.pointers.clear();}
+   500→}
+   501→

@@ -13,6 +13,20 @@
  *  - paint.inkPaths may be OPEN paths (stroke line art) when strokeWidth/filled=false
  *  - Regions are VISIBLE SURFACES: masks do not overlap, so any fill order
  *    colors correctly (fill-order independence).
+ *  - geometry.edges (stage 2, optional): boundary entries {id, d (M/L/C/Q/Z,
+ *    open or closed), kind: 'artwork' | 'subdivision', leftRegion/rightRegion
+ *    (null or an existing region id)} plus optional geometry.boundaryStyle
+ *    overrides. When edges is a non-empty array, region paths render FILL-ONLY
+ *    and an edges overlay group (above masks/ink, below labels) draws the
+ *    boundaries: artwork = solid (geometry.stroke, width 1.6, round caps),
+ *    subdivision = light dashed (#7A8C94, width 0.85, dash '3 2.2' userSpace).
+ *    Absent/empty edges = legacy stroke rendering, unchanged.
+ *  - Free color: session.freeColors maps regionId -> #RRGGBB hex (flat fill,
+ *    no gradient); board.setFreeColor(hex) is the custom brush; palette swatch
+ *    selection in free mode sets the free color to that palette's hex; no
+ *    mistake counting in free mode. BoardState.customColor exposes the brush.
+ *  - Gestures are rAF-batched: pointermove/wheel store the latest event and run
+ *    ONE scheduled frame; label visibility updates pause during a gesture.
  */
 const NS = 'http://www.w3.org/2000/svg';
 let sequence = 0;
@@ -43,6 +57,32 @@ export function validateBundle(bundle) {
     ids.add(r.id);
     const rule = r.fillRule === undefined ? 'evenodd' : r.fillRule;
     if (!paletteIds.has(r.paletteId) || !['evenodd','nonzero'].includes(rule) || !SAFE_PATH.test(r.d)) throw new Error('Invalid region geometry or palette');
+  }
+  // Stage-2 boundary contract: optional edges + boundaryStyle (absent = legacy).
+  if (g.edges !== undefined) {
+    if (!Array.isArray(g.edges)) throw new Error('Invalid edges');
+    const edgeIds = new Set();
+    for (const e of g.edges) {
+      if (!e || typeof e !== 'object') throw new Error('Invalid edge entry');
+      if (!/^[a-zA-Z0-9_-]+$/.test(e.id) || edgeIds.has(e.id)) throw new Error('Duplicate or unsafe edge ID');
+      edgeIds.add(e.id);
+      if (typeof e.d !== 'string' || !SAFE_PATH_OPEN.test(e.d)) throw new Error('Invalid edge path');
+      if (!['artwork','subdivision'].includes(e.kind)) throw new Error('Invalid edge kind');
+      for (const side of ['leftRegion','rightRegion']) {
+        const v = e[side];
+        if (v !== undefined && v !== null && !ids.has(v)) throw new Error('Edge references unknown region');
+      }
+    }
+    if (g.boundaryStyle !== undefined) {
+      const bs = g.boundaryStyle;
+      if (!bs || typeof bs !== 'object' || Array.isArray(bs)) throw new Error('Invalid boundaryStyle');
+      for (const kind of ['artwork','subdivision']) {
+        const s = bs[kind];
+        if (s === undefined || s === null) continue;
+        if (typeof s !== 'object' || !SAFE_HEX.test(s.stroke) || !finite(s.strokeWidth) || s.strokeWidth <= 0) throw new Error(`Invalid boundaryStyle ${kind}`);
+        if (s.dash !== undefined && s.dash !== null && (typeof s.dash !== 'string' || s.dash.length > 40)) throw new Error(`Invalid boundaryStyle ${kind} dash`);
+      }
+    }
   }
   if (m.format === 'color-duel-detailed-vector-1') {
     const paint = bundle.paint;
@@ -105,8 +145,11 @@ export function normalizeSession(bundle, raw, mode = 'number') {
   if (ids.has(raw.selectedPaletteId)) clean.selectedPaletteId = raw.selectedPaletteId;
   if (Number.isSafeInteger(raw.mistakes) && raw.mistakes >= 0) clean.mistakes = raw.mistakes;
   if (mode === 'free' && raw.freeColors && typeof raw.freeColors === 'object') {
-    const allIds = new Set(bundle.palette.map(p => p.id));
-    for (const id of clean.completedRegionIds) if (allIds.has(raw.freeColors[id])) clean.freeColors[id] = raw.freeColors[id];
+    // Stage-2 free colors: values are #RRGGBB hexes (legacy numeric values drop).
+    for (const id of clean.completedRegionIds) {
+      const c = raw.freeColors[id];
+      if (typeof c === 'string' && SAFE_HEX.test(c)) clean.freeColors[id] = c;
+    }
     clean.completedRegionIds = clean.completedRegionIds.filter(id => id in clean.freeColors);
   }
   return clean;
@@ -125,6 +168,8 @@ export class VectorBoard {
     if (!this.ctx) throw new Error('Canvas hit-testing is unavailable');
     this.regions = new Map(bundle.geometry.regions.map(r => [r.id, r]));
     this.paths = new Map([...this.regions].map(([id,r]) => [id,new Path2D(r.d)]));
+    this.edges = Array.isArray(bundle.geometry.edges) && bundle.geometry.edges.length ? bundle.geometry.edges : null;
+    this.edgeMode = !!this.edges;
     this.storageKey = `color-duel:vector:${bundle.manifest.id}:${bundle.manifest.version}:${bundle.manifest.contentHash}:${this.mode}`;
     let stored = options.session || null;
     if (!stored && options.persist !== false) {
@@ -186,7 +231,7 @@ export class VectorBoard {
       }
       this.svg.append(art);
     }
-    const regions = svgNode('g',{'stroke':g.stroke,'stroke-width':g.strokeWidth,'stroke-linejoin':'round'});
+    const regions = svgNode('g',{'stroke': this.edgeMode ? 'none' : g.stroke,'stroke-width':g.strokeWidth,'stroke-linejoin':'round'});
     this.elements = new Map(); this.labels = new Map();
     for (const r of g.regions) {
       const node = svgNode('path',{id:this.prefix+r.id,'data-region-id':r.id,'data-palette-id':r.paletteId,d:r.d,tabindex:0,role:'button',
@@ -214,6 +259,31 @@ export class VectorBoard {
       }
       this.svg.append(ink);
     }
+    if (this.edges) {
+      // Stage-2 edges overlay: ABOVE masks/ink, BELOW labels. Region paths
+      // render fill-only; boundaries are drawn here per kind (boundaryStyle
+      // overrides the documented defaults).
+      const bs = g.boundaryStyle || {};
+      const styleOf = (kind) => {
+        const base = kind === 'artwork'
+          ? {stroke: g.stroke || '#22333B', 'stroke-width': 1.6}
+          : {stroke: '#7A8C94', 'stroke-width': 0.85, 'stroke-dasharray': '3 2.2'};
+        const custom = bs[kind];
+        if (custom) {
+          if (custom.stroke !== undefined) base.stroke = custom.stroke;
+          if (custom.strokeWidth !== undefined) base['stroke-width'] = custom.strokeWidth;
+          if (custom.dash !== undefined) base['stroke-dasharray'] = custom.dash;
+        }
+        return base;
+      };
+      const styles = {artwork: styleOf('artwork'), subdivision: styleOf('subdivision')};
+      const overlay = svgNode('g',{'data-layer':'edges','pointer-events':'none','fill':'none','stroke-linecap':'round','stroke-linejoin':'round'});
+      for (const e of this.edges) {
+        const s = styles[e.kind] || styles.artwork;
+        overlay.append(svgNode('path',{id:this.prefix+e.id,'data-edge-kind':e.kind,d:e.d,...s}));
+      }
+      this.svg.append(overlay);
+    }
     const labels = svgNode('g',{'pointer-events':'none','font-family':'Arial,sans-serif',fill:'#33444C','text-anchor':'middle','dominant-baseline':'central'});
     for (const r of g.regions) {
       const label = svgNode('text',{'data-label-for':r.id,x:r.label.x,y:r.label.y,'font-size':r.label.fontSize});
@@ -238,6 +308,7 @@ export class VectorBoard {
     const objects = Object.fromEntries(this.bundle.manifest.objectGroups.map(group => [group.id,
       {completed:group.regionIds.filter(id=>this.completed.has(id)).length,total:group.regionIds.length}]));
     return {...this.session, completedRegionIds, freeColors:{...this.session.freeColors},
+      customColor: this.session.freeColor ?? null,
       total:this.regions.size, completed:completedRegionIds.length, progress:completedRegionIds.length/this.regions.size,
       objects,preview:this.preview,zoom:this.base[2]/this.view[2],storageWarning:!!this.storageWarning};
   }
@@ -252,12 +323,15 @@ export class VectorBoard {
       const done = this.completed.has(id), node = this.elements.get(id), label = this.labels.get(id);
       let fill = '#FFFFFF';
       if (this.preview || done) {
-        const palette = (!this.preview && this.mode==='free') ? this.session.freeColors[id] : r.paletteId;
-        fill = `url(#${this.prefix}paint-${palette})`;
+        if (this.mode==='free' && !this.preview) {
+          fill = this.session.freeColors[id] || '#FFFFFF';   // flat hex, not a gradient
+        } else {
+          fill = `url(#${this.prefix}paint-${r.paletteId})`;
+        }
       } else if (this.mode==='number' && r.paletteId===this.session.selectedPaletteId) fill=`url(#${this.prefix}selected)`;
       if (this.detailed && (this.preview || (done && this.mode!=='free'))) fill='none';
       node.setAttribute('fill',fill);
-      node.setAttribute('stroke',this.detailed && (done || this.preview) ? 'none' : this.bundle.geometry.stroke);
+      node.setAttribute('stroke',this.edgeMode || (this.detailed && (done || this.preview)) ? 'none' : this.bundle.geometry.stroke);
       node.dataset.completed=String(done);
       node.setAttribute('tabindex',done && this.mode!=='free' ? '-1':'0');
       node.setAttribute('aria-pressed',String(done));
@@ -268,6 +342,7 @@ export class VectorBoard {
   }
   updateLabelVisibility() {
     if (!this.detailed || !this.labels) return;
+    if (this.pointers && this.pointers.size) return;   // skip while a gesture is active
     const screen = this.svg.getBoundingClientRect();
     const scale = Math.min(screen.width/this.view[2],screen.height/this.view[3]);
     for (const [id,r] of this.regions) {
@@ -276,9 +351,20 @@ export class VectorBoard {
     }
   }
   setPalette(id) {
-    if (!this.bundle.palette.some(p=>p.id===id)) throw new Error('Unknown palette ID');
+    const entry = this.bundle.palette.find(p=>p.id===id);
+    if (!entry) throw new Error('Unknown palette ID');
+    if (this.mode==='free') {
+      // Palette swatches in free mode are quick access to that palette's hex.
+      this.session.freeColor = entry.hex; this.save(); this.refresh(); return;
+    }
     this.session.selectedPaletteId=id; this.save(); this.refresh();
   }
+  /** Free-mode custom color brush: any #RRGGBB hex (flat fill, no gradient). */
+  setFreeColor(hex) {
+    if (typeof hex !== 'string' || !SAFE_HEX.test(hex)) throw new Error('Use a #RRGGBB hex color');
+    this.session.freeColor = hex; this.save(); this.refresh();
+  }
+  paletteHex(id) { const p = this.bundle.palette.find(q=>q.id===id); return p ? p.hex : null; }
   paint(id) {
     const r=this.regions.get(id);
     if (!r || this.preview) return 'ignored';
@@ -286,10 +372,18 @@ export class VectorBoard {
     if (this.mode!=='free' && r.paletteId!==this.session.selectedPaletteId) {
       this.session.mistakes++;this.save();this.notify('wrong-color');return 'wrong-color';
     }
-    if (this.completed.has(id) && this.session.freeColors[id]===this.session.selectedPaletteId) return 'already-complete';
+    if (this.mode==='free') {
+      // Free mode: store the active hex (custom brush or the selected palette's
+      // hex); repainting with a different color re-colors; NO mistake counting.
+      const hex = this.session.freeColor || this.paletteHex(this.session.selectedPaletteId) || '#9AA7AD';
+      if (this.completed.has(id) && this.session.freeColors[id]===hex) return 'already-complete';
+      this.history.push({id,wasCompleted:this.completed.has(id),oldColor:this.session.freeColors[id]});
+      this.completed.add(id);
+      this.session.freeColors[id]=hex;
+      this.save();this.refresh();this.notify('paint');return 'painted';
+    }
     this.history.push({id,wasCompleted:this.completed.has(id),oldColor:this.session.freeColors[id]});
     this.completed.add(id);
-    if (this.mode==='free') this.session.freeColors[id]=this.session.selectedPaletteId;
     this.save();this.refresh();this.notify('paint');return 'painted';
   }
   undo() {
@@ -340,6 +434,15 @@ export class VectorBoard {
     this.elements.get(r.id).focus({preventScroll:true});return r.id;
   }
   bindGestures() {
+    // rAF-batched pointermove/wheel: store the latest event, run ONE scheduled
+    // frame per batch (high-frequency gestures no longer thrash the DOM).
+    this._rafPending=false; this._lastMove=null; this._lastWheel=null;
+    const raf = typeof requestAnimationFrame === 'function' ? requestAnimationFrame : (cb)=>setTimeout(cb,16);
+    const schedule = (fn) => {
+      if (this._rafPending) return;
+      this._rafPending = true;
+      raf(() => { this._rafPending = false; fn(); });
+    };
     const startPinch=()=>{
       const pts=[...this.pointers.values()];
       const mid={x:(pts[0].x+pts[1].x)/2,y:(pts[0].y+pts[1].y)/2};
@@ -360,16 +463,8 @@ export class VectorBoard {
     this.listen(this.svg,'pointermove',e=>{
       if (!this.pointers.has(e.pointerId))return;
       this.pointers.set(e.pointerId,{x:e.clientX,y:e.clientY});
-      if (this.pointers.size>=2 && this.pinch) {
-        const pts=[...this.pointers.values()], mid={x:(pts[0].x+pts[1].x)/2,y:(pts[0].y+pts[1].y)/2};
-        const distance=Math.max(1,Math.hypot(pts[0].x-pts[1].x,pts[0].y-pts[1].y));
-        const p=this.pinch, now=this.clientToArt(mid.x,mid.y,p.inverse),w=clamp(p.view[2]*p.distance/distance,this.base[2]/10,this.base[2]),h=w*this.base[3]/this.base[2];
-        this.applyView([p.anchor.x-(now.x-p.view[0])*w/p.view[2],p.anchor.y-(now.y-p.view[1])*h/p.view[3],w,h]);
-      } else if (!this.suppressTap && this.drag) {
-        const d=this.drag;
-        if (Math.hypot(e.clientX-d.x,e.clientY-d.y)>6) d.moved=true;
-        if (d.moved) {const now=this.clientToArt(e.clientX,e.clientY,d.inverse);this.applyView([d.view[0]-(now.x-d.anchor.x),d.view[1]-(now.y-d.anchor.y),d.view[2],d.view[3]]);}
-      }
+      this._lastMove = e;
+      schedule(() => { const ev = this._lastMove; if (ev) this.handleMove(ev); });
     });
     const finish=(e,cancel=false)=>{
       if (!this.pointers.has(e.pointerId))return;
@@ -381,7 +476,27 @@ export class VectorBoard {
     };
     this.listen(this.svg,'pointerup',e=>finish(e));
     this.listen(this.svg,'pointercancel',e=>finish(e,true));
-    this.listen(this.svg,'wheel',e=>{e.preventDefault();this.zoom(Math.exp(-e.deltaY*.0015),this.clientToArt(e.clientX,e.clientY));},{passive:false});
+    this.listen(this.svg,'wheel',e=>{
+      e.preventDefault();                       // must stay synchronous
+      this._lastWheel = e;
+      schedule(() => {
+        const ev = this._lastWheel; if (!ev) return;
+        this.zoom(Math.exp(-ev.deltaY*.0015), this.clientToArt(ev.clientX,ev.clientY));
+      });
+    },{passive:false});
+  }
+  /** Deferred per-frame gesture math (pan + pinch); runs inside one rAF. */
+  handleMove(e) {
+    if (this.pointers.size>=2 && this.pinch) {
+      const pts=[...this.pointers.values()], mid={x:(pts[0].x+pts[1].x)/2,y:(pts[0].y+pts[1].y)/2};
+      const distance=Math.max(1,Math.hypot(pts[0].x-pts[1].x,pts[0].y-pts[1].y));
+      const p=this.pinch, now=this.clientToArt(mid.x,mid.y,p.inverse),w=clamp(p.view[2]*p.distance/distance,this.base[2]/10,this.base[2]),h=w*this.base[3]/this.base[2];
+      this.applyView([p.anchor.x-(now.x-p.view[0])*w/p.view[2],p.anchor.y-(now.y-p.view[1])*h/p.view[3],w,h]);
+    } else if (!this.suppressTap && this.drag) {
+      const d=this.drag;
+      if (Math.hypot(e.clientX-d.x,e.clientY-d.y)>6) d.moved=true;
+      if (d.moved) {const now=this.clientToArt(e.clientX,e.clientY,d.inverse);this.applyView([d.view[0]-(now.x-d.anchor.x),d.view[1]-(now.y-d.anchor.y),d.view[2],d.view[3]]);}
+    }
   }
   destroy() {for(const remove of this.handlers)remove();this.handlers=[];this.svg.replaceChildren();this.pointers.clear();}
 }

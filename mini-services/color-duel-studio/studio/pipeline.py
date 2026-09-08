@@ -19,7 +19,7 @@ image-aware *draft* regions, not semantic object detection.
 """
 from __future__ import annotations
 
-import hashlib, json, math, shutil, zipfile
+import hashlib, json, math, random, shutil, zipfile
 from collections import defaultdict
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
@@ -30,8 +30,9 @@ from PIL import Image, ImageOps, ImageFilter
 from scipy import ndimage as ndi
 from skimage.segmentation import slic
 from shapely import make_valid
-from shapely.geometry import shape, Polygon, Point, box
-from shapely.ops import unary_union, polylabel
+from shapely.geometry import shape, Polygon, Point, LineString, box
+from shapely.ops import unary_union, polylabel, split
+from shapely.strtree import STRtree
 
 from .curves import (
     Command, evenodd_area, fit_polyline, fit_ring, flatten_path, format_path,
@@ -51,6 +52,10 @@ SAFE_HEX = _re.compile(r'^#[0-9A-Fa-f]{6}$')
 SAFE_GRAD_REF = _re.compile(r'^url\(#g-[a-zA-Z0-9_-]+\)$')
 SAFE_ID = _re.compile(r'^[a-zA-Z0-9_-]+$')
 RUNTIME_REGION_KEYS = ('id', 'paletteId', 'objectId', 'd', 'fillRule', 'bbox', 'area', 'label')
+EDGE_KINDS = ('artwork', 'subdivision')
+BOUNDARY_STYLE_DEFAULT = {'artwork': {'stroke': INK, 'strokeWidth': 1.6},
+                          'subdivision': {'stroke': '#7A8C94', 'strokeWidth': 0.85, 'dash': '3 2.2'}}
+EDGE_CLASSIFY_TOL = 1.5        # px: segment midpoint distance that still counts as ON a boundary
 BACKENDS = [
     {'id': 'spline-local', 'name': 'Local spline tracing (curves)', 'kind': 'raster-to-vector',
      'paid': False, 'available': True,
@@ -61,12 +66,24 @@ BACKENDS = [
     {'id': 'svg-master', 'name': 'SVG master import (curves preserved)', 'kind': 'svg-import',
      'paid': False, 'available': True,
      'notes': 'Sanitized SVG master: curves, holes, supported gradients, transforms and drawing order preserved. Never rasterized.'},
+    {'id': 'pen-cut-tools', 'name': 'Pen & cut region topology tools', 'kind': 'region-topology-editing',
+     'paid': False, 'available': True,
+     'notes': 'Cut a region along a drawn line and draw new pen regions on empty canvas; edges are reclassified as artwork vs subdivision.'},
+    {'id': 'auto-subdivide', 'name': 'Deterministic organic auto-subdivide', 'kind': 'deterministic-subdivision',
+     'paid': False, 'available': True,
+     'notes': 'Splits oversized regions with seeded organic (sine-wiggled) cuts until the target region count; true-vector, no rasterization.'},
+    {'id': 'difficulty-analyzer', 'name': 'Difficulty analyzer', 'kind': 'qa',
+     'paid': False, 'available': True,
+     'notes': 'Deterministic difficulty profile (region count, zoom, tiny regions, label clearance, palette ambiguity, adjacency) per revision.'},
     {'id': 'provider-vectorizer', 'name': 'External image-to-SVG provider', 'kind': 'raster-to-vector',
      'paid': True, 'available': False,
      'notes': 'Optional paid external vectorizer. Requires server-side credentials (VECTORIZER_API_KEY); disabled without them.'},
-    {'id': 'provider-svg-generation', 'name': 'AI SVG generation', 'kind': 'svg-generation',
+    {'id': 'provider-svg-generation', 'name': 'AI SVG generation', 'kind': 'vector-generation',
      'paid': True, 'available': False,
      'notes': 'Separate paid route: the configured chat provider drafts an SVG master from the brief. Sanitized before import.'},
+    {'id': 'provider-svg-multistage', 'name': 'AI multi-stage SVG generation', 'kind': 'vector-generation',
+     'paid': True, 'available': False,
+     'notes': 'Paid route: strict-JSON scene plan (object bboxes, z order, fills) then one vector fragment per object, composed into a single sanitized master; next build auto-subdivides.'},
 ]
 
 
@@ -284,6 +301,426 @@ def pack_region(geometry, rid: str, pid: int, object_id: str = 'unassigned',
             'rings': [[[float(x), float(y)] for x, y in ring] for ring in legacy],
             'note': 'Pre-upgrade pixel-edge polygon of the same region; comparison/verification only (staircase edges at zoom).'}
     return region
+
+
+# ---------------------------------------------------------------------------
+# Cut / pen geometry engine (stage-2 region topology tools)
+# ---------------------------------------------------------------------------
+
+def flatten_d(d: str, tol: float = FLATTEN_TOLERANCE) -> List[List[Tuple[float, float]]]:
+    """Flatten an M/L/C/Q/Z path string into polylines (one per subpath).
+
+    Open paths stay open (cut lines); a Z closes the ring back to its start
+    (rings are stored without the duplicated closing vertex — Polygon()
+    closes implicitly, which auto-closes pen loops missing their Z).
+    """
+    cmds = parse_path(d)
+    out: List[List[Tuple[float, float]]] = []
+    for sub in subpaths_of(cmds):
+        pts = flatten_subpath(sub, tol)
+        if len(pts) >= 2:
+            out.append([(float(x), float(y)) for x, y in pts])
+    return out
+
+
+def polyline_d(coords) -> str:
+    """M/L path string for a coordinate run (open; no closing Z)."""
+    pts = [(float(x), float(y)) for x, y in coords]
+    if len(pts) < 2:
+        return ''
+    return 'M ' + ' L '.join(f'{number(x)},{number(y)}' for x, y in pts)
+
+
+def _polys(geom) -> List[Polygon]:
+    """Valid, non-empty polygon parts of any geometry (split results)."""
+    out: List[Polygon] = []
+    for part in polygon_parts(geom):
+        if part is None or part.is_empty or part.area <= 0:
+            continue
+        if not part.is_valid:
+            part = make_valid(part)
+        if part.geom_type == 'Polygon':
+            out.append(part)
+        else:
+            out.extend(p for p in polygon_parts(part) if p.geom_type == 'Polygon' and p.area > 0)
+    return [p for p in out if p.is_valid and p.area > 0]
+
+
+def cut_polygon(poly: Polygon, polyline) -> List[Polygon]:
+    """Split a polygon with an open polyline (the cut tool's engine).
+
+    The polyline is extended beyond the polygon's bbox on both ends so a
+    crossing line always severs the polygon completely. ``split`` handles
+    the clean case; carving a hair-thin buffered corridor and taking the
+    difference is the robust fallback.
+    """
+    pts = [(float(x), float(y)) for x, y in polyline]
+    if len(pts) < 2:
+        return []
+    if poly.is_empty or poly.area <= 0:
+        return []
+    if not poly.is_valid:
+        poly = make_valid(poly)
+    if poly.geom_type != 'Polygon':
+        base = [p for p in polygon_parts(poly) if p.area > 0]
+        if not base:
+            return []
+        poly = base[0] if len(base) == 1 else _safe_union(base)
+    x0, y0, x1, y1 = poly.bounds
+    pad = math.hypot(x1 - x0, y1 - y0) + 8.0
+
+    def _ext(a, b):
+        dx, dy = a[0] - b[0], a[1] - b[1]
+        n = math.hypot(dx, dy)
+        return (a[0] + dx / n * pad, a[1] + dy / n * pad) if n > 1e-12 else a
+
+    line = LineString([_ext(pts[0], pts[1]), *pts, _ext(pts[-1], pts[-2])])
+    pieces: List[Polygon] = []
+    try:
+        pieces = _polys(split(poly, line))
+    except Exception:
+        pieces = []
+    if len(pieces) < 2:
+        try:
+            carved = _polys(make_valid(poly.difference(line.buffer(0.01))))
+        except Exception:
+            carved = []
+        if len(carved) >= 2:
+            pieces = carved
+    return pieces
+
+
+def _ref_lines(refs) -> List[LineString]:
+    lines: List[LineString] = []
+    for ref in refs or []:
+        if isinstance(ref, LineString):
+            lines.append(ref)
+        elif hasattr(ref, 'geom_type') and not isinstance(ref, (Polygon, Point)):
+            for part in getattr(ref, 'geoms', [ref]):
+                if isinstance(part, LineString) and len(part.coords) >= 2:
+                    lines.append(part)
+        elif ref and len(ref) >= 2 and not hasattr(ref, 'geom_type'):
+            lines.append(LineString([(float(x), float(y)) for x, y in ref]))
+    return [l for l in lines if not l.is_empty]
+
+
+def classify_outline(outline_coords, ref_lines, tol: float = EDGE_CLASSIFY_TOL,
+                     near_kind: str = 'subdivision', far_kind: str = 'artwork') -> List[Tuple[str, list]]:
+    """Split an outline into consecutive runs by proximity to reference lines.
+
+    Walks consecutive outline point pairs, classifies each segment by the
+    minimum distance of its midpoint to any reference LineString, then
+    merges consecutive same-kind runs. Returns [(kind, coords-run)].
+    """
+    coords = [(float(x), float(y)) for x, y in outline_coords]
+    if len(coords) < 2:
+        return []
+    lines = _ref_lines(ref_lines)
+    if not lines:
+        return [(far_kind, coords)]
+    tree = STRtree(lines)
+    runs: List[list] = []
+    for i in range(len(coords) - 1):
+        p = Point((coords[i][0] + coords[i + 1][0]) / 2.0, (coords[i][1] + coords[i + 1][1]) / 2.0)
+        j = tree.nearest(p)
+        dist = lines[int(j)].distance(p) if j is not None else 1e9
+        kind = near_kind if dist <= tol else far_kind
+        if runs and runs[-1][0] == kind:
+            runs[-1][1].append(coords[i + 1])
+        else:
+            runs.append([kind, [coords[i], coords[i + 1]]])
+    return [(kind, pts) for kind, pts in runs]
+
+
+class _RegionIndex:
+    """Region polygons + STRtree for geometric left/right neighbor probing."""
+
+    def __init__(self, regions):
+        self.ids = [r['id'] for r in regions]
+        self.polys = []
+        for r in regions:
+            p = region_polygon(r)
+            if p.is_empty or p.area <= 0:
+                p = make_valid(p)
+            self.polys.append(p)
+        self.tree = STRtree(self.polys) if self.polys else None
+
+    def owner(self, x: float, y: float, max_dist: float = 0.75):
+        """Region id owning a probe point (covers first, nearest fallback)."""
+        if self.tree is None:
+            return None
+        p = Point(x, y)
+        idxs = [int(i) for i in np.atleast_1d(self.tree.query(p.buffer(max_dist + 0.25)))]
+        if not idxs:
+            return None
+        covering = [i for i in idxs if self.polys[i].covers(p)]
+        if len(covering) == 1:
+            return self.ids[covering[0]]
+        if covering:
+            return None                     # probe sits on a shared boundary
+        best, best_d = None, max_dist
+        for i in idxs:
+            d = self.polys[i].distance(p)
+            if d <= best_d:
+                best, best_d = self.ids[i], d
+        return best
+
+
+def _edge_sides(p0, p1, index: '_RegionIndex', offset: float = 1.2):
+    """Probe both perpendicular sides of a segment for owning region ids."""
+    dx, dy = float(p1[0]) - float(p0[0]), float(p1[1]) - float(p0[1])
+    n = math.hypot(dx, dy)
+    if n < 1e-9 or index is None:
+        return None, None
+    px, py = -dy / n, dx / n
+    mx, my = (float(p0[0]) + float(p1[0])) / 2.0, (float(p0[1]) + float(p1[1])) / 2.0
+    left = index.owner(mx + offset * px, my + offset * py)
+    right = index.owner(mx - offset * px, my - offset * py)
+    return left, right
+
+
+def _next_edge_id(edges: list) -> str:
+    n = 0
+    for e in edges:
+        m = _re.match(r'^e-(\d+)$', str(e.get('id', '')))
+        if m:
+            n = max(n, int(m.group(1)))
+    return f'e-{n + 1:04d}'
+
+
+def _emit_edge(edges: list, coords, kind: str, left, right, index: '_RegionIndex' | None,
+               self_id: str | None = None) -> None:
+    """Append one EdgeEntry for a coordinate run (neighbors probed if unset).
+
+    The probe uses the run's LONGEST segment (a real boundary segment), never
+    the start->end chord (a chord can cut across the region and return
+    neighbors that do not border the boundary at all). ``self_id`` (the region
+    whose outline produced the run) is guaranteed one side when given.
+    """
+    d = polyline_d(coords)
+    if not d:
+        return
+    if left is None and right is None and index is not None and len(coords) >= 2:
+        pts = [(float(x), float(y)) for x, y in coords]
+        seg = max(range(len(pts) - 1),
+                  key=lambda i: math.hypot(pts[i + 1][0] - pts[i][0], pts[i + 1][1] - pts[i][1]))
+        left, right = _edge_sides(pts[seg], pts[seg + 1], index)
+    if self_id is not None and self_id not in (left, right):
+        # The run lies on self's boundary: keep the probed neighbor on one side.
+        other = left if left not in (None, self_id) else right
+        left, right = self_id, (other if other not in (None, self_id) else None)
+    edges.append({'id': _next_edge_id(edges), 'd': d, 'kind': kind,
+                  'leftRegion': left, 'rightRegion': right})
+
+
+def _emit_classified_edges(edges: list, poly: Polygon, ref_lines, near_kind: str,
+                           far_kind: str, index: '_RegionIndex',
+                           prior_art_lines: List[LineString] | None = None,
+                           self_id: str | None = None) -> None:
+    """Classify a polygon's rings against reference lines and emit edges.
+
+    ``prior_art_lines`` (cut action): runs classified near the cut keep the
+    ARTWORK kind when they hug a prior artwork boundary of the target.
+    ``self_id``: the owning region id (cut piece / pen region); contract:
+    left/right = adjacent new region ids (or null at the canvas boundary).
+    """
+    if poly is None or poly.is_empty:
+        return
+    rings = [list(poly.exterior.coords)] + [list(ring.coords) for ring in poly.interiors]
+    for ring in rings:
+        if len(ring) < 3:
+            continue
+        runs = classify_outline(ring, ref_lines, EDGE_CLASSIFY_TOL, near_kind, far_kind)
+        if near_kind == 'subdivision' and prior_art_lines:
+            merged: List[list] = []
+            for kind, pts in runs:
+                if kind != 'subdivision' or len(pts) < 3:
+                    merged.append([kind, pts])
+                    continue
+                for k2, pts2 in classify_outline(pts, prior_art_lines, EDGE_CLASSIFY_TOL,
+                                                 'artwork', 'subdivision'):
+                    if merged and merged[-1][0] == k2 and merged[-1][1][-1] == pts2[0]:
+                        merged[-1][1].extend(pts2[1:])
+                    else:
+                        merged.append([k2, pts2])
+            runs = [(k, p) for k, p in merged]
+        for kind, pts in runs:
+            if len(pts) >= 2:
+                _emit_edge(edges, pts, kind, None, None, index, self_id)
+
+
+def _organic_cut_line(poly: Polygon, seed: int) -> List[Tuple[float, float]]:
+    """Deterministic hand-cut-looking polyline through a polygon's centroid.
+
+    A line roughly perpendicular to the major axis (minimum rotated rect),
+    perturbed with a small sine wiggle (amplitude 2-4% of the extent, >= 8
+    samples) so boundaries look hand-cut instead of mechanical.
+    """
+    rng = random.Random(seed)
+    cx, cy = poly.centroid.x, poly.centroid.y
+    x0, y0, x1, y1 = poly.bounds
+    long_v, length = (x1 - x0, 0.0), x1 - x0
+    try:
+        rect = poly.minimum_rotated_rectangle
+        coords = list(rect.exterior.coords) if rect.geom_type == 'Polygon' else []
+    except Exception:
+        coords = []
+    if len(coords) >= 4:
+        best = None
+        for i in range(len(coords) - 1):
+            ax, ay = coords[i]
+            bx, by = coords[i + 1]
+            L = math.hypot(bx - ax, by - ay)
+            if best is None or L > best[0]:
+                best = (L, (bx - ax, by - ay))
+        if best and best[0] > 0:
+            length, long_v = best
+    n = math.hypot(*long_v) or 1.0
+    ux, uy = long_v[0] / n, long_v[1] / n          # major axis (wiggle direction)
+    vx, vy = -uy, ux                               # perpendicular (cut direction)
+    extent = max(x1 - x0, y1 - y0, 1.0)
+    reach = extent * 1.3 + 6.0
+    amp = extent * (0.02 + 0.02 * rng.random())    # 2-4% of the region extent
+    phase = rng.uniform(0, math.tau)
+    waves = rng.uniform(1.5, 2.8)
+    samples = max(8, min(24, int(extent / 8) + 8))
+    pts = []
+    for i in range(samples + 1):
+        t = -1.0 + 2.0 * i / samples
+        w = amp * math.sin(phase + waves * math.pi * t)
+        pts.append((cx + t * reach * vx + w * ux, cy + t * reach * vy + w * uy))
+    return pts
+
+
+def _auto_subdivide(regions: list, settings: BuildSettings, edges: list,
+                    progress: Callable = lambda *_: None) -> int:
+    """Deterministically split oversized regions toward the target count.
+
+    While under target and the largest region is >= 2x the minimum playable
+    size, split it with an organic cut; both pieces are refit and the new
+    shared boundary is emitted as SUBDIVISION edges. Deterministic (seeded
+    by region id hash); loop bound 1200 splits.
+    """
+    target = int(settings.target_regions)
+    min_px = float(settings.min_region_pixels)
+    skip: set = set()
+    splits = 0
+    while len(regions) < target and splits < 1200:
+        pool = [r for r in regions if r['id'] not in skip]
+        if not pool:
+            break
+        largest = max(pool, key=lambda r: r['area'])
+        if largest['area'] < 2 * min_px:
+            break
+        seed = int(hashlib.sha256(largest['id'].encode()).hexdigest()[:8], 16)
+        poly = region_polygon(largest)
+        if poly.is_empty or poly.area <= 0:
+            skip.add(largest['id'])
+            continue
+        if not poly.is_valid:
+            poly = make_valid(poly)
+        if poly.geom_type != 'Polygon':
+            parts = [p for p in polygon_parts(poly) if p.area > 0]
+            if not parts:
+                skip.add(largest['id'])
+                continue
+            poly = parts[0] if len(parts) == 1 else _safe_union(parts)
+        line = _organic_cut_line(poly, seed)
+        pieces = cut_polygon(poly, line)
+        if len(pieces) < 2 or any(p.area < min_px for p in pieces):
+            skip.add(largest['id'])       # this cut would create untappable pieces
+            continue
+        regions.remove(largest)
+        new_ids = []
+        for idx, piece in enumerate(pieces):
+            rid = 'r-d-' + hashlib.sha256((largest['id'] + str(seed) + str(idx)).encode()).hexdigest()[:12]
+            reg = pack_region(piece, rid, largest['paletteId'], largest['objectId'],
+                              source='subdivision-split', fit_tolerance=float(settings.curve_tolerance))
+            if largest.get('masterShapeId'):
+                reg['masterShapeId'] = largest['masterShapeId']
+            regions.append(reg)
+            new_ids.append(rid)
+        # The new boundary is the cut line clipped to the region: subdivision.
+        left, right = (new_ids[0], new_ids[1]) if len(new_ids) >= 2 else (None, None)
+        try:
+            shared = LineString(line).intersection(poly)
+        except Exception:
+            shared = None
+        segs = [shared] if isinstance(shared, LineString) else list(getattr(shared, 'geoms', []) or [])
+        for seg in segs:
+            if isinstance(seg, LineString) and len(seg.coords) >= 2:
+                _emit_edge(edges, list(seg.coords), 'subdivision', left, right, None)
+        splits += 1
+        if splits % 25 == 0:
+            progress(.58, f'Subdividing large regions: {len(regions)}/{target} tap targets')
+    # Re-splitting removes earlier piece ids: drop their now-stale edges.
+    live = {r['id'] for r in regions}
+    edges[:] = [e for e in edges
+                if all(v is None or v in live for v in (e.get('leftRegion'), e.get('rightRegion')))]
+    return splits
+
+
+def _emit_master_edges(regions: list, doc, edges: list) -> None:
+    """Emit EdgeEntries for compiled SVG-master regions (contract 1: edges).
+
+    Verbatim regions keep their own master path as ONE artwork edge (their
+    boundary IS the master path). Derived regions (visible-surface refits,
+    subdivision pieces) get their outline classified against the union of
+    master-shape boundaries: within ~1.5px = artwork, else subdivision.
+    """
+    ref_lines: List[LineString] = []
+    for s in doc.shapes:
+        for ring in s.get('rings') or []:
+            if ring and len(ring) >= 2:
+                ref_lines.append(LineString([(float(x), float(y)) for x, y in ring]))
+    if not ref_lines:
+        return
+    index = _RegionIndex(regions)
+    for r in regions:
+        if r.get('master', {}).get('source') == 'svg-master-import':
+            edges.append({'id': _next_edge_id(edges), 'd': r['d'], 'kind': 'artwork',
+                          'leftRegion': r['id'], 'rightRegion': _outside_neighbor(r, index)})
+            continue
+        poly = region_polygon(r)
+        if poly is None or poly.is_empty:
+            continue
+        rings = [list(poly.exterior.coords)] + [list(ring.coords) for ring in poly.interiors]
+        for ring in rings:
+            if len(ring) < 3:
+                continue
+            for kind, pts in classify_outline(ring, ref_lines, EDGE_CLASSIFY_TOL, 'artwork', 'subdivision'):
+                if len(pts) >= 2:
+                    _emit_edge(edges, pts, kind, None, None, index, r['id'])
+
+
+def _outside_neighbor(r: dict, index: '_RegionIndex', samples: int = 10):
+    """Consensus non-self neighbour of a region's own outline (or null)."""
+    rings = r.get('flat', {}).get('rings') or r.get('rings') or []
+    ring = rings[0] if rings else []
+    if len(ring) < 3 or index.tree is None:
+        return None
+    counts: Dict[str, int] = {}
+    n = len(ring)
+    step = max(1, (n - 1) // samples)
+    for k in range(0, n - 1, step):
+        p0, p1 = ring[k], ring[(k + 1) % n]
+        left, right = _edge_sides(p0, p1, index)
+        for owner in (left, right):
+            if owner and owner != r['id']:
+                counts[owner] = counts.get(owner, 0) + 1
+    if not counts:
+        return None
+    best = max(sorted(counts.items()), key=lambda kv: kv[1])
+    return best[0] if best[1] >= 2 or len(counts) == 1 else None
+
+
+def _prune_edges(g: dict, removed_ids: set) -> None:
+    """Drop edge entries whose left/right reference deleted region ids."""
+    edges = g.get('edges')
+    if not edges or not removed_ids:
+        return
+    g['edges'] = [e for e in edges
+                  if e.get('leftRegion') not in removed_ids and e.get('rightRegion') not in removed_ids]
 
 
 # ---------------------------------------------------------------------------
@@ -1048,6 +1485,102 @@ def _rasterize_regions(regs, w, h):
 
 
 # ---------------------------------------------------------------------------
+# Difficulty profile (contract 5: deterministic analyzer)
+# ---------------------------------------------------------------------------
+
+def _hex_rgb(hx: str):
+    return tuple(int(hx[i:i + 2], 16) for i in (1, 3, 5))
+
+
+def difficulty_profile(bundle: dict) -> dict:
+    """Deterministic difficulty profile of a compiled bundle (contract 5).
+
+    Weighted score 0-100; rating easy <25 <= medium <50 <= hard <75 <= master.
+    ``difficultyValidatedByPlaytest`` stays False until a real playtest.
+    """
+    g, p = bundle['geometry'], bundle['palette']
+    regs = g.get('regions') or []
+    w, h = float(g['viewBox'][2]), float(g['viewBox'][3])
+    count = len(regs)
+    areas = [float(r['area']) for r in regs] or [1.0]
+    median = float(np.median(areas))
+    tiny = sum(1 for a in areas if a < 400.0 or a < 0.4 * median)
+    tiny_pct = tiny / max(1, count)
+    # requiredZoom: worst-case zoom for a 44px touch target from a fit viewport
+    # (nominal 380px board width); inscribed-diameter proxy 2*sqrt(area/pi).
+    scale = 380.0 / max(1.0, w)
+    worst = min(2.0 * math.sqrt(max(a, 1e-6) / math.pi) for a in areas)
+    required_zoom = 44.0 / max(1e-6, worst * scale)
+    # label clearance from existing label data
+    conflicts = tight = 0
+    for r in regs:
+        lab = r.get('label') or {}
+        clearance, font = float(lab.get('clearance', 0.0)), float(lab.get('fontSize', 0.0))
+        if clearance <= 0 or font < 3.5 or clearance < font * 0.5:
+            conflicts += 1
+        elif clearance < font * 1.2:
+            tight += 1
+    if conflicts:
+        label_clearance = 'conflict'
+    elif tight > 0.2 * count:
+        label_clearance = 'tight'
+    else:
+        label_clearance = 'ok'
+    # palette ambiguity: closest RGB pair distance + group count
+    rgbs = [_hex_rgb(entry['hex']) for entry in p if SAFE_HEX.match(entry.get('hex', ''))]
+    closest = 442.0
+    for i in range(len(rgbs)):
+        for j in range(i + 1, len(rgbs)):
+            d = math.sqrt(sum((a - b) ** 2 for a, b in zip(rgbs[i], rgbs[j])))
+            closest = min(closest, d)
+    if len(rgbs) < 2:
+        ambiguity = 'low'
+    elif closest < 45:
+        ambiguity = 'high'
+    elif closest < 90 or len(rgbs) >= 28:
+        ambiguity = 'medium'
+    else:
+        ambiguity = 'low'
+    # adjacency (cap: sample the largest 300 regions when huge)
+    sample = regs if count <= 300 else sorted(regs, key=lambda r: -r['area'])[:300]
+    polys = [region_polygon(r) for r in sample]
+    polys = [q for q in polys if not q.is_empty and q.area > 0]
+    degrees = 0.0
+    if len(polys) > 1:
+        tree = STRtree(polys)
+        for i, q in enumerate(polys):
+            for j in np.atleast_1d(tree.query(q.buffer(0.5))):
+                if int(j) != i and q.touches(polys[int(j)]):
+                    degrees += 1
+        degrees /= len(polys)
+    edges = g.get('edges') or []
+    sub_edges = sum(1 for e in edges if e.get('kind') == 'subdivision')
+    density = count / max(1e-6, w * h / 10000.0)
+    metrics = {
+        'regionCount': count,
+        'medianRegionArea': round(median, 2),
+        'tinyRegionPct': round(tiny_pct, 4),
+        'requiredZoom': round(min(required_zoom, 99.0), 2),
+        'labelClearance': label_clearance,
+        'paletteAmbiguity': ambiguity,
+        'paletteGroups': len(p),
+        'avgNeighbors': round(degrees, 3),
+        'subdivisionEdges': sub_edges,
+        'objectDensity': round(density, 3),
+    }
+    score = (min(1.0, count / 400.0) * 22
+             + min(1.0, tiny_pct / 0.5) * 15
+             + min(1.0, required_zoom / 8.0) * 21
+             + {'ok': 0.0, 'tight': 0.5, 'conflict': 1.0}[label_clearance] * 10
+             + {'low': 0.0, 'medium': 0.5, 'high': 1.0}[ambiguity] * 10
+             + min(1.0, degrees / 8.0) * 12
+             + min(1.0, density / 10.0) * 10)
+    score = round(min(100.0, max(0.0, score)), 1)
+    rating = 'easy' if score < 25 else ('medium' if score < 50 else ('hard' if score < 75 else 'master'))
+    return {'rating': rating, 'score': score, 'metrics': metrics}
+
+
+# ---------------------------------------------------------------------------
 # Bundle emission
 # ---------------------------------------------------------------------------
 
@@ -1055,6 +1588,9 @@ def emit_bundle(folder: Path, bundle: dict, previews=True) -> dict:
     folder.mkdir(parents=True, exist_ok=True)
     m, g, p, paint = bundle['manifest'], bundle['geometry'], bundle['palette'], bundle['paint']
     m['regionCount'] = len(g['regions']); m['paletteCount'] = len(p)
+    # Difficulty profile (contract 5): recomputed for every revision; replaces
+    # the 'unrated' placeholder. difficultyValidatedByPlaytest stays False.
+    m['difficulty'] = difficulty_profile(bundle)
     w, h = map(int, g['viewBox'][2:]); vb = svg_open(w, h)
     write_json(folder / 'regions.json', g); write_json(folder / 'palette.json', p); write_json(folder / 'paint.json', paint)
     m['contentHash'] = hashlib.sha256(b''.join((folder / f).read_bytes() for f in ['regions.json', 'palette.json', 'paint.json'])).hexdigest()
@@ -1082,6 +1618,9 @@ def emit_bundle(folder: Path, bundle: dict, previews=True) -> dict:
     if not qa['passed']:
         raise ValueError('Asset validation failed: ' + '; '.join(qa['errors'][:5]))
     m['qa'] = {'status': 'draft-needs-human-review', 'passedGeometryChecks': True, 'humanReviewed': False}
+    qa['difficulty'] = {'rating': m['difficulty']['rating'], 'score': m['difficulty']['score'],
+                        'metrics': m['difficulty']['metrics'],
+                        'note': 'Deterministic analyzer; difficultyValidatedByPlaytest stays false until a real playtest.'}
     write_json(folder / 'validation.json', qa)
     if previews:
         import cairosvg
@@ -1379,7 +1918,15 @@ def compile_svg_master(source: Path, output: Path, *, artwork_id: str, version: 
             regions.append(reg)
     if not regions:
         raise ValueError('No playable regions in the SVG master; shapes are too small.')
-    progress(.55, 'Emitting the detailed paint layer (order, strokes and gradients preserved)')
+    # Stage-2 deterministic auto-subdivide (contract 6): close the gap between
+    # authored shape count and a rich gameplay region count, true-vector only.
+    edges: List[dict] = []
+    if settings.auto_subdivide:
+        progress(.58, f'Subdividing large regions toward ~{settings.target_regions} tap targets')
+        _auto_subdivide(regions, settings, edges, progress)
+    progress(.66, 'Classifying artwork boundaries vs subdivision edges')
+    _emit_master_edges(regions, doc, edges)
+    progress(.70, 'Emitting the detailed paint layer (order, strokes and gradients preserved)')
     paint_paths = []
     gradients = []
     for s in doc.shapes:
@@ -1433,6 +1980,8 @@ def compile_svg_master(source: Path, output: Path, *, artwork_id: str, version: 
                 'backend': 'svg-master', 'flattenTolerance': FLATTEN_TOLERANCE,
                 'curveFitTolerance': settings.curve_tolerance, 'partitionTolerance': round(overlap_allowance + 0.01, 3),
                 'visibleRegionGeometry': True,
+                'edges': edges,
+                'boundaryStyle': BOUNDARY_STYLE_DEFAULT,
                 'importReport': doc.report, 'regions': regions, 'decorations': decorations, 'detailPaths': []}
     manifest = {'schemaVersion': 1, 'format': SCHEMA, 'id': artwork_id, 'version': version, 'title': title,
                 'description': 'Compiled from a sanitized SVG master: curves, holes, gradients, transforms and drawing order preserved; regions are visible surfaces.',
@@ -1453,7 +2002,7 @@ def compile_svg_master(source: Path, output: Path, *, artwork_id: str, version: 
     bundle = {'manifest': manifest, 'geometry': geometry, 'palette': palette, 'paint': paint}
     output.mkdir(parents=True, exist_ok=True)
     shutil.copy2(source, output / 'source-master.svg')
-    progress(.72, 'Checking topology, labels and runtime exports')
+    progress(.86, 'Checking topology, labels and runtime exports')
     qa = emit_bundle(output, bundle)
     write_json(output / 'build-settings.json', settings.model_dump())
     progress(1, 'SVG-master bundle ready for review')
@@ -1568,12 +2117,34 @@ def edit_bundle(source: Path, output: Path, request, version: str):
     bundle = load_bundle(source); g = bundle['geometry']; m = bundle['manifest']
     settings = read_json(source / 'build-settings.json') if (source / 'build-settings.json').is_file() else {}
     fit_tolerance = float(settings.get('curve_tolerance', 1.0))
+    min_px = float(settings.get('min_region_pixels', 35))
     regs = {r['id']: r for r in g['regions']}
-    chosen = [regs.get(rid) for rid in dict.fromkeys(request.region_ids)]
-    if any(r is None for r in chosen):
+    chosen_ids = list(dict.fromkeys(request.region_ids))
+    if any(rid not in regs for rid in chosen_ids) and request.action != 'draw':
         raise ValueError('Select existing playable regions from the current revision.')
+    if request.action == 'draw' and chosen_ids:
+        raise ValueError('The pen tool takes no region selection; draw the shape over empty canvas instead.')
+    chosen = [regs[rid] for rid in chosen_ids if rid in regs]
+    # Per-action selection counts (contract addendum):
+    # merge>=2, split/cut/label=1, draw=0, others>=1.
+    need = {'merge': 2, 'split': 1, 'cut': 1, 'label': 1}.get(request.action, 1)
+    if request.action == 'draw':
+        if chosen:
+            raise ValueError('The pen tool takes no region selection.')
+    elif len(chosen) < need:
+        hint = ('two or more adjacent regions' if request.action == 'merge'
+                else 'exactly one region' if request.action in ('split', 'cut', 'label')
+                else 'at least one region')
+        raise ValueError(f'Select {hint} for this action.')
+    elif request.action in ('split', 'cut', 'label') and len(chosen) != 1:
+        raise ValueError('Select exactly one region for this action.')
     valid_palette = {p['id'] for p in bundle['palette']}
-    pid = request.palette_id or chosen[0]['paletteId']
+    if request.action == 'draw':
+        if request.palette_id is None:
+            raise ValueError('Choose a number group (palette) for the drawn region.')
+        pid = int(request.palette_id)
+    else:
+        pid = request.palette_id or chosen[0]['paletteId']
     if pid not in valid_palette: raise ValueError('Unknown palette group.')
     if request.action == 'merge':
         if len(chosen) < 2: raise ValueError('Select two or more adjacent regions.')
@@ -1582,6 +2153,7 @@ def edit_bundle(source: Path, output: Path, request, version: str):
             raise ValueError('Merge only edge-adjacent regions; disconnected pieces cannot be one tap target.')
         used = set(request.region_ids)
         g['regions'] = [r for r in g['regions'] if r['id'] not in used]
+        _prune_edges(g, used)
         merged_id = 'r-m-' + hashlib.sha256(('|'.join(sorted(used)) + version).encode()).hexdigest()[:12]
         # curve-preserving refit: corners & straight architectural edges survive
         merged = pack_region(union, merged_id, pid, chosen[0]['objectId'],
@@ -1598,10 +2170,97 @@ def edit_bundle(source: Path, output: Path, request, version: str):
         if len(parts) < 2:
             raise ValueError('This region is already a single connected tap target.')
         g['regions'] = [r for r in g['regions'] if r['id'] != target['id']]
+        _prune_edges(g, {target['id']})
         for idx, (part_cmds, _rings) in enumerate(parts):
             split_id = 'r-s-' + hashlib.sha256((target['id'] + version + str(idx)).encode()).hexdigest()[:12]
             g['regions'].append(pack_region(part_cmds, split_id, target['paletteId'], target['objectId'],
                                             source='split-disconnected', fit_tolerance=0.0))
+    elif request.action == 'cut':
+        if len(chosen) != 1: raise ValueError('Select exactly one region to cut.')
+        if not request.d:
+            raise ValueError('Draw a cut line first: the pen line must cross the whole region.')
+        target = chosen[0]
+        cut_polys = flatten_d(request.d)
+        if not cut_polys:
+            raise ValueError('The cut line path is empty or unparsable.')
+        line = max(cut_polys, key=len)
+        target_poly = region_polygon(target)
+        pieces = cut_polygon(target_poly, line)
+        if len(pieces) < 2 or any(p.area < min_px for p in pieces):
+            smallest = min((p.area for p in pieces), default=target_poly.area)
+            raise ValueError(f'The cut line must cross the whole region; pieces of {smallest:.0f} px² are too '
+                             f'small to tap. Draw the line from outside one edge to outside the opposite edge.')
+        # Prior artwork edges of the target keep their classification.
+        prior_art_lines: List[LineString] = []
+        for e in g.get('edges') or []:
+            if e.get('kind') == 'artwork' and target['id'] in (e.get('leftRegion'), e.get('rightRegion')):
+                prior_art_lines.extend(_ref_lines(flatten_d(e.get('d', ''))))
+        g['regions'] = [r for r in g['regions'] if r['id'] != target['id']]
+        if g.get('edges') is not None:
+            g['edges'] = [e for e in g['edges']
+                          if target['id'] not in (e.get('leftRegion'), e.get('rightRegion'))]
+        new_regions = []
+        for idx, piece in enumerate(pieces):
+            cut_id = 'r-c-' + hashlib.sha256((target['id'] + version + str(idx)).encode()).hexdigest()[:12]
+            reg = pack_region(piece, cut_id, target['paletteId'], target['objectId'],
+                              source='cut-region', fit_tolerance=fit_tolerance)
+            if target.get('masterShapeId'):
+                reg['masterShapeId'] = target['masterShapeId']
+            g['regions'].append(reg)
+            new_regions.append(reg)
+        g.setdefault('edges', [])
+        g.setdefault('boundaryStyle', BOUNDARY_STYLE_DEFAULT)
+        index = _RegionIndex(g['regions'])
+        cut_ref = [LineString(line)]
+        for reg, piece in zip(new_regions, pieces):
+            _emit_classified_edges(g['edges'], piece, cut_ref, 'subdivision', 'artwork',
+                                   index, prior_art_lines, self_id=reg['id'])
+        deviation = max(region_polygon(reg).symmetric_difference(piece).area
+                        for reg, piece in zip(new_regions, pieces))
+        g['partitionTolerance'] = round(float(g.get('partitionTolerance', 0.0)) + deviation + 0.01, 3)
+    elif request.action == 'draw':
+        if not request.d:
+            raise ValueError('Draw a closed shape first (the pen region path).')
+        rings = flatten_d(request.d)
+        if not rings or any(len(ring) < 3 for ring in rings):
+            raise ValueError('Draw a closed shape with at least three points.')
+        # Flatten closes rings implicitly (Polygon closes open loops: a
+        # missing Z auto-closes by joining the last point back to the first).
+        solids = solid_polygons(rings, 'evenodd')
+        poly = _safe_union(solids) if len(solids) > 1 else (solids[0] if solids else Polygon())
+        if poly.is_empty or poly.area < min_px:
+            raise ValueError(f'The drawn shape is only {max(0.0, float(poly.area)):.0f} px²; '
+                             f'playable regions need at least {min_px:.0f} px² to tap.')
+        existing = [region_polygon(r) for r in g['regions'] + g.get('decorations', [])]
+        existing = [p for p in existing if not p.is_empty and p.area > 0]
+        cover = _safe_union(existing) if existing else Polygon()
+        try:
+            visible = make_valid(poly.difference(cover))
+        except Exception:
+            visible = Polygon()
+        parts = _polys(visible)
+        usable = [p for p in parts if p.area >= min_px]
+        if not usable:
+            raise ValueError('The drawn shape overlaps fully with existing regions; '
+                             'draw over empty canvas instead.')
+        drawn_ref = [LineString(ring) for ring in rings]
+        new_regions = []
+        for idx, piece in enumerate(usable):
+            pen_id = 'r-p-' + hashlib.sha256((request.d + version + str(idx)).encode()).hexdigest()[:12]
+            # Pen regions are gameplay-only surfaces: NO paint.json path is
+            # added (white tap target that colors in; the artist recolors later).
+            reg = pack_region(piece, pen_id, int(pid), request.group,
+                              source='pen-drawn', fit_tolerance=fit_tolerance)
+            g['regions'].append(reg)
+            new_regions.append(reg)
+        g.setdefault('edges', [])
+        g.setdefault('boundaryStyle', BOUNDARY_STYLE_DEFAULT)
+        index = _RegionIndex(g['regions'])
+        for reg, piece in zip(new_regions, usable):
+            # Outline segments near the drawn path are artwork; the subtraction
+            # segments bordering existing regions are subdivision.
+            _emit_classified_edges(g['edges'], piece, drawn_ref, 'artwork', 'subdivision', index,
+                                   self_id=reg['id'])
     elif request.action == 'group':
         for r in chosen: r['objectId'] = request.group
     elif request.action == 'palette':
@@ -1627,6 +2286,7 @@ def edit_bundle(source: Path, output: Path, request, version: str):
         if len(chosen) >= len(g['regions']): raise ValueError('Keep at least one playable region.')
         remove = set(request.region_ids)
         g['regions'] = [r for r in g['regions'] if r['id'] not in remove]
+        _prune_edges(g, remove)
         g['decorations'].extend(chosen)
     groups = defaultdict(list)
     for r in g['regions']:
@@ -1707,6 +2367,48 @@ def validate_runtime_contract(bundle: dict) -> list:
             errors.append('Unsafe gradient id.')
         if gr.get('type') not in ('linear', 'radial') or not gr.get('stops'):
             errors.append('Invalid gradient definition.')
+    # Optional edges (stage-2 boundary contract): id/path/kind + region refs
+    # must exist; boundaryStyle overrides must stay shapely-safe.
+    edges = g.get('edges')
+    if edges is not None:
+        if not isinstance(edges, list):
+            errors.append('Invalid edges.')
+        else:
+            edge_ids = set()
+            for e in edges:
+                if not isinstance(e, dict):
+                    errors.append('Invalid edge entry.')
+                    continue
+                eid = str(e.get('id', ''))
+                if not SAFE_ID.match(eid) or eid in edge_ids:
+                    errors.append(f'Duplicate or unsafe edge ID: {eid}')
+                edge_ids.add(eid)
+                if not isinstance(e.get('d'), str) or not SAFE_D_OPEN.match(e['d']):
+                    errors.append(f'Invalid edge path data: {eid}')
+                if e.get('kind') not in EDGE_KINDS:
+                    errors.append(f'Invalid edge kind: {eid}')
+                for side in ('leftRegion', 'rightRegion'):
+                    value = e.get(side)
+                    if value is not None and value not in seen:
+                        errors.append(f'Edge {eid} references an unknown region.')
+            style = g.get('boundaryStyle')
+            if style is not None:
+                if not isinstance(style, dict):
+                    errors.append('Invalid boundaryStyle.')
+                else:
+                    for kind in EDGE_KINDS:
+                        part = style.get(kind)
+                        if part is None:
+                            continue
+                        if (not isinstance(part, dict) or not isinstance(part.get('stroke'), str)
+                                or not SAFE_HEX.match(part['stroke'])
+                                or not isinstance(part.get('strokeWidth'), (int, float))
+                                or not (part['strokeWidth'] > 0)):
+                            errors.append(f'Invalid boundaryStyle.{kind}.')
+                            continue
+                        dash = part.get('dash')
+                        if dash is not None and (not isinstance(dash, str) or len(dash) > 40):
+                            errors.append(f'Invalid boundaryStyle.{kind}.dash.')
     return errors
 
 
@@ -1715,7 +2417,7 @@ def _runtime_geometry(g: dict) -> dict:
     keep = ('schemaVersion', 'geometrySchema', 'source', 'artworkId', 'artworkVersion',
             'viewBox', 'fillRule', 'stroke', 'strokeWidth', 'backend',
             'flattenTolerance', 'curveFitTolerance', 'partitionTolerance',
-            'visibleRegionGeometry', 'detailPaths')
+            'visibleRegionGeometry', 'detailPaths', 'edges', 'boundaryStyle')
     out = {k: v for k, v in g.items() if k in keep}
     out['regions'] = [{k: r[k] for k in RUNTIME_REGION_KEYS if k in r} for r in g.get('regions', [])]
     out['decorations'] = []
@@ -1794,6 +2496,7 @@ def make_export(folder: Path, include_authoring=False):
                                 'The runtime bundle was contract-checked against that adapter before export. '
                                 'Geometry schema 2: regions[*].d is the AUTHORITATIVE curved path data (M/L/C/Q/Z); authoring duplicates (master/rings/flat/legacy) are stripped from the runtime export. '
                                 'Regions are visible surfaces: masks do not overlap, so any fill order colors correctly. '
+                                'geometry.edges (when present) carries boundary kinds: artwork = true master boundary (solid), subdivision = artificial gameplay boundary (light dashed); geometry.boundaryStyle overrides the default stroke/dash per kind; render region paths fill-only when edges exist. '
                                 'Preserve viewBox, per-region fill rules (evenodd/nonzero), gradients, contentHash and version. Do not stretch a full painting into each region. Do not use numbered.svg as hit-test metadata. Validation does not establish copyright clearance.\n')
     (folder / '.runtime-regions.json').unlink(missing_ok=True)
     (folder / '.runtime-paint.json').unlink(missing_ok=True)

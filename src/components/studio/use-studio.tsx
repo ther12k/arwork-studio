@@ -14,7 +14,7 @@
 import { createContext, useCallback, useContext, useEffect, useRef, useState } from "react";
 import { toast } from "sonner";
 
-import { loadBundle, VectorBoard, type BoardState, type Bundle } from "@/lib/detailed-board";
+import { loadBundle, VectorBoard, type BoardMode, type BoardState, type Bundle } from "@/lib/detailed-board";
 import {
   activateRevision,
   buildDraft,
@@ -55,6 +55,9 @@ export const VIEW_LABELS: Record<StudioView, string> = {
 };
 
 const PROJECT_STORAGE_KEY = "studio-project";
+const RECENT_COLORS_KEY = "cd-studio-recent-colors";
+const FREE_HEX_RE = /^#[0-9A-Fa-f]{6}$/;
+export type StudioTool = "select" | "cut" | "pen";
 const DEFAULT_BRIEF =
   "An original detailed woodland treehouse beside a waterfall, with warm lanterns, a winding staircase and flowering plants. Clear contours, coherent architecture, rich shading. No text, UI, palette or gameplay numbers.";
 
@@ -76,6 +79,21 @@ export interface StudioApi {
   selected: Set<string>;
   placing: boolean;
   selectionInfo: string;
+  /** Imperative VectorBoard instance (exposed for the Cut/Pen drawing overlay). */
+  boardRef: React.RefObject<VectorBoard | null>;
+  // board tools (active in the inspect view)
+  tool: StudioTool;
+  setTool: (t: StudioTool) => void;
+  /** Cut a region along a drawn line: edit action "cut" with the path d. */
+  cutRegion: (regionId: string, d: string) => Promise<void>;
+  /** Create a gameplay-only region from a drawn closed shape: edit action "draw". */
+  drawRegion: (d: string, paletteId: number, group?: string) => Promise<void>;
+  // free color (true custom colors, contract §4)
+  freeColor: string;
+  setBoardFreeColor: (hex: string) => void;
+  recentColors: string[];
+  boardMode: BoardMode;
+  setBoardMode: (mode: BoardMode) => void;
   // board action wrappers (safe to call from event handlers)
   setBoardPalette: (id: number) => void;
   findRegion: () => void;
@@ -109,7 +127,7 @@ export interface StudioApi {
   setEditPalette: (v: string) => void;
   setObjectGroup: (v: string) => void;
   setRevisionSelect: (v: string) => void;
-  setBuildSetting: (key: keyof BuildSettings, value: number | string) => void;
+  setBuildSetting: (key: keyof BuildSettings, value: number | string | boolean) => void;
   // SVG master generation inputs
   svgPrompt: string;
   setSvgPrompt: (v: string) => void;
@@ -117,6 +135,10 @@ export interface StudioApi {
   setSvgAspect: (v: "1024x1536" | "1536x1024" | "1024x1024") => void;
   svgPaidConsent: boolean;
   setSvgPaidConsent: (v: boolean) => void;
+  svgGenMode: "single" | "multistage";
+  setSvgGenMode: (v: "single" | "multistage") => void;
+  svgTargetRegions: number;
+  setSvgTargetRegions: (v: number) => void;
   // actions
   openProjectById: (pid: string) => Promise<void>;
   createNewProject: () => Promise<void>;
@@ -130,7 +152,7 @@ export interface StudioApi {
   generate: () => Promise<void>;
   generateSvg: () => Promise<void>;
   build: () => Promise<void>;
-  runEdit: (action: EditAction, extra?: Partial<EditPayload>) => Promise<void>;
+  runEdit: (action: EditAction, extra?: Partial<EditPayload>, regionIds?: string[]) => Promise<void>;
   clearSelection: () => void;
   startPlacing: () => void;
   /** Select a single region by id, switch to the board view and zoom to it (QA drill-down). */
@@ -189,6 +211,13 @@ export function StudioProvider({ children }: { children: React.ReactNode }) {
   const [svgPrompt, setSvgPrompt] = useState("");
   const [svgAspect, setSvgAspect] = useState<"1024x1536" | "1536x1024" | "1024x1024">("1024x1536");
   const [svgPaidConsent, setSvgPaidConsent] = useState(false);
+  const [svgGenMode, setSvgGenMode] = useState<"single" | "multistage">("single");
+  const [svgTargetRegions, setSvgTargetRegions] = useState(300);
+  // Board tools (inspect view) + free color + board mode (play view)
+  const [tool, setTool] = useState<StudioTool>("select");
+  const [freeColor, setFreeColor] = useState("#66AA33");
+  const [recentColors, setRecentColors] = useState<string[]>([]);
+  const [boardMode, setBoardMode] = useState<BoardMode>("number");
 
   // refs mirroring state for closures created once
   const projectRef = useRef<Project | null>(null);
@@ -212,6 +241,12 @@ export function StudioProvider({ children }: { children: React.ReactNode }) {
   const svgPromptRef = useRef(svgPrompt);
   const svgAspectRef = useRef(svgAspect);
   const svgPaidRef = useRef(svgPaidConsent);
+  const svgGenModeRef = useRef(svgGenMode);
+  const svgTargetRef = useRef(svgTargetRegions);
+  const toolRef = useRef<StudioTool>("select");
+  const boardModeRef = useRef<BoardMode>("number");
+  const freeColorRef = useRef(freeColor);
+  const appliedPendingPbsRef = useRef<string>("");
   const configRef = useRef<StudioConfig | null>(null);
 
   // DOM refs
@@ -231,6 +266,11 @@ export function StudioProvider({ children }: { children: React.ReactNode }) {
   useEffect(() => void (svgPromptRef.current = svgPrompt), [svgPrompt]);
   useEffect(() => void (svgAspectRef.current = svgAspect), [svgAspect]);
   useEffect(() => void (svgPaidRef.current = svgPaidConsent), [svgPaidConsent]);
+  useEffect(() => void (svgGenModeRef.current = svgGenMode), [svgGenMode]);
+  useEffect(() => void (svgTargetRef.current = svgTargetRegions), [svgTargetRegions]);
+  useEffect(() => void (toolRef.current = tool), [tool]);
+  useEffect(() => void (boardModeRef.current = boardMode), [boardMode]);
+  useEffect(() => void (freeColorRef.current = freeColor), [freeColor]);
   useEffect(() => void (configRef.current = config), [config]);
   useEffect(() => void (buildSettingsRef.current = buildSettings), [buildSettings]);
   useEffect(() => void (revisionSelectRef.current = revisionSelect), [revisionSelect]);
@@ -243,17 +283,35 @@ export function StudioProvider({ children }: { children: React.ReactNode }) {
 
   // ---------------------------------------------------------------- helpers
 
-  const setProjectSync = useCallback((next: Project | null) => {
-    projectRef.current = next;
-    setProject(next);
-    if (next) {
-      const current = next.revisions.find((r) => r.id === next.currentRevision);
-      const fallback = current?.id ?? next.revisions[0]?.id ?? "";
-      setRevisionSelect((prev) => (prev && next.revisions.some((r) => r.id === prev) ? prev : fallback));
-    } else {
-      setRevisionSelect("");
-    }
+  /** Prefill build settings from multi-stage generation hints (applied once
+   *  per distinct value — polls re-deliver the same object and must not fight
+   *  user edits). Called from setProjectSync (an event flow), never render. */
+  const applyPendingBuildSettings = useCallback((pbs: { auto_subdivide: boolean; target_regions: number }) => {
+    const key = JSON.stringify(pbs);
+    if (appliedPendingPbsRef.current === key) return;
+    appliedPendingPbsRef.current = key;
+    setBuildSettings((prev) => ({
+      ...prev,
+      auto_subdivide: !!pbs.auto_subdivide,
+      target_regions: Math.min(1600, Math.max(100, Math.round(pbs.target_regions) || prev.target_regions)),
+    }));
   }, []);
+
+  const setProjectSync = useCallback(
+    (next: Project | null) => {
+      projectRef.current = next;
+      setProject(next);
+      if (next?.pendingBuildSettings) applyPendingBuildSettings(next.pendingBuildSettings);
+      if (next) {
+        const current = next.revisions.find((r) => r.id === next.currentRevision);
+        const fallback = current?.id ?? next.revisions[0]?.id ?? "";
+        setRevisionSelect((prev) => (prev && next.revisions.some((r) => r.id === prev) ? prev : fallback));
+      } else {
+        setRevisionSelect("");
+      }
+    },
+    [applyPendingBuildSettings]
+  );
 
   /** Overwrite editable fields from the server (title / brief). */
   const syncFields = useCallback((p: Project) => {
@@ -353,14 +411,24 @@ export function StudioProvider({ children }: { children: React.ReactNode }) {
     [highlightSelection]
   );
 
-  /** Create the VectorBoard whenever a new bundle arrives (revision change). */
+  /** Create the VectorBoard whenever a new bundle arrives (revision change).
+   *  The board re-mounts per revision, so the underpainting cache rebuilds
+   *  per bundle (its key is the artwork version). Mode + free color persist
+   *  across re-mounts through the refs. */
   useEffect(() => {
     if (!bundle || !svgRef.current) return;
     const board = new VectorBoard(svgRef.current, bundle, {
       persist: false,
-      mode: "number",
+      mode: boardModeRef.current,
       onChange: handleBoardChange,
     });
+    if (boardModeRef.current === "free" && FREE_HEX_RE.test(freeColorRef.current)) {
+      try {
+        board.setFreeColor(freeColorRef.current);
+      } catch {
+        /* validated above — cannot throw */
+      }
+    }
     boardRef.current = board;
     wrapBoard(board);
     applyBoardView();
@@ -388,6 +456,26 @@ export function StudioProvider({ children }: { children: React.ReactNode }) {
     const observer = new ResizeObserver(() => boardRef.current?.updateLabelVisibility());
     observer.observe(el);
     return () => observer.disconnect();
+  }, []);
+
+  // Load recent free colors from localStorage (outside the board — the board
+  // itself stays memory-only by design). Async body so no storage read happens
+  // during render/hydration.
+  useEffect(() => {
+    let cancelled = false;
+    void (async () => {
+      try {
+        const raw = localStorage.getItem(RECENT_COLORS_KEY);
+        const parsed: unknown = raw ? JSON.parse(raw) : [];
+        if (!cancelled && Array.isArray(parsed))
+          setRecentColors(parsed.filter((c): c is string => typeof c === "string" && FREE_HEX_RE.test(c)).slice(0, 10));
+      } catch {
+        /* storage unavailable */
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
   }, []);
 
   // ----------------------------------------------------------------- polling
@@ -469,6 +557,7 @@ export function StudioProvider({ children }: { children: React.ReactNode }) {
     async (p: Project) => {
       if (pollTimerRef.current) clearTimeout(pollTimerRef.current);
       clearBoard();
+      appliedPendingPbsRef.current = "";
       setProjectSync(p);
       syncFields(p);
       setChatInput("");
@@ -659,6 +748,8 @@ export function StudioProvider({ children }: { children: React.ReactNode }) {
         aspect: svgAspectRef.current,
         include_reference: true,
         confirm_paid: true,
+        mode: svgGenModeRef.current,
+        target_regions: svgTargetRef.current,
       })
     );
     setSvgPrompt("");
@@ -675,16 +766,19 @@ export function StudioProvider({ children }: { children: React.ReactNode }) {
   }, [job, saveBrief]);
 
   const runEdit = useCallback(
-    async (action: EditAction, extra: Partial<EditPayload> = {}) => {
+    async (action: EditAction, extra: Partial<EditPayload> = {}, regionIds?: string[]) => {
       const p = projectRef.current;
       if (!p) throw new Error("Create a project first.");
-      if (!selectedRef.current.size) throw new Error("Select at least one region in Edit regions.");
       if (isBusyProject(p)) throw new Error("Wait for the current job.");
       if (!p.currentRevision) throw new Error("Build the vector regions first.");
+      // Cut/draw supply their own region ids (the target region / none);
+      // everything else uses the current selection.
+      const ids = regionIds ?? [...selectedRef.current];
+      if (!ids.length && action !== "draw") throw new Error("Select at least one region in Edit regions.");
       const body: EditPayload = {
         base_revision: p.currentRevision,
         action,
-        region_ids: [...selectedRef.current],
+        region_ids: ids,
         ...extra,
       };
       await job(() => apiRunEdit(p.id, body));
@@ -705,6 +799,72 @@ export function StudioProvider({ children }: { children: React.ReactNode }) {
     setPlacing(false);
     highlightSelection();
   }, [highlightSelection]);
+
+  // ------------------------------------------------------- tools & free color
+
+  /** Switch the active inspect-view tool (Select / Cut / Pen). */
+  const changeTool = useCallback((next: StudioTool) => {
+    // Leaving Select cancels any pending label placement (the drawing
+    // overlay swallows board taps while a tool is active).
+    if (next !== "select") {
+      placingRef.current = false;
+      setPlacing(false);
+    }
+    setTool(next);
+  }, []);
+
+  /** Cut the region under a drawn stroke — edit action "cut" (contract §2). */
+  const cutRegion = useCallback(
+    (regionId: string, d: string) => runEdit("cut", { d }, [regionId]),
+    [runEdit]
+  );
+
+  /** Create a region from a drawn closed shape — edit action "draw"
+   *  (contract §3): gameplay-only surface, painted later by the artist. */
+  const drawRegion = useCallback(
+    (d: string, paletteId: number, group?: string) =>
+      runEdit("draw", { d, palette_id: paletteId, ...(group ? { group } : {}) }, []),
+    [runEdit]
+  );
+
+  /** Apply a custom free-mode color (contract §4) and remember it in the
+   *  recent list (capped at 10, persisted in localStorage OUTSIDE the board). */
+  const setBoardFreeColor = useCallback((hex: string) => {
+    if (!FREE_HEX_RE.test(hex)) {
+      toast("Enter a 6-digit hex color like #66AA33.");
+      return;
+    }
+    const norm = hex.toUpperCase();
+    try {
+      boardRef.current?.setFreeColor(norm);
+    } catch (e) {
+      toast((e as Error).message);
+      return;
+    }
+    setFreeColor(norm);
+    setRecentColors((prev) => {
+      const next = [norm, ...prev.filter((c) => c !== norm)].slice(0, 10);
+      try {
+        localStorage.setItem(RECENT_COLORS_KEY, JSON.stringify(next));
+      } catch {
+        /* storage unavailable */
+      }
+      return next;
+    });
+  }, []);
+
+  /** Switch the board coloring mode (number / memory / free). */
+  const changeBoardMode = useCallback((mode: BoardMode) => {
+    try {
+      boardRef.current?.setMode(mode);
+      if (mode === "free" && FREE_HEX_RE.test(freeColorRef.current)) {
+        boardRef.current?.setFreeColor(freeColorRef.current);
+      }
+      setBoardMode(mode);
+    } catch (e) {
+      toast((e as Error).message);
+    }
+  }, []);
 
   const startPlacing = useCallback(() => {
     if (selectedRef.current.size !== 1) {
@@ -780,6 +940,11 @@ export function StudioProvider({ children }: { children: React.ReactNode }) {
         toast("Build the vector regions first.");
         return;
       }
+      // Cut/Pen only make sense on the inspect board — reset when leaving.
+      if (next !== "inspect" && toolRef.current !== "select") {
+        setTool("select");
+        toolRef.current = "select";
+      }
       viewRef.current = next;
       setView(next);
       void mountBoard();
@@ -787,7 +952,7 @@ export function StudioProvider({ children }: { children: React.ReactNode }) {
     [mountBoard]
   );
 
-  const setBuildSetting = useCallback((key: keyof BuildSettings, value: number | string) => {
+  const setBuildSetting = useCallback((key: keyof BuildSettings, value: number | string | boolean) => {
     setBuildSettings((prev) => ({ ...prev, [key]: value }));
   }, []);
 
@@ -805,7 +970,13 @@ export function StudioProvider({ children }: { children: React.ReactNode }) {
     placing,
     selectionInfo,
     setBoardPalette: (id: number) => {
-      boardRef.current?.setPalette(id);
+      const board = boardRef.current;
+      if (!board) return;
+      board.setPalette(id);
+      // Free mode: the swatch loaded that palette entry's hex as the board's
+      // active custom color — mirror it into the React state so the hex field
+      // and color picker stay in sync with what taps will actually paint.
+      if (board.mode === "free" && board.customColor) setFreeColor(board.customColor);
     },
     findRegion: () => boardRef.current?.nextRegion(),
     undoFill: () => boardRef.current?.undo(),
@@ -814,6 +985,16 @@ export function StudioProvider({ children }: { children: React.ReactNode }) {
     canvasRef,
     zoomRef,
     messagesRef,
+    boardRef,
+    tool,
+    setTool: changeTool,
+    cutRegion,
+    drawRegion,
+    freeColor,
+    setBoardFreeColor,
+    recentColors,
+    boardMode,
+    setBoardMode: changeBoardMode,
     titleInput,
     briefInput,
     chatInput,
@@ -842,6 +1023,10 @@ export function StudioProvider({ children }: { children: React.ReactNode }) {
     setSvgAspect,
     svgPaidConsent,
     setSvgPaidConsent,
+    svgGenMode,
+    setSvgGenMode,
+    svgTargetRegions,
+    setSvgTargetRegions,
     openProjectById,
     createNewProject,
     saveBrief,

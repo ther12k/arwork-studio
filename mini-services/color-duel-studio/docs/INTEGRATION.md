@@ -39,6 +39,19 @@ A bundle that passes studio validation passes this adapter:
 - Regions are VISIBLE SURFACES: opaque coverage has been subtracted, masks do
   not overlap, so any fill order colors correctly and every number label hits
   its own region
+- `geometry.edges` (stage 2, optional): boundary entries `{id, d, kind, leftRegion,
+  rightRegion}` with `kind` `artwork` (true master boundary, solid stroke) or
+  `subdivision` (artificial gameplay boundary, light dashed); when `edges` is a
+  non-empty array the adapter renders region paths FILL-ONLY and draws the
+  boundaries in an overlay above masks/ink, below labels. `geometry.boundaryStyle`
+  (`{artwork|subdivision: {stroke, strokeWidth, dash?}}`) overrides the default
+  strokes. Edge entries are validated (path pattern, kind enum, region refs).
+- Free color (stage 2): in `free` mode `session.freeColors` maps region ids to
+  `#RRGGBB` hexes (flat fills, no gradients); `board.setFreeColor(hex)` sets the
+  custom brush and palette swatches quick-set it to their hex; no palette-mismatch
+  mistakes are counted in free mode. `board.state().customColor` exposes the brush.
+- Gestures (stage 2): `pointermove`/`wheel` are rAF-batched (one deferred frame
+  per event burst) and label visibility updates pause while a gesture is active.
 
 The default export is the LEAN RUNTIME bundle: only artwork/regions/palette/paint
 JSON (+ validation evidence). Authoring duplicates (master/rings/flat/legacy)

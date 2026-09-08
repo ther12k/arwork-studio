@@ -19,6 +19,8 @@ class BuildSettings(StrictModel):
         description='Max px deviation of fitted curves from the pixel-exact boundary. Higher smooths more; corners are preserved separately.')
     corner_angle_deg: float = Field(60.0, ge=20.0, le=120.0,
         description='Turning angle above which a boundary vertex is a deliberate corner and stays straight.')
+    auto_subdivide: bool = Field(False,
+        description='Deterministically subdivide oversized regions with organic hand-cut boundaries until the target region count is reached (SVG-master builds; true-vector, no rasterization).')
 
 class CreateProject(StrictModel):
     title: str = Field('Untitled artwork', min_length=1, max_length=100)
@@ -44,6 +46,10 @@ class GenerateSvgRequest(StrictModel):
     """Separate SVG-generation route: providers that can author SVG masters."""
     prompt: str = Field(min_length=1, max_length=12000)
     aspect: Literal['1024x1536', '1536x1024', '1024x1024'] = '1024x1536'
+    mode: Literal['single', 'multistage'] = Field('single',
+        description='single = one master in one call; multistage = scene plan + per-object vector fragments composed in z order.')
+    target_regions: int = Field(300, ge=60, le=1200,
+        description='Multistage only: region count the next deterministic build should aim for via auto-subdivide.')
     include_reference: bool = True
     confirm_paid: bool = False
 
@@ -52,8 +58,11 @@ class PromoteRequest(StrictModel):
 
 class EditRequest(StrictModel):
     base_revision: str
-    action: Literal['merge', 'group', 'palette', 'recolor', 'label', 'decorate', 'split']
-    region_ids: list[str] = Field(min_length=1, max_length=1600)
+    action: Literal['merge', 'group', 'palette', 'recolor', 'label', 'decorate', 'split', 'cut', 'draw']
+    region_ids: list[str] = Field(max_length=1600,
+        description='Validated per action: merge>=2, split/cut/label=1, draw=0, others>=1.')
+    d: str | None = Field(None, pattern=r'^M[\s\d.,eE+\-MLQCZ]+$',
+        description="SVG path data in master units: 'cut' = open line crossing the region, 'draw' = closed pen shape (Z closes it).")
     group: str = Field('unassigned', pattern=r'^[a-z][a-z0-9_-]{0,39}$')
     palette_id: int | None = None
     x: float | None = Field(None, allow_inf_nan=False)

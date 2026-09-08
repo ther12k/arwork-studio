@@ -9,6 +9,7 @@ import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
 import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Textarea } from "@/components/ui/textarea";
 import { imageUrl } from "@/lib/studio-api";
@@ -53,6 +54,10 @@ export function LeftPanel() {
     setSvgAspect,
     svgPaidConsent,
     setSvgPaidConsent,
+    svgGenMode,
+    setSvgGenMode,
+    svgTargetRegions,
+    setSvgTargetRegions,
     messagesRef,
     createNewProject,
     openProjectById,
@@ -312,7 +317,48 @@ export function LeftPanel() {
                 <SelectItem value="1024x1024">Square 640×640</SelectItem>
               </SelectContent>
             </Select>
+            <Select
+              value={svgGenMode}
+              onValueChange={(v) => setSvgGenMode(v as typeof svgGenMode)}
+              disabled={busy}
+            >
+              <SelectTrigger
+                className="h-8 flex-1 rounded-md border-[#e1e5df] bg-white text-[10px]"
+                aria-label="SVG generation mode"
+              >
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="single">One-shot SVG</SelectItem>
+                <SelectItem value="multistage">Multi-stage vector</SelectItem>
+              </SelectContent>
+            </Select>
           </div>
+          {svgGenMode === "multistage" && (
+            <div className="mt-1.5">
+              <label htmlFor="studio-svg-target-regions" className="text-[10px] font-normal text-[#657671]">
+                Target regions (60–1200)
+              </label>
+              <Input
+                id="studio-svg-target-regions"
+                type="number"
+                min={60}
+                max={1200}
+                step={10}
+                value={svgTargetRegions}
+                onChange={(e) => {
+                  const v = Number(e.target.value);
+                  if (e.target.value !== "" && Number.isFinite(v)) setSvgTargetRegions(v);
+                }}
+                onBlur={() => setSvgTargetRegions(Math.min(1200, Math.max(60, Math.round(svgTargetRegions) || 300)))}
+                className="mt-1 h-8 rounded-md bg-white text-xs"
+              />
+              <MicroCaption className="mt-1">
+                Scene plan → per-object vector fragments → compose. The next Build auto-enables
+                auto-subdivide toward this target.
+              </MicroCaption>
+            </div>
+          )}
           <label className="mt-1.5 flex items-start gap-1.5 text-[10px] font-normal text-[#657671]">
             <Checkbox
               checked={svgPaidConsent}
