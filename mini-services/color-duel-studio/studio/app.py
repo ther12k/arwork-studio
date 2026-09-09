@@ -11,8 +11,8 @@ from fastapi.responses import FileResponse,JSONResponse,Response
 from fastapi.staticfiles import StaticFiles
 from .models import *
 from .pipeline import (BACKENDS, clean_image, compile_image, compile_svg_master,
-                        edit_bundle, read_json, write_json, make_export, load_bundle, validate_bundle,
-                        legacy_geometry)
+                        difficulty_profile, edit_bundle, read_json, write_json, make_export,
+                        load_bundle, validate_bundle, legacy_geometry)
 from .svg_master import clean_svg
 from .ai import Provider
 
@@ -358,6 +358,42 @@ def create_app(workspace: Path|None=None, transport=None):
             for r in p['revisions']:
                 if r['id']==body.revision:r['qa']=qa
             save(p);return p
+    @app.post('/api/projects/{pid}/revisions/{revision}/playtest')
+    def playtest(pid: str, revision: str, body: PlaytestRecord):
+        """Record a play-test run against a revision (stage-3 contract B).
+
+        Appends {recordedAt, seconds, filled, total, mistakes, mode} to the
+        revision's playtests.json (newest 50 kept), recomputes the difficulty
+        profile WITH the play-tests and patches the manifest difficulty block
+        in place; the rest of the manifest stays untouched.
+        """
+        with lock:
+            p = project(pid); editable(p)
+            d = revision_dir(pid, revision)
+            entries = []
+            pt = d / 'playtests.json'
+            if pt.is_file():
+                try:
+                    loaded = read_json(pt)
+                    if isinstance(loaded, list):
+                        entries = loaded
+                except Exception:
+                    entries = []
+            entries.append({'recordedAt': now(), **body.model_dump()})
+            entries = entries[-50:]          # keep the newest 50 runs
+            write_json(pt, entries)
+            profile = difficulty_profile(load_bundle(d), entries)
+            manifest = read_json(d / 'artwork.json')
+            manifest['difficulty'] = profile
+            completed = [e for e in entries if e.get('filled', 0) >= e.get('total', 0)]
+            manifest['difficultyValidatedByPlaytest'] = bool(completed)
+            write_json(d / 'artwork.json', manifest)
+        return {'manifest': {'id': manifest['id'], 'version': manifest['version'],
+                             'regionCount': manifest['regionCount'],
+                             'difficulty': manifest['difficulty'],
+                             'difficultyValidatedByPlaytest': manifest['difficultyValidatedByPlaytest']},
+                'playtestCount': len(entries),
+                'medianSeconds': profile['metrics'].get('playtestMedianSeconds')}
     @app.get('/api/projects/{pid}/revisions/{revision}/files/{name}')
     def artifact(pid:str,revision:str,name:str):
         if name not in FILES:raise HTTPException(404)

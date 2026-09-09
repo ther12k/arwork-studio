@@ -28,6 +28,7 @@ import {
   loadSvgSample,
   patchProject,
   promoteReference as promoteReferenceApi,
+  recordPlaytest as apiRecordPlaytest,
   runEdit as apiRunEdit,
   sendChat as apiSendChat,
   submitReview as apiSubmitReview,
@@ -38,6 +39,7 @@ import {
   type EditPayload,
   type GenerateSource,
   type ImageQuality,
+  type PlaytestRecordBody,
   type Project,
   type Revision,
   type StudioConfig,
@@ -57,7 +59,7 @@ export const VIEW_LABELS: Record<StudioView, string> = {
 const PROJECT_STORAGE_KEY = "studio-project";
 const RECENT_COLORS_KEY = "cd-studio-recent-colors";
 const FREE_HEX_RE = /^#[0-9A-Fa-f]{6}$/;
-export type StudioTool = "select" | "cut" | "pen";
+export type StudioTool = "select" | "cut" | "pen" | "node";
 const DEFAULT_BRIEF =
   "An original detailed woodland treehouse beside a waterfall, with warm lanterns, a winding staircase and flowering plants. Clear contours, coherent architecture, rich shading. No text, UI, palette or gameplay numbers.";
 
@@ -88,12 +90,18 @@ export interface StudioApi {
   cutRegion: (regionId: string, d: string) => Promise<void>;
   /** Create a gameplay-only region from a drawn closed shape: edit action "draw". */
   drawRegion: (d: string, paletteId: number, group?: string) => Promise<void>;
+  /** Rebuild the shared boundary between two regions (dragged anchors):
+   *  edit action "node" with the new open boundary path d. */
+  nodeEdit: (regionIds: [string, string], d: string) => Promise<void>;
   // free color (true custom colors, contract §4)
   freeColor: string;
   setBoardFreeColor: (hex: string) => void;
   recentColors: string[];
   boardMode: BoardMode;
   setBoardMode: (mode: BoardMode) => void;
+  /** Record a completed play-test run and refresh the difficulty profile
+   *  in-context (contract B) — no job, no board remount. */
+  recordPlaytest: (payload: PlaytestRecordBody) => Promise<void>;
   // board action wrappers (safe to call from event handlers)
   setBoardPalette: (id: number) => void;
   findRegion: () => void;
@@ -827,6 +835,14 @@ export function StudioProvider({ children }: { children: React.ReactNode }) {
     [runEdit]
   );
 
+  /** Rebuild the shared boundary between two regions from dragged
+   *  anchors — edit action "node" (stage 3, contract A): region_ids are
+   *  EXACTLY the edge's leftRegion/rightRegion, d the NEW open polyline. */
+  const nodeEdit = useCallback(
+    (regionIds: [string, string], d: string) => runEdit("node", { d }, regionIds),
+    [runEdit]
+  );
+
   /** Apply a custom free-mode color (contract §4) and remember it in the
    *  recent list (capped at 10, persisted in localStorage OUTSIDE the board). */
   const setBoardFreeColor = useCallback((hex: string) => {
@@ -865,6 +881,39 @@ export function StudioProvider({ children }: { children: React.ReactNode }) {
       toast((e as Error).message);
     }
   }, []);
+
+  /** Record a completed play-test run (contract B) and refresh difficulty
+   *  in-context: the active revision entry is patched immutably
+   *  (currentRevision untouched) and the mounted bundle's manifest is updated
+   *  IN PLACE — a new bundle object would remount the board and destroy the
+   *  play progress, so only its manifest fields are swapped before a plain
+   *  state update re-renders the difficulty panels. */
+  const recordPlaytest = useCallback(
+    async (payload: PlaytestRecordBody) => {
+      const p = projectRef.current;
+      if (!p) throw new Error("Create a project first.");
+      const r = p.revisions.find((x) => x.id === p.currentRevision);
+      if (!r) throw new Error("Build a draft first.");
+      const res = await apiRecordPlaytest(p.id, r.id, payload);
+      const difficulty = res.manifest?.difficulty;
+      const validated = !!res.manifest?.difficultyValidatedByPlaytest;
+      setProjectSync({
+        ...p,
+        revisions: p.revisions.map((rev) =>
+          rev.id === r.id
+            ? { ...rev, manifest: { ...(rev.manifest ?? {}), difficulty, difficultyValidatedByPlaytest: validated } }
+            : rev
+        ),
+      });
+      const b = bundleRef.current;
+      if (b) {
+        if (difficulty !== undefined) b.manifest.difficulty = difficulty;
+        b.manifest.difficultyValidatedByPlaytest = validated;
+      }
+      toast("Playtest recorded — difficulty updated.");
+    },
+    [setProjectSync]
+  );
 
   const startPlacing = useCallback(() => {
     if (selectedRef.current.size !== 1) {
@@ -990,11 +1039,13 @@ export function StudioProvider({ children }: { children: React.ReactNode }) {
     setTool: changeTool,
     cutRegion,
     drawRegion,
+    nodeEdit,
     freeColor,
     setBoardFreeColor,
     recentColors,
     boardMode,
     setBoardMode: changeBoardMode,
+    recordPlaytest,
     titleInput,
     briefInput,
     chatInput,

@@ -35,7 +35,12 @@ import { Switch } from "@/components/ui/switch";
 import { exportUrl, renderUrl, type DifficultyProfile, type ImageQuality } from "@/lib/studio-api";
 import { useStudioContext } from "./use-studio";
 import { ReviewDialog } from "./review-dialog";
-import { DIFFICULTY_TIERS as TIERS, normalizeDifficulty } from "./difficulty";
+import {
+  DIFFICULTY_TIERS as TIERS,
+  PlaytestValidatedBadge,
+  formatPlaytestClock,
+  normalizeDifficulty,
+} from "./difficulty";
 
 function MicroCaption({ children, className = "" }: { children: React.ReactNode; className?: string }) {
   return <p className={`text-[10px] leading-relaxed text-[#778481] ${className}`}>{children}</p>;
@@ -65,9 +70,11 @@ const num = (v: unknown): number | null => {
 };
 
 /** Full difficulty profile (contract §5): 4-tier segmented bar + score +
- *  metric rows with units + a palette-ambiguity chip. Legacy manifests carry
- *  the string "unrated" — normalized to an Unrated note without bars. */
-function DifficultyPanel({ raw }: { raw: string | DifficultyProfile | undefined }) {
+ *  metric rows with units + a palette-ambiguity chip. Stage 3 (contract B)
+ *  adds the play-test rows (count, median, pace, mistakes/region) and the
+ *  "Playtest validated" pill when a completed run was recorded. Legacy
+ *  manifests carry the string "unrated" — normalized to an Unrated note. */
+function DifficultyPanel({ raw, validated }: { raw: string | DifficultyProfile | undefined; validated?: boolean }) {
   const normalized = normalizeDifficulty(raw);
   if (!normalized) {
     return (
@@ -104,6 +111,15 @@ function DifficultyPanel({ raw }: { raw: string | DifficultyProfile | undefined 
     ["Object density", num(metrics.objectDensity) != null ? num(metrics.objectDensity)!.toFixed(2) : "—"],
     ["Label clearance", String(metrics.labelClearance ?? "—")],
   ];
+  // Play-test factor (contract B) — only when a run has been recorded.
+  if (num(metrics.playtestCount) != null)
+    rows.push(["Playtests", num(metrics.playtestCount)!.toLocaleString("en-US")]);
+  if (num(metrics.playtestMedianSeconds) != null)
+    rows.push(["Median completion", formatPlaytestClock(num(metrics.playtestMedianSeconds)!)]);
+  if (num(metrics.playtestSecondsPerRegion) != null)
+    rows.push(["Pace", `${num(metrics.playtestSecondsPerRegion)!.toFixed(1)} s/region`]);
+  if (num(metrics.playtestMistakesPerRegion) != null)
+    rows.push(["Mistakes/region", num(metrics.playtestMistakesPerRegion)!.toFixed(2)]);
   return (
     <div className="rp-wide mt-4 rounded-[10px] border border-[#dfe6d8] bg-[#eff3ec] px-3 py-2.5">
       <div className="flex items-center justify-between gap-2">
@@ -111,11 +127,14 @@ function DifficultyPanel({ raw }: { raw: string | DifficultyProfile | undefined 
           <Gauge className="size-3.5" aria-hidden />
           Difficulty profile
         </div>
-        <span
-          className="rounded-full border px-2 py-0.5 text-[9px] font-bold uppercase tracking-[0.08em]"
-          style={{ color: TIERS[tierIndex].color, borderColor: TIERS[tierIndex].color, background: "white" }}
-        >
-          {TIERS[tierIndex].label}
+        <span className="flex flex-wrap items-center gap-1.5">
+          <span
+            className="rounded-full border px-2 py-0.5 text-[9px] font-bold uppercase tracking-[0.08em]"
+            style={{ color: TIERS[tierIndex].color, borderColor: TIERS[tierIndex].color, background: "white" }}
+          >
+            {TIERS[tierIndex].label}
+          </span>
+          {validated && <PlaytestValidatedBadge />}
         </span>
       </div>
       {/* 4-tier segmented bar: each block = 25 points; filled up to score */}
@@ -601,7 +620,7 @@ export function RightPanel() {
 
       {/* Difficulty profile (contract §5) — one place, no duplication:
           the review panel, fed by the mounted bundle's manifest. */}
-      {bundle && <DifficultyPanel raw={bundle.manifest.difficulty} />}
+      {bundle && <DifficultyPanel raw={bundle.manifest.difficulty} validated={bundle.manifest.difficultyValidatedByPlaytest} />}
 
       {/* Region inspector */}
       {view === "inspect" && bundle && (

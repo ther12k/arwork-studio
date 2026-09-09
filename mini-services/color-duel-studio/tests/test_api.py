@@ -227,3 +227,88 @@ def test_generate_svg_multistage_mocked(tmp_path,monkeypatch):
         count=p['revisions'][-1]['regionCount']
         assert count>len(SCENE_OBJECTS)*3,'auto-subdivide should have applied the pending target'
         assert 'pendingBuildSettings' not in p   # consumed by the build
+
+
+# ---------------------------------------------------------------------------
+# Stage-3: node edit route + play-test difficulty recording (contract A/B)
+# ---------------------------------------------------------------------------
+
+NODE_SVG=b'''<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 200 200">
+<rect x="0" y="0" width="100" height="200" fill="#3366AA"/>
+<rect x="100" y="0" width="100" height="200" fill="#A9DBEF"/>
+</svg>'''
+
+def test_edit_node_route(client):
+    pid=new(client)
+    r=client.post(f'/api/projects/{pid}/upload-svg',headers=H,
+        files={'file':('n.svg',NODE_SVG,'image/svg+xml')},data={'rights_confirmed':'true'})
+    assert r.status_code==200,r.text
+    r=client.post(f'/api/projects/{pid}/build',headers=H,json={'target_regions':30,'palette_colors':4,
+        'paint_colors':16,'max_edge':256,'min_region_pixels':4,'min_label_radius':1.0})
+    assert r.status_code==200
+    p=wait(client,pid);assert p['job']['status']=='done',p['job']
+    rev=p['currentRevision']
+    base=f'/api/projects/{pid}/revisions/{rev}'
+    regions=client.get(base+'/files/regions.json').json()['regions']
+    left,right=[r['id'] for r in regions]
+    body={'base_revision':rev,'action':'node','region_ids':[left,right],
+          'd':'M 0,0 L 120,0 L 120,200 L 0,200'}
+    r=client.post(f'/api/projects/{pid}/edit',headers=H,json=body)
+    assert r.status_code==200,r.text
+    p=wait(client,pid);assert p['job']['status']=='done',p['job']
+    rev2=p['currentRevision']
+    regs2=client.get(f'/api/projects/{pid}/revisions/{rev2}/files/regions.json').json()['regions']
+    moved=[r2 for r2 in regs2 if r2['id'].startswith('r-n-')]
+    assert len(moved)==2 and {round(r2['area']) for r2 in moved}=={24000,16000}
+    qa=client.get(f'/api/projects/{pid}/revisions/{rev2}/files/validation.json').json()
+    assert qa['passed']
+    # a node edit with a region that does not exist fails with an actionable job message
+    r=client.post(f'/api/projects/{pid}/edit',headers=H,
+        json={'base_revision':rev2,'action':'node','region_ids':['r-00001','r-99999'],
+              'd':'M 0,0 L 120,0 L 120,200 L 0,200'})
+    assert r.status_code==200          # jobs are async: the failure surfaces in the job
+    p=wait(client,pid)
+    assert p['job']['status']=='failed'
+    assert 'Select existing playable regions' in p['job']['message']
+
+def test_playtest_record_updates_difficulty(client,tmp_path):
+    pid,rev=_svg_project(client)
+    base=f'/api/projects/{pid}/revisions/{rev}'
+    revdir=tmp_path/pid/'revisions'/rev
+    before=json.loads((revdir/'artwork.json').read_text())
+    assert 'playtestCount' not in before['difficulty']['metrics']
+    r=client.post(base+'/playtest',headers=H,
+                  json={'seconds':240.0,'filled':2,'total':2,'mistakes':3,'mode':'number'})
+    assert r.status_code==200,r.text
+    out=r.json()
+    assert out['playtestCount']==1 and out['medianSeconds']==240.0
+    assert out['manifest']['difficultyValidatedByPlaytest'] is True
+    metrics=out['manifest']['difficulty']['metrics']
+    for key in ('playtestCount','playtestMedianSeconds','playtestSecondsPerRegion','playtestMistakesPerRegion'):
+        assert key in metrics
+    # score blend: 240s for 2 regions saturates the pace term (min(1, 6))
+    assert out['manifest']['difficulty']['score']==round(0.9*before['difficulty']['score']+10.0,1)
+    entries=json.loads((revdir/'playtests.json').read_text())
+    assert len(entries)==1 and entries[0]['mode']=='number' and 'recordedAt' in entries[0]
+    after=json.loads((revdir/'artwork.json').read_text())
+    assert after['difficultyValidatedByPlaytest'] is True
+    assert after['difficulty']['metrics']['playtestCount']==1
+    # the rest of the manifest is untouched
+    assert after['contentHash']==before['contentHash'] and after['checksums']==before['checksums']
+    assert after['assets']==before['assets'] and after['version']==before['version']
+    # a second run keeps both entries and refreshes the median
+    r=client.post(base+'/playtest',headers=H,
+                  json={'seconds':60.0,'filled':2,'total':2,'mistakes':0,'mode':'memory'})
+    assert r.status_code==200
+    assert r.json()['playtestCount']==2 and r.json()['medianSeconds']==150.0
+
+def test_playtest_invalid_body_and_unknown_ids(client):
+    pid,rev=_svg_project(client)
+    base=f'/api/projects/{pid}/revisions/{rev}'
+    good={'seconds':60.0,'filled':2,'total':2,'mistakes':0,'mode':'number'}
+    assert client.post(base+'/playtest',headers=H,json={**good,'seconds':5}).status_code==422
+    assert client.post(base+'/playtest',headers=H,json={**good,'mode':'turbo'}).status_code==422
+    assert client.post(base+'/playtest',headers=H,json={**good,'filled':0}).status_code==422
+    assert client.post(base+'/playtest',headers=H,json={'seconds':60}).status_code==422
+    assert client.post(f'/api/projects/{pid}/revisions/rev-nope/playtest',headers=H,json=good).status_code==404
+    assert client.post(f'/api/projects/{pid}-missing/revisions/{rev}/playtest',headers=H,json=good).status_code==404

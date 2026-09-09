@@ -1,0 +1,1017 @@
+     1→"use client";
+     2→
+     3→/** Center panel — artwork workspace: header, brief, canvas, palette, job status.
+     4→ *  Stage 2 adds: the inspect-view tool row (Select / Cut / Pen) with a drawing
+     5→ *  overlay for cut lines and pen shapes (AlertDialog / Popover confirmations),
+     6→ *  the play-test coloring-mode switch, the free-color cluster (custom hex +
+     7→ *  recents) and the compact difficulty mini-panel. */
+     8→
+     9→import { useRef, useState } from "react";
+    10→import { Gauge, Maximize2, MousePointer2, PenTool, RotateCcw, Scissors, Search, Sparkles, Undo2, ZoomIn, ZoomOut } from "lucide-react";
+    11→import { toast } from "sonner";
+    12→
+    13→import {
+    14→  AlertDialog,
+    15→  AlertDialogAction,
+    16→  AlertDialogCancel,
+    17→  AlertDialogContent,
+    18→  AlertDialogDescription,
+    19→  AlertDialogFooter,
+    20→  AlertDialogHeader,
+    21→  AlertDialogTitle,
+    22→} from "@/components/ui/alert-dialog";
+    23→import { Button } from "@/components/ui/button";
+    24→import { Input } from "@/components/ui/input";
+    25→import { Popover, PopoverAnchor, PopoverContent } from "@/components/ui/popover";
+    26→import { Progress } from "@/components/ui/progress";
+    27→import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
+    28→import { Textarea } from "@/components/ui/textarea";
+    29→import type { BoardMode, VectorBoard } from "@/lib/detailed-board";
+    30→import { imageUrl, masterSvgUrl, type DifficultyProfile } from "@/lib/studio-api";
+    31→import { VIEW_LABELS, type StudioTool, type StudioView, useStudioContext } from "./use-studio";
+    32→import { DIFFICULTY_TIERS, normalizeDifficulty } from "./difficulty";
+    33→import ZoomLab from "./zoom-lab";
+    34→
+    35→const VIEW_ORDER: StudioView[] = ["master", "colored", "numbered", "play", "inspect", "zoomlab"];
+    36→
+    37→const TOOL_HINTS: Record<StudioTool, string> = {
+    38→  select: "Tap regions to select",
+    39→  cut: "Drag a line across a region to cut it",
+    40→  pen: "Draw a closed shape to create a region",
+    41→};
+    42→
+    43→const MODE_HINTS: Record<BoardMode, string> = {
+    44→  number: "Match palette numbers — wrong taps count as mistakes.",
+    45→  memory: "Numbers hidden — remember which group each region needs.",
+    46→  free: "Any color, any region — no mistakes, full freedom.",
+    47→};
+    48→
+    49→const FREE_HEX_RE = /^#[0-9A-Fa-f]{6}$/;
+    50→
+    51→function canvasTag(view: StudioView): string {
+    52→  if (view === "inspect") return "Select · merge · group · fix labels";
+    53→  if (view === "play") return "Play test · separate from game progress";
+    54→  if (view === "zoomlab") return "Same crop · curved vs legacy";
+    55→  return "Draft · review required";
+    56→}
+    57→
+    58→/** Contrast-aware text color for a hex swatch. */
+    59→function swatchTextColor(hex: string): string {
+    60→  const rgb = hex.match(/\w\w/g)?.map((v) => parseInt(v, 16)) ?? [0, 0, 0];
+    61→  return rgb[0] * 0.299 + rgb[1] * 0.587 + rgb[2] * 0.114 > 150 ? "#152a2a" : "white";
+    62→}
+    63→
+    64→// ---------------------------------------------------------------- stroke math
+    65→
+    66→type ArtPt = { x: number; y: number };
+    67→
+    68→/** Drop points closer than `minDist` art units to the previous kept point. */
+    69→function dropDensePoints(pts: ArtPt[], minDist: number): ArtPt[] {
+    70→  const out: ArtPt[] = [];
+    71→  for (const p of pts) {
+    72→    const last = out[out.length - 1];
+    73→    if (!last || Math.hypot(p.x - last.x, p.y - last.y) >= minDist) out.push(p);
+    74→  }
+    75→  return out;
+    76→}
+    77→
+    78→function perpendicularDistance(p: ArtPt, a: ArtPt, b: ArtPt): number {
+    79→  const dx = b.x - a.x;
+    80→  const dy = b.y - a.y;
+    81→  const len = Math.hypot(dx, dy);
+    82→  if (len < 1e-9) return Math.hypot(p.x - a.x, p.y - a.y);
+    83→  return Math.abs(dy * p.x - dx * p.y + b.x * a.y - b.y * a.x) / len;
+    84→}
+    85→
+    86→/** Ramer–Douglas–Peucker simplification (art units). */
+    87→function rdp(pts: ArtPt[], epsilon: number): ArtPt[] {
+    88→  if (pts.length < 3) return pts;
+    89→  const a = pts[0];
+    90→  const b = pts[pts.length - 1];
+    91→  let maxDist = 0;
+    92→  let index = 0;
+    93→  for (let i = 1; i < pts.length - 1; i++) {
+    94→    const d = perpendicularDistance(pts[i], a, b);
+    95→    if (d > maxDist) {
+    96→      maxDist = d;
+    97→      index = i;
+    98→    }
+    99→  }
+   100→  if (maxDist > epsilon) {
+   101→    const left = rdp(pts.slice(0, index + 1), epsilon);
+   102→    const right = rdp(pts.slice(index), epsilon);
+   103→    return [...left.slice(0, -1), ...right];
+   104→  }
+   105→  return [a, b];
+   106→}
+   107→
+   108→/** Shoelace area of a closed polygon (art units²). */
+   109→function polygonArea(pts: ArtPt[]): number {
+   110→  let sum = 0;
+   111→  for (let i = 0; i < pts.length; i++) {
+   112→    const a = pts[i];
+   113→    const b = pts[(i + 1) % pts.length];
+   114→    sum += a.x * b.y - b.x * a.y;
+   115→  }
+   116→  return Math.abs(sum) / 2;
+   117→}
+   118→
+   119→/** Point at half the total arc length of the polyline (stroke midpoint). */
+   120→function polylineMidpoint(pts: ArtPt[]): ArtPt | null {
+   121→  if (!pts.length) return null;
+   122→  const segs: number[] = [];
+   123→  let total = 0;
+   124→  for (let i = 1; i < pts.length; i++) {
+   125→    const d = Math.hypot(pts[i].x - pts[i - 1].x, pts[i].y - pts[i - 1].y);
+   126→    segs.push(d);
+   127→    total += d;
+   128→  }
+   129→  if (!segs.length) return pts[0];
+   130→  let half = total / 2;
+   131→  for (let i = 0; i < segs.length; i++) {
+   132→    if (half <= segs[i]) {
+   133→      const t = segs[i] > 0 ? half / segs[i] : 0;
+   134→      return { x: pts[i].x + (pts[i + 1].x - pts[i].x) * t, y: pts[i].y + (pts[i + 1].y - pts[i].y) * t };
+   135→    }
+   136→    half -= segs[i];
+   137→  }
+   138→  return pts[pts.length - 1];
+   139→}
+   140→
+   141→const fmt = (n: number) => (Math.round(n * 100) / 100).toString();
+   142→
+   143→/** Build the edit-action path string: `M x,y L …` (+ ` Z` when closed). */
+   144→function pathFromPoints(pts: ArtPt[], close: boolean): string {
+   145→  return `M ${pts.map((p) => `${fmt(p.x)},${fmt(p.y)}`).join(" L ")}${close ? " Z" : ""}`;
+   146→}
+   147→
+   148→/** Art-space point → canvas-container-relative CSS position (px, clamped
+   149→ *  inside the canvas; "50%" center fallback). Anchors the Pen confirm
+   150→ *  popover at the drawn shape's centroid. */
+   151→function artPointToCanvas(board: VectorBoard, x: number, y: number): { left: number | string; top: number | string } {
+   152→  try {
+   153→    const ctm = board.svg.getScreenCTM();
+   154→    const host = board.svg.parentElement;
+   155→    if (!ctm || !host) return { left: "50%", top: "50%" };
+   156→    const screen = new DOMPoint(x, y).matrixTransform(ctm);
+   157→    const rect = host.getBoundingClientRect();
+   158→    if (!rect.width || !rect.height) return { left: "50%", top: "50%" };
+   159→    const clamp = (v: number, lo: number, hi: number) => Math.max(lo, Math.min(hi, v));
+   160→    return { left: clamp(screen.x - rect.left, 48, rect.width - 48), top: clamp(screen.y - rect.top, 48, rect.height - 48) };
+   161→  } catch {
+   162→    return { left: "50%", top: "50%" };
+   163→  }
+   164→}
+   165→
+   166→/** Compact difficulty summary (contract §5): 4-tier bar + score in one row.
+   167→ *  Legacy "unrated" strings normalize to a muted note; the full metric table
+   168→ *  lives in the right panel (DifficultyPanel). */
+   169→function DifficultyMini({ raw }: { raw: string | DifficultyProfile | undefined }) {
+   170→  const d = normalizeDifficulty(raw);
+   171→  if (!d) {
+   172→    return (
+   173→      <p className="mt-2.5 flex items-center gap-1.5 text-[10px] text-[#778481]" role="status">
+   174→        <Gauge className="size-3.5 shrink-0" aria-hidden />
+   175→        Difficulty · <span className="italic">unrated</span>
+   176→        <span aria-hidden>·</span>
+   177→        rebuild to analyze
+   178→      </p>
+   179→    );
+   180→  }
+   181→  return (
+   182→    <div
+   183→      className="mt-2.5 flex flex-wrap items-center gap-x-2.5 gap-y-1 rounded-lg border border-[#e1e5df] bg-white/70 px-3 py-2"
+   184→      role="status"
+   185→      aria-label={`Difficulty ${d.tier.label}, score ${d.score} of 100`}
+   186→    >
+   187→      <span className="flex items-center gap-1.5 text-[10px] font-semibold text-[#657671]">
+   188→        <Gauge className="size-3.5" aria-hidden />
+   189→        Difficulty
+   190→      </span>
+   191→      <span className="flex h-2 w-24 gap-0.5 overflow-hidden rounded-full sm:w-28" aria-hidden>
+   192→        {DIFFICULTY_TIERS.map((t, i) => {
+   193→          const fill = Math.max(0, Math.min(1, (d.score - i * 25) / 25));
+   194→          return (
+   195→            <span key={t.key} className="relative h-full flex-1 rounded-[2px] bg-[#e1e5df]" title={`${t.label}: ${i * 25}–${t.max}`}>
+   196→              <span className="absolute inset-y-0 left-0 rounded-[2px]" style={{ width: `${fill * 100}%`, background: t.color }} />
+   197→            </span>
+   198→          );
+   199→        })}
+   200→      </span>
+   201→      <span className="text-[10px] font-bold" style={{ color: d.tier.color }}>
+   202→        {d.tier.label} · {d.score}/100
+   203→      </span>
+   204→    </div>
+   205→  );
+   206→}
+   207→
+   208→// ------------------------------------------------------------------ component
+   209→
+   210→export function CanvasWorkspace() {
+   211→  const studio = useStudioContext();
+   212→  const {
+   213→    project,
+   214→    view,
+   215→    bundle,
+   216→    boardState,
+   217→    busy,
+   218→    revision,
+   219→    connectionError,
+   220→    svgRef,
+   221→    canvasRef,
+   222→    zoomRef,
+   223→    boardRef,
+   224→    tool,
+   225→    setTool,
+   226→    cutRegion,
+   227→    drawRegion,
+   228→    freeColor,
+   229→    setBoardFreeColor,
+   230→    recentColors,
+   231→    boardMode,
+   232→    setBoardMode,
+   233→    objectGroup,
+   234→    briefInput,
+   235→    setBriefInput,
+   236→    generationSource,
+   237→    setGenerationSource,
+   238→    setBoardPalette,
+   239→    setEditPalette,
+   240→    findRegion,
+   241→    undoFill,
+   242→    resetTest,
+   243→    saveBrief,
+   244→    generate,
+   245→    switchView,
+   246→    zoomIn,
+   247→    zoomOut,
+   248→    fit,
+   249→  } = studio;
+   250→  const aiConfigured = studio.config?.ai.configured ?? false;
+   251→  const hasMaster = !!project?.master;
+   252→  const hasBundle = !!bundle;
+   253→
+   254→  const paletteEntries = bundle?.palette ?? [];
+   255→  const selectedPaletteId = boardState?.selectedPaletteId ?? null;
+   256→  const completed = boardState?.completed ?? 0;
+   257→  const total = boardState?.total ?? 0;
+   258→  const mistakes = boardState?.mistakes ?? 0;
+   259→
+   260→  const job = project?.job ?? {};
+   261→  const jobMessage =
+   262→    job.message ?? "Local tools ready. No cloud request is made until you confirm.";
+   263→  const jobFailed = job.status === "failed";
+   264→
+   265→  const setSwatch = (id: number) => {
+   266→    try {
+   267→      setBoardPalette(id);
+   268→      setEditPalette(String(id));
+   269→    } catch (e) {
+   270→      toast((e as Error).message);
+   271→    }
+   272→  };
+   273→
+   274→  // ------------------------------------------------ drawing overlay (Cut / Pen)
+   275→
+   276→  const strokeRef = useRef<ArtPt[]>([]);
+   277→  const [strokePts, setStrokePts] = useState<ArtPt[]>([]);
+   278→  const [strokeViewBox, setStrokeViewBox] = useState<string | null>(null);
+   279→  const [pendingCut, setPendingCut] = useState<{ regionId: string; d: string } | null>(null);
+   280→  const [pendingDraw, setPendingDraw] = useState<{
+   281→    d: string;
+   282→    area: number;
+   283→    /** Popover anchor (CSS left/top within the canvas container). */
+   284→    anchor: { left: number | string; top: number | string };
+   285→  } | null>(null);
+   286→  const [penPalette, setPenPalette] = useState("1");
+   287→  const [penGroup, setPenGroup] = useState("");
+   288→
+   289→  const toolActive = view === "inspect" && hasBundle && tool !== "select" && !busy;
+   290→
+   291→  const strokeWidthArt = (() => {
+   292→    const vb = strokeViewBox?.split(/\s+/).map(Number);
+   293→    const w = vb && vb.length === 4 && Number.isFinite(vb[2]) ? vb[2] : 576;
+   294→    return Math.max(1.2, w / 240);
+   295→  })();
+   296→
+   297→  const beginStroke = (e: React.PointerEvent<SVGSVGElement>) => {
+   298→    const board = boardRef.current;
+   299→    if (!board) return;
+   300→    const p = board.clientToArt(e.clientX, e.clientY);
+   301→    if (!p) return;
+   302→    // Freeze the overlay to the board's CURRENT viewBox: the overlay eats the
+   303→    // pointer events, so the board view cannot change mid-stroke.
+   304→    setStrokeViewBox(board.svg.getAttribute("viewBox") ?? null);
+   305→    strokeRef.current = [{ x: p.x, y: p.y }];
+   306→    setStrokePts([{ x: p.x, y: p.y }]);
+   307→    setPendingCut(null);
+   308→    setPendingDraw(null);
+   309→    try {
+   310→      e.currentTarget.setPointerCapture(e.pointerId);
+   311→    } catch {
+   312→      /* synthetic events / stale ids — continue without capture */
+   313→    }
+   314→  };
+   315→
+   316→  const extendStroke = (e: React.PointerEvent<SVGSVGElement>) => {
+   317→    if (!strokeRef.current.length) return;
+   318→    const board = boardRef.current;
+   319→    if (!board) return;
+   320→    const p = board.clientToArt(e.clientX, e.clientY);
+   321→    if (!p) return;
+   322→    const last = strokeRef.current[strokeRef.current.length - 1];
+   323→    if (Math.hypot(p.x - last.x, p.y - last.y) < 1.5) return;
+   324→    strokeRef.current.push({ x: p.x, y: p.y });
+   325→    setStrokePts([...strokeRef.current]);
+   326→  };
+   327→
+   328→  const endStroke = (e: React.PointerEvent<SVGSVGElement>) => {
+   329→    const raw = strokeRef.current;
+   330→    strokeRef.current = [];
+   331→    setStrokePts([]);
+   332→    if (e.currentTarget.hasPointerCapture?.(e.pointerId)) {
+   333→      try {
+   334→        e.currentTarget.releasePointerCapture(e.pointerId);
+   335→      } catch {
+   336→        /* pointer already released */
+   337→      }
+   338→    }
+   339→    const board = boardRef.current;
+   340→    if (!board || !raw.length || tool !== "cut" && tool !== "pen") return;
+   341→    const pts = rdp(dropDensePoints(raw, 2), 1.2);
+   342→    if (tool === "cut") {
+   343→      if (pts.length < 2) {
+   344→        toast("Draw a longer cut line.");
+   345→        return;
+   346→      }
+   347→      const mid = polylineMidpoint(pts);
+   348→      const regionId = mid ? board.hitRegion(mid.x, mid.y) : null;
+   349→      if (!regionId) {
+   350→        toast("Start and end the cut line inside the same region.");
+   351→        return;
+   352→      }
+   353→      setPendingCut({ regionId, d: pathFromPoints(pts, false) });
+   354→    } else {
+   355→      if (pts.length < 3) {
+   356→        toast("Draw a closed shape with at least 3 points.");
+   357→        return;
+   358→      }
+   359→      const area = polygonArea(pts);
+   360→      if (area < 120) {
+   361→        toast("Draw a larger shape — the region needs ~120 px² or more.");
+   362→        return;
+   363→      }
+   364→      setPenPalette(String(boardState?.selectedPaletteId ?? paletteEntries[0]?.id ?? 1));
+   365→      setPenGroup(objectGroup || "");
+   366→      const cx = pts.reduce((s, p) => s + p.x, 0) / pts.length;
+   367→      const cy = pts.reduce((s, p) => s + p.y, 0) / pts.length;
+   368→      setPendingDraw({ d: pathFromPoints(pts, true), area, anchor: artPointToCanvas(board, cx, cy) });
+   369→    }
+   370→  };
+   371→
+   372→  const confirmCut = () => {
+   373→    const cut = pendingCut;
+   374→    if (!cut) return;
+   375→    setPendingCut(null);
+   376→    void cutRegion(cut.regionId, cut.d).catch((e: Error) => toast(e.message));
+   377→  };
+   378→
+   379→  const confirmDraw = () => {
+   380→    const draw = pendingDraw;
+   381→    if (!draw) return;
+   382→    const paletteId = Number(penPalette) || 1;
+   383→    setPendingDraw(null);
+   384→    void drawRegion(draw.d, paletteId, penGroup.trim() || undefined).catch((e: Error) => toast(e.message));
+   385→  };
+   386→
+   387→  // ----------------------------------------------------- free color (play view)
+   388→
+   389→  const [freeHex, setFreeHex] = useState(freeColor);
+   390→  // Keep the hex field in sync with context-level changes (recent swatch or
+   391→  // palette quick-access) — the React "adjust state when a prop changes"
+   392→  // pattern, no effect needed.
+   393→  const [syncedFreeColor, setSyncedFreeColor] = useState(freeColor);
+   394→  if (freeColor !== syncedFreeColor) {
+   395→    setSyncedFreeColor(freeColor);
+   396→    setFreeHex(freeColor);
+   397→  }
+   398→  const freeHexValid = FREE_HEX_RE.test(freeHex);
+   399→
+   400→  const applyFreeColor = (hex: string) => {
+   401→    if (!FREE_HEX_RE.test(hex)) {
+   402→      toast("Enter a 6-digit hex color like #66AA33.");
+   403→      return;
+   404→    }
+   405→    setFreeHex(hex.toUpperCase());
+   406→    setBoardFreeColor(hex);
+   407→  };
+   408→
+   409→  return (
+   410→    <section className="studio-main-panel min-w-0" aria-label="Artwork workspace">
+   411→      {/* Workspace header */}
+   412→      <div className="mb-5 flex flex-wrap items-center justify-between gap-2.5">
+   413→        <div>
+   414→          <span className="mb-1.5 block text-[9px] font-semibold uppercase tracking-[0.16em] text-[#80908a]">
+   415→            ARTWORK WORKSPACE
+   416→          </span>
+   417→          <h1 className="text-2xl font-bold leading-tight tracking-tight text-[#183837]">
+   418→            {project?.title ?? "Make something worth coloring."}
+   419→          </h1>
+   420→        </div>
+   421→        <div
+   422→          className={`rounded-full border px-2.5 py-1.5 text-[10px] ${
+   423→            revision
+   424→              ? "border-[#cce7dc] bg-[#e5f3ed] text-[#087f74]"
+   425→              : "border-[#e1e5df] text-[#778481]"
+   426→          }`}
+   427→          role="status"
+   428→        >
+   429→          {revision ? `v${revision.version} · ${revision.kind}` : "No revision yet"}
+   430→        </div>
+   431→      </div>
+   432→
+   433→      {/* Brief box */}
+   434→      <div className="rounded-xl border border-[#e1e5df] bg-white/70 p-3.5">
+   435→        <label htmlFor="studio-brief" className="studio-label mb-1.5 mt-0">
+   436→          Approved image brief
+   437→          <span className="ml-1.5 font-normal text-[#778481]">Edit directly, or let chat refine it.</span>
+   438→        </label>
+   439→        <Textarea
+   440→          id="studio-brief"
+   441→          value={briefInput}
+   442→          onChange={(e) => setBriefInput(e.target.value)}
+   443→          maxLength={8000}
+   444→          rows={3}
+   445→          placeholder="An original, richly illustrated woodland treehouse with a glowing window, winding stairs and a waterfall. No lettering, numbers, palettes or UI."
+   446→          className="min-h-14 resize-y border-0 bg-transparent p-1 text-[11px] leading-relaxed shadow-none focus-visible:ring-0"
+   447→        />
+   448→        <div className="mt-2 flex flex-wrap items-center justify-end gap-2">
+   449→          <Button
+   450→            variant="outline"
+   451→            size="sm"
+   452→            className="h-8 rounded-md border-[#e1e5df] bg-white text-[10px] hover:border-[#65a89b] hover:bg-[#f0f7f3]"
+   453→            onClick={() =>
+   454→              void saveBrief()
+   455→                .then(() => toast("Brief saved locally."))
+   456→                .catch((e: Error) => toast(e.message))
+   457→            }
+   458→          >
+   459→            Save brief
+   460→          </Button>
+   461→          <Select
+   462→            value={generationSource}
+   463→            onValueChange={(v) => setGenerationSource(v as typeof generationSource)}
+   464→            disabled={!aiConfigured || busy}
+   465→          >
+   466→            <SelectTrigger
+   467→              className="h-8 w-44 rounded-md border-[#e1e5df] bg-white text-[10px]"
+   468→              aria-label="AI generation source"
+   469→            >
+   470→              <SelectValue />
+   471→            </SelectTrigger>
+   472→            <SelectContent>
+   473→              <SelectItem value="brief">Generate from brief</SelectItem>
+   474→              <SelectItem value="reference">Edit owned reference</SelectItem>
+   475→              <SelectItem value="current">Revise current master</SelectItem>
+   476→            </SelectContent>
+   477→          </Select>
+   478→          <Button
+   479→            size="sm"
+   480→            className="h-8 rounded-md border border-[#cfe6db] bg-[#e5f3ed] text-[10px] font-semibold text-[#126e5e] hover:bg-[#d9ede2] disabled:opacity-50"
+   481→            disabled={!aiConfigured || busy}
+   482→            title={aiConfigured ? "Generate a new master image with AI" : "API key required"}
+   483→            onClick={() =>
+   484→              void generate().catch((e: Error) => toast(e.message))
+   485→            }
+   486→          >
+   487→            <Sparkles className="size-3.5" aria-hidden />
+   488→            Generate master
+   489→          </Button>
+   490→        </div>
+   491→      </div>
+   492→
+   493→      {/* Canvas toolbar */}
+   494→      <div className="mx-0 my-4 flex flex-wrap items-center justify-between gap-2">
+   495→        <div
+   496→          className="flex flex-wrap gap-0.5 rounded-[9px] bg-[#e8ece5] p-1"
+   497→          role="group"
+   498→          aria-label="Artwork preview state"
+   499→        >
+   500→          {VIEW_ORDER.map((v) => (
+   501→            <button
+   502→              key={v}
+   503→              type="button"
+   504→              onClick={() => switchView(v)}
+   505→              className={`rounded-md px-2.5 py-1.5 text-[10px] font-medium whitespace-nowrap transition-colors ${
+   506→                view === v
+   507→                  ? "bg-white text-[#087f74] shadow-[0_1px_4px_rgba(18,47,34,0.13)]"
+   508→                  : "text-[#657671] hover:text-[#183837]"
+   509→              }`}
+   510→              aria-pressed={view === v}
+   511→            >
+   512→              {VIEW_LABELS[v]}
+   513→            </button>
+   514→          ))}
+   515→        </div>
+   516→        <div className="flex items-center gap-0.5">
+   517→          <Button
+   518→            variant="ghost"
+   519→            size="icon"
+   520→            className="size-7 rounded-md text-[10px] text-[#657671] hover:bg-[#f0f7f3]"
+   521→            aria-label="Zoom out"
+   522→            onClick={zoomOut}
+   523→          >
+   524→            <ZoomOut className="size-3.5" aria-hidden />
+   525→          </Button>
+   526→          <span ref={zoomRef} className="w-9 text-center text-[10px] text-[#778481]" aria-live="off">
+   527→            100%
+   528→          </span>
+   529→          <Button
+   530→            variant="ghost"
+   531→            size="icon"
+   532→            className="size-7 rounded-md text-[10px] text-[#657671] hover:bg-[#f0f7f3]"
+   533→            aria-label="Zoom in"
+   534→            onClick={zoomIn}
+   535→          >
+   536→            <ZoomIn className="size-3.5" aria-hidden />
+   537→          </Button>
+   538→          <Button
+   539→            variant="ghost"
+   540→            size="sm"
+   541→            className="h-7 rounded-md px-2 text-[10px] text-[#657671] hover:bg-[#f0f7f3]"
+   542→            onClick={fit}
+   543→          >
+   544→            <Maximize2 className="size-3.5" aria-hidden />
+   545→            Fit
+   546→          </Button>
+   547→        </div>
+   548→      </div>
+   549→
+   550→      {/* Canvas area */}
+   551→      <div
+   552→        ref={canvasRef}
+   553→        className={`studio-canvas relative flex min-w-0 rounded-xl border border-[#dce2d9] ${
+   554→          view === "zoomlab"
+   555→            ? "min-h-64 w-full flex-col items-stretch justify-start px-3.5 pb-14 pt-3.5"
+   556→            : "h-[clamp(440px,60vh,880px)] min-h-64 items-center justify-center overflow-hidden p-3.5"
+   557→        }`}
+   558→        role={view === "zoomlab" ? undefined : "img"}
+   559→        aria-label={view === "zoomlab" ? undefined : "Artwork canvas"}
+   560→      >
+   561→        {!hasMaster && !hasBundle && view !== "zoomlab" && (
+   562→          <div className="px-6 py-6 text-center">
+   563→            <span className="mb-5 block text-6xl text-[#acbfb1]" aria-hidden>
+   564→              ◈
+   565→            </span>
+   566→            <h2 className="text-2xl font-bold text-[#527360]">From illustration to playable art.</h2>
+   567→            <p className="mt-3 text-xs leading-7 text-[#778481]">
+   568→              Upload an approved image, or generate a new master.
+   569→              <br />
+   570→              Then build the vector regions and test the coloring.
+   571→            </p>
+   572→            <span className="mt-7 block text-[9px] font-semibold tracking-[0.14em] text-[#95a599]">
+   573→              ONE MASTER · MATCHED STATES · REAL SVG PATHS
+   574→            </span>
+   575→          </div>
+   576→        )}
+   577→        {view === "master" && hasMaster && project && (
+   578→          <figure className="flex h-full w-full min-h-0 flex-col items-center gap-1.5">
+   579→            <img
+   580→              src={
+   581→                project.master?.kind === "svg"
+   582→                  ? masterSvgUrl(project.id, project.master.sha256)
+   583→                  : imageUrl(project.id, "master", project.master!.sha256)
+   584→              }
+   585→              alt="Current approved artwork master"
+   586→              className="min-h-0 w-full flex-1 object-contain drop-shadow-[0_4px_15px_rgba(33,56,47,0.13)]"
+   587→            />
+   588→            {project.master?.kind === "svg" && project.master.summary && (
+   589→              <figcaption className="shrink-0 text-center text-[9px] leading-relaxed text-[#607767]">
+   590→                {project.master.summary.shapes} shapes · {project.master.summary.curvedShapes} curved ·{" "}
+   591→                {project.master.summary.gradients} gradients · {project.master.summary.hiddenShapes} hidden
+   592→                excluded · {project.master.summary.rasterized ? "rasterized" : "never rasterized"}
+   593→              </figcaption>
+   594→            )}
+   595→          </figure>
+   596→        )}
+   597→        {view === "zoomlab" && <ZoomLab />}
+   598→        {/* VectorBoard owns this element's children — React renders it empty, once. */}
+   599→        <svg
+   600→          ref={svgRef}
+   601→          xmlns="http://www.w3.org/2000/svg"
+   602→          className={`h-full w-full select-none drop-shadow-[0_4px_15px_rgba(33,56,47,0.06)] ${
+   603→            view === "master" || view === "zoomlab" || !hasBundle ? "hidden" : "block"
+   604→          }`}
+   605→          aria-label="Interactive vector artwork"
+   606→        />
+   607→        {/* Cut / Pen drawing overlay — same box as the board svg (inset-3.5
+   608→            matches the canvas p-3.5), pointer events active only while a tool
+   609→            is selected. The board keeps rendering below. NOTE: the svg itself
+   610→            is a REPLACED element — absolute insets alone do not stretch it
+   611→            (it would fall back to the intrinsic 300×150), so it fills a
+   612→            stretched wrapper div that mirrors the board svg's exact box
+   613→            (identical viewBox + identical rendered box ⇒ identical
+   614→            letterboxing ⇒ art-unit strokes land pixel-exact). */}
+   615→        {toolActive && (
+   616→          <div className="absolute inset-3.5 z-[3]">
+   617→            <svg
+   618→              xmlns="http://www.w3.org/2000/svg"
+   619→              viewBox={strokeViewBox ?? undefined}
+   620→              className="h-full w-full touch-none select-none"
+   621→              style={{ pointerEvents: "auto", cursor: "crosshair" }}
+   622→              role="img"
+   623→              aria-label={`Drawing layer — ${tool === "cut" ? "cut line" : "pen shape"} in progress`}
+   624→              onPointerDown={beginStroke}
+   625→              onPointerMove={extendStroke}
+   626→              onPointerUp={endStroke}
+   627→              onPointerCancel={endStroke}
+   628→            >
+   629→              {strokePts.length > 1 && (
+   630→                <polyline
+   631→                  points={strokePts.map((p) => `${p.x},${p.y}`).join(" ")}
+   632→                  fill="none"
+   633→                  stroke={tool === "cut" ? "#ba463f" : "#087f74"}
+   634→                  strokeWidth={strokeWidthArt}
+   635→                  strokeDasharray={tool === "cut" ? "8 5" : undefined}
+   636→                  strokeLinecap="round"
+   637→                  strokeLinejoin="round"
+   638→                />
+   639→              )}
+   640→            </svg>
+   641→          </div>
+   642→        )}
+   643→        {/* Pen confirm popover (contract §3): anchored at the drawn shape's
+   644→            centroid inside the canvas; click-away / Escape cancels the shape.
+   645→            The anchor is inert — PopoverContent portals above the overlay. */}
+   646→        <Popover
+   647→          open={toolActive && !!pendingDraw}
+   648→          onOpenChange={(open) => {
+   649→            if (!open) setPendingDraw(null);
+   650→          }}
+   651→        >
+   652→          <PopoverAnchor
+   653→            className="pointer-events-none absolute size-0"
+   654→            style={
+   655→              pendingDraw
+   656→                ? { left: pendingDraw.anchor.left, top: pendingDraw.anchor.top }
+   657→                : { left: "50%", top: "50%" }
+   658→            }
+   659→            aria-hidden
+   660→          />
+   661→          <PopoverContent
+   662→            className="w-80 rounded-xl border-[#cfe6db] bg-[#edf6f2] p-3.5"
+   663→            align="center"
+   664→            sideOffset={10}
+   665→            aria-label="Confirm new pen-drawn region"
+   666→          >
+   667→            <p className="text-[11px] font-semibold text-[#183837]">Create a region from the drawn shape?</p>
+   668→            <p className="mt-0.5 text-[10px] leading-relaxed text-[#657671]">
+   669→              Closes a {pendingDraw ? Math.round(pendingDraw.area).toLocaleString("en-US") : "…"} px² surface. It
+   670→              becomes a white tap target (gameplay-only — the artist paints it later).
+   671→            </p>
+   672→            <div className="mt-2.5 grid grid-cols-2 gap-2">
+   673→              <div>
+   674→                <label htmlFor="studio-pen-palette" className="text-[10px] leading-snug text-[#657671]">
+   675→                  Number group
+   676→                </label>
+   677→                <Select value={penPalette} onValueChange={setPenPalette} disabled={busy}>
+   678→                  <SelectTrigger
+   679→                    id="studio-pen-palette"
+   680→                    className="mt-1 h-9 w-full rounded-md border-[#e1e5df] bg-white text-xs"
+   681→                    aria-label="Palette group for the new region"
+   682→                  >
+   683→                    <SelectValue />
+   684→                  </SelectTrigger>
+   685→                  <SelectContent>
+   686→                    {paletteEntries.map((p) => (
+   687→                      <SelectItem key={p.id} value={String(p.id)}>
+   688→                        {p.id} · {p.name}
+   689→                      </SelectItem>
+   690→                    ))}
+   691→                  </SelectContent>
+   692→                </Select>
+   693→              </div>
+   694→              <div>
+   695→                <label htmlFor="studio-pen-group" className="text-[10px] leading-snug text-[#657671]">
+   696→                  Object group (optional)
+   697→                </label>
+   698→                <Input
+   699→                  id="studio-pen-group"
+   700→                  value={penGroup}
+   701→                  placeholder="roof"
+   702→                  pattern="[a-z0-9]+(-[a-z0-9]+)*"
+   703→                  onChange={(e) => setPenGroup(e.target.value)}
+   704→                  className="mt-1 h-9 rounded-md bg-white text-xs"
+   705→                />
+   706→              </div>
+   707→            </div>
+   708→            <div className="mt-2.5 flex flex-wrap justify-end gap-2">
+   709→              <Button
+   710→                variant="outline"
+   711→                size="sm"
+   712→                className="h-9 rounded-md border-[#e1e5df] bg-white text-[10px]"
+   713→                onClick={() => setPendingDraw(null)}
+   714→              >
+   715→                Cancel
+   716→              </Button>
+   717→              <Button
+   718→                size="sm"
+   719→                className="h-9 rounded-md bg-[#087f74] text-[10px] font-semibold text-white hover:bg-[#056c62]"
+   720→                disabled={busy || !paletteEntries.length}
+   721→                onClick={confirmDraw}
+   722→              >
+   723→                <PenTool className="size-3.5" aria-hidden />
+   724→                {busy ? "Creating…" : "Create region"}
+   725→              </Button>
+   726→            </div>
+   727→          </PopoverContent>
+   728→        </Popover>
+   729→        {hasBundle && view !== "master" && (
+   730→          <div className="pointer-events-none absolute bottom-5 left-5 z-[2] rounded-md bg-white/90 px-2.5 py-1.5 text-[9px] text-[#607767]">
+   731→            {canvasTag(view)}
+   732→          </div>
+   733→        )}
+   734→      </div>
+   735→
+   736→      {/* Compact difficulty mini-panel (contract §5) — full metrics live in
+   737→          the right panel (DifficultyPanel). */}
+   738→      {hasBundle && view !== "master" && view !== "zoomlab" && (
+   739→        <DifficultyMini raw={bundle?.manifest.difficulty} />
+   740→      )}
+   741→
+   742→      {/* Tools row (inspect view only) */}
+   743→      {view === "inspect" && hasBundle && (
+   744→        <div className="mt-2.5 flex flex-wrap items-center gap-2.5">
+   745→          <div
+   746→            className="flex flex-wrap gap-0.5 rounded-[9px] bg-[#e8ece5] p-1"
+   747→            role="group"
+   748→            aria-label="Region editing tool"
+   749→          >
+   750→            {(
+   751→              [
+   752→                { key: "select", label: "Select", icon: MousePointer2 },
+   753→                { key: "cut", label: "Cut", icon: Scissors },
+   754→                { key: "pen", label: "Pen", icon: PenTool },
+   755→              ] as Array<{ key: StudioTool; label: string; icon: typeof MousePointer2 }>
+   756→            ).map((t) => (
+   757→              <button
+   758→                key={t.key}
+   759→                type="button"
+   760→                aria-pressed={tool === t.key}
+   761→                disabled={busy}
+   762→                onClick={() => {
+   763→                  // Switching tools discards any pending cut/pen confirm.
+   764→                  setPendingCut(null);
+   765→                  setPendingDraw(null);
+   766→                  setTool(t.key);
+   767→                }}
+   768→                className={`flex min-h-11 items-center gap-1.5 rounded-md px-3 text-[10px] font-medium transition-colors disabled:opacity-50 ${
+   769→                  tool === t.key
+   770→                    ? "bg-white text-[#087f74] shadow-[0_1px_4px_rgba(18,47,34,0.13)]"
+   771→                    : "text-[#657671] hover:text-[#183837]"
+   772→                }`}
+   773→              >
+   774→                <t.icon className="size-3.5" aria-hidden />
+   775→                {t.label}
+   776→              </button>
+   777→            ))}
+   778→          </div>
+   779→          <span className="text-[10px] text-[#778481]" role="status">
+   780→            {busy ? "Waiting for the current job…" : TOOL_HINTS[tool]}
+   781→          </span>
+   782→        </div>
+   783→      )}
+   784→
+   785→      {/* Cut confirmation (contract §2) — modal: the board behind stays
+   786→          visible, Cancel / Escape / overlay-click all cancel the stroke. */}
+   787→      <AlertDialog
+   788→        open={toolActive && !!pendingCut}
+   789→        onOpenChange={(open) => {
+   790→          if (!open) setPendingCut(null);
+   791→        }}
+   792→      >
+   793→        <AlertDialogContent className="rounded-xl border-[#cfe6db] sm:max-w-md">
+   794→          <AlertDialogHeader>
+   795→            <AlertDialogTitle className="text-left text-sm text-[#183837]">
+   796→              Cut region {pendingCut?.regionId} along the drawn line?
+   797→            </AlertDialogTitle>
+   798→            <AlertDialogDescription className="text-left text-[11px] leading-relaxed text-[#657671]">
+   799→              Creates a new revision; both pieces stay playable tap targets and the new boundary is drawn as a
+   800→              dashed subdivision edge.
+   801→            </AlertDialogDescription>
+   802→          </AlertDialogHeader>
+   803→          <AlertDialogFooter className="gap-2 sm:justify-end">
+   804→            <AlertDialogCancel className="h-9 rounded-md border-[#e1e5df] bg-white text-[10px]">
+   805→              Cancel
+   806→            </AlertDialogCancel>
+   807→            <AlertDialogAction
+   808→              className="h-9 rounded-md bg-[#087f74] text-[10px] font-semibold text-white hover:bg-[#056c62]"
+   809→              disabled={busy}
+   810→              onClick={confirmCut}
+   811→            >
+   812→              <Scissors className="size-3.5" aria-hidden />
+   813→              {busy ? "Cutting…" : "Cut region"}
+   814→            </AlertDialogAction>
+   815→          </AlertDialogFooter>
+   816→        </AlertDialogContent>
+   817→      </AlertDialog>
+   818→
+   819→      {/* Palette bar */}
+   820→      {hasBundle && view !== "master" && view !== "colored" && view !== "zoomlab" && (
+   821→        <div className="mt-2.5">
+   822→          {/* Coloring mode switch (play test) */}
+   823→          {view === "play" && (
+   824→            <div className="mb-1.5 flex flex-wrap items-center justify-between gap-1.5">
+   825→              <div
+   826→                className="flex flex-wrap gap-0.5 rounded-[9px] bg-[#e8ece5] p-0.5"
+   827→                role="group"
+   828→                aria-label="Coloring mode"
+   829→              >
+   830→                {(["number", "memory", "free"] as BoardMode[]).map((m) => (
+   831→                  <button
+   832→                    key={m}
+   833→                    type="button"
+   834→                    aria-pressed={boardMode === m}
+   835→                    onClick={() => setBoardMode(m)}
+   836→                    className={`rounded-md px-2.5 py-1.5 text-[10px] font-medium capitalize transition-colors ${
+   837→                      boardMode === m
+   838→                        ? "bg-white text-[#087f74] shadow-[0_1px_4px_rgba(18,47,34,0.13)]"
+   839→                        : "text-[#657671] hover:text-[#183837]"
+   840→                    }`}
+   841→                  >
+   842→                    {m === "number" ? "Numbered" : m === "memory" ? "Memory" : "Free"}
+   843→                  </button>
+   844→                ))}
+   845→              </div>
+   846→              <span className="text-[9px] text-[#778481]" role="status">
+   847→                {MODE_HINTS[boardMode]}
+   848→              </span>
+   849→            </div>
+   850→          )}
+   851→          <div className="mb-1 flex flex-wrap items-center justify-between gap-1.5 text-[10px] text-[#778481]">
+   852→            <span id="studio-progress-text">
+   853→              {boardState
+   854→                ? `${completed} / ${total} regions filled · ${mistakes} incorrect attempts`
+   855→                : "Choose a color to test"}
+   856→            </span>
+   857→            <div className="flex gap-0.5">
+   858→              <Button
+   859→                variant="ghost"
+   860→                size="sm"
+   861→                className="h-6 rounded-md px-2 text-[9px] text-[#657671] hover:bg-[#f0f7f3]"
+   862→                onClick={findRegion}
+   863→              >
+   864→                <Search className="size-3" aria-hidden />
+   865→                Find region
+   866→              </Button>
+   867→              <Button
+   868→                variant="ghost"
+   869→                size="sm"
+   870→                className="h-6 rounded-md px-2 text-[9px] text-[#657671] hover:bg-[#f0f7f3]"
+   871→                onClick={undoFill}
+   872→              >
+   873→                <Undo2 className="size-3" aria-hidden />
+   874→                Undo fill
+   875→              </Button>
+   876→              <Button
+   877→                variant="ghost"
+   878→                size="sm"
+   879→                className="h-6 rounded-md px-2 text-[9px] text-[#657671] hover:bg-[#f0f7f3]"
+   880→                onClick={resetTest}
+   881→              >
+   882→                <RotateCcw className="size-3" aria-hidden />
+   883→                Reset test
+   884→              </Button>
+   885→            </div>
+   886→          </div>
+   887→          <div
+   888→            className="studio-scroll flex items-center gap-2 overflow-x-auto py-2 pb-3"
+   889→            role="group"
+   890→            aria-label="Color palette"
+   891→            aria-describedby="studio-progress-text"
+   892→          >
+   893→            {paletteEntries.map((p) => (
+   894→              <button
+   895→                key={p.id}
+   896→                type="button"
+   897→                onClick={() => setSwatch(p.id)}
+   898→                title={`${p.name} · group ${p.id}${boardMode === "free" ? " · quick color" : ""}`}
+   899→                aria-label={`${p.name}, group ${p.id}${boardMode === "free" ? ", use as free color" : ""}`}
+   900→                aria-pressed={selectedPaletteId === p.id}
+   901→                className={`flex size-9 shrink-0 items-center justify-center rounded-full border-2 border-white text-[11px] font-semibold shadow-[0_0_0_1px_rgba(189,199,189,0.5)] transition-transform ${
+   902→                  selectedPaletteId === p.id ? "scale-105 shadow-[0_0_0_3px_#087f74]" : "hover:scale-105"
+   903→                }`}
+   904→                style={{ background: p.hex, color: swatchTextColor(p.hex) }}
+   905→              >
+   906→                {p.number}
+   907→              </button>
+   908→            ))}
+   909→          </div>
+   910→
+   911→          {/* Free color cluster — true custom colors (contract §4). Palette
+   912→              swatches in free mode double as quick access (they load their hex
+   913→              as the active color inside VectorBoard.setPalette). */}
+   914→          {view === "play" && boardMode === "free" && (
+   915→            <div className="mt-1.5 rounded-lg border border-[#dce4dd] bg-white/70 p-2.5">
+   916→              <div className="flex flex-wrap items-center gap-2">
+   917→                <span className="text-[10px] font-semibold text-[#657671]">Custom color</span>
+   918→                <input
+   919→                  type="color"
+   920→                  value={freeHexValid ? freeHex : "#66AA33"}
+   921→                  onChange={(e) => applyFreeColor(e.target.value.toUpperCase())}
+   922→                  className="h-8 w-10 shrink-0 cursor-pointer rounded-md border border-[#e1e5df] bg-white p-0.5"
+   923→                  aria-label="Pick a custom free color"
+   924→                />
+   925→                <Input
+   926→                  value={freeHex}
+   927→                  onChange={(e) => setFreeHex(e.target.value.trim().toUpperCase())}
+   928→                  onBlur={() => {
+   929→                    const t = freeHex.trim().toUpperCase();
+   930→                    setFreeHex(/^[0-9A-F]{6}$/.test(t) ? `#${t}` : t);
+   931→                  }}
+   932→                  onKeyDown={(e) => {
+   933→                    if (e.key === "Enter") applyFreeColor(freeHex);
+   934→                  }}
+   935→                  placeholder="#RRGGBB"
+   936→                  spellCheck={false}
+   937→                  autoComplete="off"
+   938→                  className="h-8 w-24 rounded-md bg-white font-mono text-xs"
+   939→                  aria-label="Custom color hex value"
+   940→                  aria-invalid={!freeHexValid}
+   941→                />
+   942→                <Button
+   943→                  variant="outline"
+   944→                  size="sm"
+   945→                  className="h-8 rounded-md border-[#e1e5df] bg-white text-[10px] hover:bg-[#f0f7f3]"
+   946→                  disabled={!freeHexValid}
+   947→                  onClick={() => applyFreeColor(freeHex)}
+   948→                >
+   949→                  Apply
+   950→                </Button>
+   951→                {boardState?.customColor && (
+   952→                  <span className="ml-auto flex items-center gap-1.5 text-[9px] text-[#657671]">
+   953→                    Active
+   954→                    <span
+   955→                      className="inline-block size-3.5 rounded-full border border-[#c3ced4]"
+   956→                      style={{ background: boardState.customColor }}
+   957→                      aria-hidden
+   958→                    />
+   959→                    <span className="font-mono">{boardState.customColor}</span>
+   960→                  </span>
+   961→                )}
+   962→              </div>
+   963→              {recentColors.length > 0 && (
+   964→                <div className="mt-1.5 flex flex-wrap items-center gap-1.5">
+   965→                  <span className="text-[9px] text-[#778481]">Recent</span>
+   966→                  {recentColors.map((c) => (
+   967→                    <button
+   968→                      key={c}
+   969→                      type="button"
+   970→                      onClick={() => applyFreeColor(c)}
+   971→                      title={`Reuse ${c}`}
+   972→                      aria-label={`Reuse recent color ${c}`}
+   973→                      className={`size-6 shrink-0 rounded-full border shadow-[0_0_0_1px_rgba(189,199,189,0.5)] transition-transform hover:scale-110 ${
+   974→                        freeColor === c ? "border-[#087f74] shadow-[0_0_0_2px_#087f74]" : "border-white"
+   975→                      }`}
+   976→                      style={{ background: c }}
+   977→                    />
+   978→                  ))}
+   979→                </div>
+   980→              )}
+   981→              <p className="mt-1.5 text-[9px] leading-relaxed text-[#778481]">
+   982→                In free mode every region accepts this color — no palette checks, no mistakes. Palette swatches
+   983→                above stay clickable as quick access.
+   984→              </p>
+   985→            </div>
+   986→          )}
+   987→        </div>
+   988→      )}
+   989→
+   990→      {/* Job area */}
+   991→      <div className="mt-3" aria-live="polite">
+   992→        <div className="flex items-center justify-between gap-2 text-[10px]">
+   993→          <span
+   994→            className={
+   995→              jobFailed
+   996→                ? "text-[#ba463f]"
+   997→                : busy
+   998→                  ? "font-medium text-[#087f74]"
+   999→                  : "text-[#778481]"
+  1000→            }
+  1001→          >
+  1002→            {connectionError ? "Could not connect to the local studio service." : jobMessage}
+  1003→          </span>
+  1004→          <strong className={jobFailed ? "text-[#ba463f]" : "text-[#087f74]"}>
+  1005→            {busy ? `${Math.round((job.progress ?? 0) * 100)}%` : ""}
+  1006→          </strong>
+  1007→        </div>
+  1008→        <Progress
+  1009→          value={(job.progress ?? 0) * 100}
+  1010→          className="mt-2 h-1 bg-[#e1e5df] [&>div]:bg-[#087f74]"
+  1011→          aria-hidden
+  1012→        />
+  1013→      </div>
+  1014→    </section>
+  1015→  );
+  1016→}
+  1017→

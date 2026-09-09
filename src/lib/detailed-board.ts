@@ -258,6 +258,9 @@ export interface Manifest {
   /** Legacy bundles carry the string "unrated"; new ones carry the full
    *  profile (contract §5). The UI normalizes both. */
   difficulty?: string | DifficultyProfile;
+  /** Stage 3 (contract B): true once at least one completed play-test run
+   *  has been recorded for this revision. */
+  difficultyValidatedByPlaytest?: boolean;
 }
 
 export interface Bundle {

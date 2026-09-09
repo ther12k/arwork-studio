@@ -98,6 +98,15 @@ export interface QaReport {
   [key: string]: unknown;
 }
 
+/** Manifest block shapes the frontend patches in-context. The playtest
+ *  route returns the full (loose) manifest with the difficulty section
+ *  recomputed; the project listing itself does not embed revision manifests. */
+export interface RevisionManifest {
+  difficulty?: string | DifficultyProfile;
+  difficultyValidatedByPlaytest?: boolean;
+  [key: string]: unknown;
+}
+
 export interface Revision {
   id: string;
   version: string;
@@ -107,6 +116,9 @@ export interface Revision {
   regionCount: number;
   qa: QaReport;
   manifestUrl: string;
+  /** In-context manifest patch (difficulty + playtest validation); present
+   *  after a playtest recording, not part of the server listing. */
+  manifest?: RevisionManifest;
 }
 
 export interface Job {
@@ -161,7 +173,17 @@ export interface BuildSettings {
   auto_subdivide?: boolean;
 }
 
-export type EditAction = "merge" | "group" | "palette" | "recolor" | "label" | "decorate" | "split" | "cut" | "draw";
+export type EditAction =
+  | "merge"
+  | "group"
+  | "palette"
+  | "recolor"
+  | "label"
+  | "decorate"
+  | "split"
+  | "cut"
+  | "draw"
+  | "node";
 
 export type GeometryMode = "curved" | "legacy";
 
@@ -210,7 +232,8 @@ export interface EditPayload {
    * instead of replacing the fill. */
   preserve_shading?: boolean;
   /** 'cut': the cut polyline (open path, M/L only). 'draw': the closed
-   * region outline (M…Z). Pattern ^M[\s\d.,eE+\-MLQCZz]+$ upstream. */
+   *  region outline (M…Z). 'node': the NEW open boundary polyline between
+   *  the two selected region ids. Pattern upstream accepts M/L/C/Q/Z. */
   d?: string;
 }
 
@@ -228,6 +251,12 @@ export interface DifficultyMetrics {
   avgNeighbors?: number;
   subdivisionEdges?: number;
   objectDensity?: number;
+  /** Play-test factor (stage 3, contract B) — present once a completed run
+   *  has been recorded for the revision. */
+  playtestCount?: number;
+  playtestMedianSeconds?: number;
+  playtestSecondsPerRegion?: number;
+  playtestMistakesPerRegion?: number;
   [key: string]: unknown;
 }
 
@@ -367,6 +396,31 @@ export const runEdit = (pid: string, payload: EditPayload): Promise<{ jobId: str
 
 export const activateRevision = (pid: string, revision: string): Promise<Project> =>
   post<Project>(`/projects/${pid}/activate`, { revision });
+
+export interface PlaytestResponse {
+  /** Full manifest with the difficulty block recomputed (playtest metrics +
+   *  the validated flag). */
+  manifest: RevisionManifest;
+  playtestCount: number;
+  medianSeconds: number;
+}
+
+/** Record a completed play-test run against a revision (contract B) — a
+ *  DIRECT call (no job polling); the backend recomputes difficulty with the
+ *  playtests and rewrites the manifest difficulty block in place. */
+export interface PlaytestRecordBody {
+  seconds: number;
+  filled: number;
+  total: number;
+  mistakes: number;
+  mode: "number" | "memory" | "free";
+}
+
+export const recordPlaytest = (
+  pid: string,
+  revision: string,
+  body: PlaytestRecordBody
+): Promise<PlaytestResponse> => post(`/projects/${pid}/revisions/${revision}/playtest`, body);
 
 export const submitReview = (pid: string, revision: string, note: string): Promise<Project> =>
   post<Project>(`/projects/${pid}/review`, { revision, note, confirmed: true });

@@ -1492,11 +1492,16 @@ def _hex_rgb(hx: str):
     return tuple(int(hx[i:i + 2], 16) for i in (1, 3, 5))
 
 
-def difficulty_profile(bundle: dict) -> dict:
+def difficulty_profile(bundle: dict, playtests: list | None = None) -> dict:
     """Deterministic difficulty profile of a compiled bundle (contract 5).
 
     Weighted score 0-100; rating easy <25 <= medium <50 <= hard <75 <= master.
-    ``difficultyValidatedByPlaytest`` stays False until a real playtest.
+    ``playtests`` (stage-3 contract B): recorded play-test runs; completed
+    runs (filled >= total) blend the score by completion pace (±10% band).
+    The ``difficultyValidatedByPlaytest`` manifest flag is set by callers.
+    Time/mistake metrics come from the completed runs when at least one
+    exists (a completion time is only meaningful when the board was filled);
+    otherwise from all recorded runs (partial-run data, no blend).
     """
     g, p = bundle['geometry'], bundle['palette']
     regs = g.get('regions') or []
@@ -1576,6 +1581,21 @@ def difficulty_profile(bundle: dict) -> dict:
              + min(1.0, degrees / 8.0) * 12
              + min(1.0, density / 10.0) * 10)
     score = round(min(100.0, max(0.0, score)), 1)
+    # Play-test factor (stage-3 contract B): completed runs validate the rating
+    # and blend the score by completion pace - fast boards ease, slow climb.
+    completed = [e for e in (playtests or []) if e.get('filled', 0) >= e.get('total', 0)]
+    if playtests:
+        source = completed or list(playtests)
+        seconds = [float(e.get('seconds', 0.0) or 0.0) for e in source]
+        median_seconds = float(np.median(seconds)) if seconds else 0.0
+        metrics['playtestCount'] = len(playtests)
+        metrics['playtestMedianSeconds'] = round(median_seconds, 1)
+        metrics['playtestSecondsPerRegion'] = round(median_seconds / max(1, count), 2)
+        metrics['playtestMistakesPerRegion'] = round(
+            sum(float(e.get('mistakes', 0) or 0.0) for e in source) / max(1, count), 3)
+    if completed:
+        pace = min(1.0, (median_seconds / max(1, count)) / 20.0)
+        score = round(min(100.0, 0.9 * score + 10.0 * pace), 1)
     rating = 'easy' if score < 25 else ('medium' if score < 50 else ('hard' if score < 75 else 'master'))
     return {'rating': rating, 'score': score, 'metrics': metrics}
 
@@ -1589,8 +1609,20 @@ def emit_bundle(folder: Path, bundle: dict, previews=True) -> dict:
     m, g, p, paint = bundle['manifest'], bundle['geometry'], bundle['palette'], bundle['paint']
     m['regionCount'] = len(g['regions']); m['paletteCount'] = len(p)
     # Difficulty profile (contract 5): recomputed for every revision; replaces
-    # the 'unrated' placeholder. difficultyValidatedByPlaytest stays False.
-    m['difficulty'] = difficulty_profile(bundle)
+    # the 'unrated' placeholder. Play-tests recorded next to the output folder
+    # (contract B) feed the profile; fresh revision folders start unvalidated.
+    playtests = None
+    playtest_file = folder / 'playtests.json'
+    if playtest_file.is_file():
+        try:
+            loaded = read_json(playtest_file)
+            if isinstance(loaded, list):
+                playtests = loaded
+        except Exception:
+            playtests = None
+    m['difficulty'] = difficulty_profile(bundle, playtests)
+    completed = [e for e in (playtests or []) if e.get('filled', 0) >= e.get('total', 0)]
+    m['difficultyValidatedByPlaytest'] = bool(completed)
     w, h = map(int, g['viewBox'][2:]); vb = svg_open(w, h)
     write_json(folder / 'regions.json', g); write_json(folder / 'palette.json', p); write_json(folder / 'paint.json', paint)
     m['contentHash'] = hashlib.sha256(b''.join((folder / f).read_bytes() for f in ['regions.json', 'palette.json', 'paint.json'])).hexdigest()
@@ -1620,7 +1652,9 @@ def emit_bundle(folder: Path, bundle: dict, previews=True) -> dict:
     m['qa'] = {'status': 'draft-needs-human-review', 'passedGeometryChecks': True, 'humanReviewed': False}
     qa['difficulty'] = {'rating': m['difficulty']['rating'], 'score': m['difficulty']['score'],
                         'metrics': m['difficulty']['metrics'],
-                        'note': 'Deterministic analyzer; difficultyValidatedByPlaytest stays false until a real playtest.'}
+                        'note': ('Deterministic analyzer blended with recorded play-test completion times (difficultyValidatedByPlaytest true).'
+                                 if m['difficultyValidatedByPlaytest'] else
+                                 'Deterministic analyzer; difficultyValidatedByPlaytest stays false until a real playtest.')}
     write_json(folder / 'validation.json', qa)
     if previews:
         import cairosvg
@@ -2126,18 +2160,21 @@ def edit_bundle(source: Path, output: Path, request, version: str):
         raise ValueError('The pen tool takes no region selection; draw the shape over empty canvas instead.')
     chosen = [regs[rid] for rid in chosen_ids if rid in regs]
     # Per-action selection counts (contract addendum):
-    # merge>=2, split/cut/label=1, draw=0, others>=1.
-    need = {'merge': 2, 'split': 1, 'cut': 1, 'label': 1}.get(request.action, 1)
+    # merge>=2, split/cut/label=1, node=2, draw=0, others>=1.
+    need = {'merge': 2, 'split': 1, 'cut': 1, 'label': 1, 'node': 2}.get(request.action, 1)
     if request.action == 'draw':
         if chosen:
             raise ValueError('The pen tool takes no region selection.')
     elif len(chosen) < need:
         hint = ('two or more adjacent regions' if request.action == 'merge'
                 else 'exactly one region' if request.action in ('split', 'cut', 'label')
+                else 'exactly two regions sharing a boundary' if request.action == 'node'
                 else 'at least one region')
         raise ValueError(f'Select {hint} for this action.')
     elif request.action in ('split', 'cut', 'label') and len(chosen) != 1:
         raise ValueError('Select exactly one region for this action.')
+    elif request.action == 'node' and len(chosen) != 2:
+        raise ValueError('Select exactly two regions sharing the boundary you want to drag.')
     valid_palette = {p['id'] for p in bundle['palette']}
     if request.action == 'draw':
         if request.palette_id is None:
@@ -2261,6 +2298,110 @@ def edit_bundle(source: Path, output: Path, request, version: str):
             # segments bordering existing regions are subdivision.
             _emit_classified_edges(g['edges'], piece, drawn_ref, 'artwork', 'subdivision', index,
                                    self_id=reg['id'])
+    elif request.action == 'node':
+        # Drag boundary anchors (stage-3 contract A): the shared boundary of
+        # exactly two regions is re-drawn as a new polyline; the swept lens
+        # moves area from one side to the other. A true artwork boundary stays
+        # artwork ("true boundary stays true"); a subdivision stays subdivision.
+        if len(chosen) != 2:
+            raise ValueError('Select exactly two regions sharing the boundary you want to drag.')
+        a, b = chosen
+        pair_ids = {a['id'], b['id']}
+        E = next((e for e in (g.get('edges') or [])
+                  if {e.get('leftRegion'), e.get('rightRegion')} == pair_ids), None)
+        if E is None:
+            raise ValueError('Select a shared boundary between exactly two regions.')
+        old_subs = flatten_d(E.get('d') or '')
+        new_subs = flatten_d(request.d) if request.d else []
+        if not old_subs or not new_subs:
+            raise ValueError('Draw the new boundary first — drag at least one anchor.')
+        old_line = LineString(max(old_subs, key=len))
+        new_pts = [(float(x), float(y)) for x, y in max(new_subs, key=len)]
+        new_line = LineString(new_pts)
+        # No-op guard: an undragged boundary (or a sub-pixel lens) changes nothing.
+        if old_line.hausdorff_distance(new_line) < 0.75:
+            raise ValueError('Drag at least one anchor to a new position.')
+        A, B = region_polygon(a), region_polygon(b)
+        # The lens is swept from the ACTUAL shared boundary of the two region
+        # polygons (adjacent regions touch exactly along the refit-shared
+        # line), not from the simplified edge 'd' the anchors were rendered
+        # from: sweeping the rendered line leaves hairline gaps against the
+        # true polygons and detaches the swept strip from its new owner.
+        # Fallback when the polygons do not touch exactly: the edge line
+        # itself (the sliver tolerance below then absorbs the artifacts).
+        shared = A.intersection(B)
+        shared_parts = shared.geoms if hasattr(shared, 'geoms') else [shared]
+        shared_lines = [q for q in shared_parts if q.geom_type == 'LineString' and q.length > 0]
+        sweep = max(shared_lines, key=lambda q: q.length) if shared_lines else old_line
+        ring = [(float(x), float(y)) for x, y in sweep.coords] + list(reversed(new_pts))
+        try:
+            lens = make_valid(Polygon(ring))
+        except Exception:
+            lens = None
+        lens_polys = [p for p in (polygon_parts(lens) if lens is not None else []) if p.area > 0]
+        S = _safe_union(lens_polys) if lens_polys else Polygon()
+        if S.is_empty or S.area < 1.0:
+            raise ValueError('Drag at least one anchor to a new position.')
+        # Spill guard: the lens must stay inside the two chosen regions.
+        others = [region_polygon(r) for r in g['regions'] + g.get('decorations', [])
+                  if r['id'] not in pair_ids]
+        others = [p for p in others if not p.is_empty and p.area > 0]
+        if others and S.intersection(_safe_union(others)).area > max(2.0, 0.02 * S.area):
+            raise ValueError('The dragged boundary crosses other regions — keep it between the two selected regions.')
+        Ap = make_valid(A.difference(S).union(S.intersection(B)))
+        Bp = make_valid(B.difference(S).union(S.intersection(A)))
+        rebuilt = []
+        for src, geom in ((a, Ap), (b, Bp)):
+            parts = _polys(geom)
+            if not parts:
+                raise ValueError(f'The drag would erase region {src["id"]} — keep the boundary between the two selected regions.')
+            if len(parts) > 1:
+                # Refit slivers: the lens is swept from the SIMPLIFIED edge
+                # polyline while region polygons carry the refit detail, so a
+                # hair-thin fragment can detach along the old line. Keep the
+                # dominant piece and drop slivers under the documented
+                # tolerance (they become unowned gaps); a genuine split that
+                # removes real area stays an error.
+                parts = sorted(parts, key=lambda p: -p.area)
+                main, slivers = parts[0], parts[1:]
+                lost = sum(p.area for p in slivers)
+                if lost > max(8.0, 0.005 * main.area):
+                    raise ValueError(f'The drag would split region {src["id"]} into disconnected pieces — keep the boundary in one piece.')
+                parts = [main]
+            merged = parts[0]
+            if merged.geom_type != 'Polygon':
+                raise ValueError(f'The drag would split region {src["id"]} into disconnected pieces — keep the boundary in one piece.')
+            if merged.area < min_px:
+                raise ValueError(f'Region {src["id"]} would be only {merged.area:.0f} px² after the drag — too small to tap.')
+            rebuilt.append((src, merged))
+        # Prior artwork edges of the pair keep their classification (collected
+        # BEFORE pruning so the reclassification below can re-check against them).
+        prior_art_lines: List[LineString] = []
+        for e in g.get('edges') or []:
+            if e.get('kind') == 'artwork' and (e.get('leftRegion') in pair_ids or e.get('rightRegion') in pair_ids):
+                prior_art_lines.extend(_ref_lines(flatten_d(e.get('d', ''))))
+        g['regions'] = [r for r in g['regions'] if r['id'] not in pair_ids]
+        _prune_edges(g, pair_ids)
+        new_regions = []
+        for idx, (src, poly) in enumerate(rebuilt):
+            node_id = 'r-n-' + hashlib.sha256(('|'.join(sorted(pair_ids)) + version + str(idx)).encode()).hexdigest()[:12]
+            reg = pack_region(poly, node_id, src['paletteId'], src['objectId'],
+                              source='node-edit', fit_tolerance=fit_tolerance)
+            if src.get('masterShapeId'):
+                reg['masterShapeId'] = src['masterShapeId']
+            g['regions'].append(reg)
+            new_regions.append(reg)
+        g.setdefault('edges', [])
+        g.setdefault('boundaryStyle', BOUNDARY_STYLE_DEFAULT)
+        index = _RegionIndex(g['regions'])
+        e_kind = E.get('kind') if E.get('kind') in EDGE_KINDS else 'subdivision'
+        other_kind = 'artwork' if e_kind == 'subdivision' else 'subdivision'
+        for reg, (_src, poly) in zip(new_regions, rebuilt):
+            _emit_classified_edges(g['edges'], poly, [new_line], e_kind, other_kind,
+                                   index, prior_art_lines, self_id=reg['id'])
+        deviation = max(region_polygon(reg).symmetric_difference(poly).area
+                        for reg, (_src, poly) in zip(new_regions, rebuilt))
+        g['partitionTolerance'] = round(float(g.get('partitionTolerance', 0.0)) + deviation + 0.01, 3)
     elif request.action == 'group':
         for r in chosen: r['objectId'] = request.group
     elif request.action == 'palette':

@@ -264,3 +264,175 @@ def test_merge_prunes_stale_edges(svg_asset,tmp_path):
     for e in after['geometry'].get('edges') or []:
         assert (e.get('leftRegion') is None or e.get('leftRegion') in live) \
             and (e.get('rightRegion') is None or e.get('rightRegion') in live)
+
+
+# ---------------------------------------------------------------------------
+# Stage-3: node boundary drag + play-test difficulty factor (contract A/B)
+# ---------------------------------------------------------------------------
+
+NODE_SVG='''<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 200 200">
+<rect x="0" y="0" width="100" height="200" fill="#3366AA"/>
+<rect x="100" y="0" width="100" height="200" fill="#A9DBEF"/>
+</svg>'''
+STRIPS_SVG='''<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 200 200">
+<rect x="0" y="0" width="60" height="200" fill="#3366AA"/>
+<rect x="60" y="0" width="60" height="200" fill="#A9DBEF"/>
+<rect x="120" y="0" width="80" height="200" fill="#79B258"/>
+</svg>'''
+
+@pytest.fixture(scope='module')
+def node_asset(tmp_path_factory):
+    root=tmp_path_factory.mktemp('node')
+    (root/'master.svg').write_text(NODE_SVG)
+    compile_svg_master(root/'master.svg',root/'bundle',artwork_id='node-test',version='0.1.0',title='Node fixture',
+        settings=BuildSettings(target_regions=30,palette_colors=8,paint_colors=16,max_edge=256,
+                               min_region_pixels=4,min_label_radius=1.0))
+    return root
+
+@pytest.fixture(scope='module')
+def strips_asset(tmp_path_factory):
+    root=tmp_path_factory.mktemp('strips')
+    (root/'master.svg').write_text(STRIPS_SVG)
+    compile_svg_master(root/'master.svg',root/'bundle',artwork_id='strips-test',version='0.1.0',title='Strips fixture',
+        settings=BuildSettings(target_regions=30,palette_colors=8,paint_colors=16,max_edge=256,
+                               min_region_pixels=4,min_label_radius=1.0))
+    return root
+
+def test_node_edit_moves_shared_boundary(node_asset,tmp_path):
+    b=load_bundle(node_asset/'bundle');g=b['geometry']
+    left,right=[r['id'] for r in g['regions']]
+    # The pair-matching edge is the left region's artwork outline; dragging its
+    # shared side from x=100 to x=120 moves a 20x200 strip to the left region.
+    result=edit_bundle(node_asset/'bundle',tmp_path/'node',
+        EditRequest(base_revision='x',action='node',region_ids=[left,right],
+                    d='M 0,0 L 120,0 L 120,200 L 0,200'),'0.2.0')
+    assert result['validation']['passed']
+    after=load_bundle(tmp_path/'node');regs=after['geometry']['regions']
+    moved=[r for r in regs if r['id'].startswith('r-n-')]
+    assert len(moved)==2 and {r['id'] for r in regs}=={r['id'] for r in moved}
+    assert all(r['master']['source']=='node-edit' for r in moved)
+    assert {round(r['area']) for r in moved}=={24000,16000}
+    assert {r['masterShapeId'] for r in moved}=={'s0000','s0001'}   # inherited
+    edges=after['geometry']['edges']
+    assert all(left not in (e.get('leftRegion'),e.get('rightRegion'))
+               and right not in (e.get('leftRegion'),e.get('rightRegion')) for e in edges)
+    new_ids={r['id'] for r in moved}
+    shared=[e for e in edges if e['leftRegion'] in new_ids and e['rightRegion'] in new_ids]
+    assert shared and any(e['kind']=='artwork' for e in shared)   # artwork boundaries stay artwork
+    assert validate_bundle(after)['passed']
+    assert after['manifest']['provenance']['lastEdit']=='node'
+    assert after['geometry']['partitionTolerance']>g['partitionTolerance']
+
+def test_node_edit_keeps_subdivision_kind(svg_asset,tmp_path):
+    # Cut first, then drag the fresh cut boundary: a subdivision stays subdivision.
+    b=load_bundle(svg_asset/'bundle')
+    target=next(r for r in b['geometry']['regions'] if region_polygon(r).covers(Point(100,100)))
+    edit_bundle(svg_asset/'bundle',tmp_path/'cut',
+        EditRequest(base_revision='x',action='cut',region_ids=[target['id']],d='M 100 40 L 100 160'),'0.2.0')
+    cut=load_bundle(tmp_path/'cut')
+    pieces=[r['id'] for r in cut['geometry']['regions'] if r['id'].startswith('r-c-')]
+    shared=next(e for e in cut['geometry']['edges']
+                if {e.get('leftRegion'),e.get('rightRegion')}==set(pieces))
+    assert shared['kind']=='subdivision'
+    result=edit_bundle(tmp_path/'cut',tmp_path/'node',
+        EditRequest(base_revision='x',action='node',region_ids=pieces,d='M 110,140 L 110,60'),'0.3.0')
+    assert result['validation']['passed']
+    after=load_bundle(tmp_path/'node')
+    nodes=[r for r in after['geometry']['regions'] if r['id'].startswith('r-n-')]
+    assert len(nodes)==2 and {round(r['area']) for r in nodes}=={4000,2400}
+    new_ids={r['id'] for r in nodes}
+    new_shared=[e for e in after['geometry']['edges']
+                if e['leftRegion'] in new_ids and e['rightRegion'] in new_ids]
+    assert new_shared and all(e['kind']=='subdivision' for e in new_shared)
+    assert all(p not in (e.get('leftRegion'),e.get('rightRegion'))
+               for p in pieces for e in after['geometry']['edges'])
+    assert validate_bundle(after)['passed']
+
+def test_node_requires_shared_edge_pair(strips_asset,tmp_path):
+    b=load_bundle(strips_asset/'bundle');ids=[r['id'] for r in b['geometry']['regions']]
+    with pytest.raises(ValueError,match='shared boundary between exactly two'):
+        edit_bundle(strips_asset/'bundle',tmp_path/'bad',EditRequest(base_revision='x',action='node',
+            region_ids=[ids[0],ids[2]],d='M 30,0 L 30,200'),'0.2.0')
+
+def test_node_noop_drag_rejected(node_asset,tmp_path):
+    b=load_bundle(node_asset/'bundle');left,right=[r['id'] for r in b['geometry']['regions']]
+    with pytest.raises(ValueError,match='new position'):
+        edit_bundle(node_asset/'bundle',tmp_path/'bad',EditRequest(base_revision='x',action='node',
+            region_ids=[left,right],d='M 0,0 L 100,0 L 100,200 L 0,200'),'0.2.0')
+
+def test_node_missing_d_rejected(node_asset,tmp_path):
+    b=load_bundle(node_asset/'bundle');left,right=[r['id'] for r in b['geometry']['regions']]
+    with pytest.raises(ValueError,match='at least one anchor'):
+        edit_bundle(node_asset/'bundle',tmp_path/'bad',EditRequest(base_revision='x',action='node',
+            region_ids=[left,right]),'0.2.0')
+
+def test_node_closed_ring_submission(node_asset,tmp_path):
+    # Closed (Z) edges are the norm for rect outlines; the frontend submits the
+    # dragged ring closed (Z) — the lens math treats it exactly like the open
+    # variant (flatten_d drops the closure command).
+    b=load_bundle(node_asset/'bundle');left,right=[r['id'] for r in b['geometry']['regions']]
+    result=edit_bundle(node_asset/'bundle',tmp_path/'node',
+        EditRequest(base_revision='x',action='node',region_ids=[left,right],
+                    d='M 0,0 L 120,0 L 120,200 L 0,200 Z'),'0.2.0')
+    assert result['validation']['passed']
+    after=load_bundle(tmp_path/'node')
+    moved=[r for r in after['geometry']['regions'] if r['id'].startswith('r-n-')]
+    assert len(moved)==2 and {round(r['area']) for r in moved}=={24000,16000}
+
+def test_node_spill_into_third_region_rejected(strips_asset,tmp_path):
+    b=load_bundle(strips_asset/'bundle');ids=[r['id'] for r in b['geometry']['regions']]
+    with pytest.raises(ValueError,match='crosses other regions'):
+        edit_bundle(strips_asset/'bundle',tmp_path/'bad',EditRequest(base_revision='x',action='node',
+            region_ids=[ids[0],ids[1]],d='M 0,0 L 150,0 L 150,200 L 0,200'),'0.2.0')
+
+def test_node_too_small_region_rejected(node_asset,tmp_path):
+    b=load_bundle(node_asset/'bundle');left,right=[r['id'] for r in b['geometry']['regions']]
+    with pytest.raises(ValueError,match='too small to tap'):
+        edit_bundle(node_asset/'bundle',tmp_path/'bad',EditRequest(base_revision='x',action='node',
+            region_ids=[left,right],d='M 0,0 L 199.99,0 L 199.99,200 L 0,200'),'0.2.0')
+
+def test_node_disconnected_result_rejected(svg_asset,tmp_path):
+    b=load_bundle(svg_asset/'bundle')
+    target=next(r for r in b['geometry']['regions'] if region_polygon(r).covers(Point(100,100)))
+    edit_bundle(svg_asset/'bundle',tmp_path/'cut',
+        EditRequest(base_revision='x',action='cut',region_ids=[target['id']],d='M 100 40 L 100 160'),'0.2.0')
+    cut=load_bundle(tmp_path/'cut')
+    pieces=[r['id'] for r in cut['geometry']['regions'] if r['id'].startswith('r-c-')]
+    # A new boundary that crosses the old one pinches a piece at a single point.
+    with pytest.raises(ValueError,match='disconnected pieces'):
+        edit_bundle(tmp_path/'cut',tmp_path/'bad',EditRequest(base_revision='x',action='node',
+            region_ids=pieces,d='M 60,100 L 140,100'),'0.3.0')
+
+def test_difficulty_profile_playtest_blend(svg_asset):
+    b=load_bundle(svg_asset/'bundle')
+    base=difficulty_profile(b)
+    assert 'playtestCount' not in base['metrics']
+    assert difficulty_profile(b,[])['score']==base['score']    # no playtests -> unchanged
+    count=base['metrics']['regionCount']
+    runs=[{'seconds':100.0,'filled':count,'total':count,'mistakes':6,'mode':'number'},
+          {'seconds':200.0,'filled':count,'total':count,'mistakes':2,'mode':'memory'}]
+    blended=difficulty_profile(b,runs)
+    metrics=blended['metrics']
+    assert metrics['playtestCount']==2
+    assert metrics['playtestMedianSeconds']==150.0
+    assert metrics['playtestSecondsPerRegion']==round(150.0/count,2)
+    assert metrics['playtestMistakesPerRegion']==round(8.0/count,3)
+    pace=min(1.0,(150.0/count)/20.0)
+    assert blended['score']==round(min(100.0,0.9*base['score']+10.0*pace),1)
+    assert blended['rating'] in ('easy','medium','hard','master')
+    # Uncompleted runs carry data but never validate or blend the score.
+    partial=[{'seconds':60.0,'filled':1,'total':count,'mistakes':0,'mode':'free'}]
+    unvalidated=difficulty_profile(b,partial)
+    assert unvalidated['score']==base['score']
+    assert unvalidated['metrics']['playtestCount']==1
+
+def test_emit_bundle_reads_playtest_records(svg_asset,tmp_path):
+    b=load_bundle(svg_asset/'bundle')
+    out=tmp_path/'rev';out.mkdir()
+    write_json(out/'playtests.json',[{'seconds':42.0,'filled':2,'total':2,'mistakes':1,'mode':'number'}])
+    emit_bundle(out,b,previews=False)
+    m=read_json(out/'artwork.json')
+    assert m['difficultyValidatedByPlaytest'] is True
+    assert m['difficulty']['metrics']['playtestCount']==1
+    qa=read_json(out/'validation.json')
+    assert 'blended' in qa['difficulty']['note']

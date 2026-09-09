@@ -4,10 +4,26 @@
  *  Stage 2 adds: the inspect-view tool row (Select / Cut / Pen) with a drawing
  *  overlay for cut lines and pen shapes (AlertDialog / Popover confirmations),
  *  the play-test coloring-mode switch, the free-color cluster (custom hex +
- *  recents) and the compact difficulty mini-panel. */
+ *  recents) and the compact difficulty mini-panel. Stage 3 adds the Node tool
+ *  (drag boundary anchors, contract A) and play-test recording with the run
+ *  clock + playtest difficulty rows (contract B). */
 
-import { useRef, useState } from "react";
-import { Gauge, Maximize2, MousePointer2, PenTool, RotateCcw, Scissors, Search, Sparkles, Undo2, ZoomIn, ZoomOut } from "lucide-react";
+import { useCallback, useEffect, useRef, useState } from "react";
+import {
+  Gauge,
+  Maximize2,
+  MousePointer2,
+  PenTool,
+  RotateCcw,
+  Scissors,
+  Search,
+  Sparkles,
+  Timer,
+  Undo2,
+  Waypoints,
+  ZoomIn,
+  ZoomOut,
+} from "lucide-react";
 import { toast } from "sonner";
 
 import {
@@ -26,10 +42,17 @@ import { Popover, PopoverAnchor, PopoverContent } from "@/components/ui/popover"
 import { Progress } from "@/components/ui/progress";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Textarea } from "@/components/ui/textarea";
-import type { BoardMode, VectorBoard } from "@/lib/detailed-board";
+import type { BoardMode, EdgeEntry, VectorBoard } from "@/lib/detailed-board";
 import { imageUrl, masterSvgUrl, type DifficultyProfile } from "@/lib/studio-api";
+import { flattenPath, polylineNearestDistance } from "@/lib/svg-path";
 import { VIEW_LABELS, type StudioTool, type StudioView, useStudioContext } from "./use-studio";
-import { DIFFICULTY_TIERS, normalizeDifficulty } from "./difficulty";
+import {
+  DIFFICULTY_TIERS,
+  PlaytestValidatedBadge,
+  difficultyMetricNumber,
+  formatPlaytestClock,
+  normalizeDifficulty,
+} from "./difficulty";
 import ZoomLab from "./zoom-lab";
 
 const VIEW_ORDER: StudioView[] = ["master", "colored", "numbered", "play", "inspect", "zoomlab"];
@@ -38,6 +61,7 @@ const TOOL_HINTS: Record<StudioTool, string> = {
   select: "Tap regions to select",
   cut: "Drag a line across a region to cut it",
   pen: "Draw a closed shape to create a region",
+  node: "Tap a boundary between two regions, then drag its anchor points.",
 };
 
 const MODE_HINTS: Record<BoardMode, string> = {
@@ -145,6 +169,26 @@ function pathFromPoints(pts: ArtPt[], close: boolean): string {
   return `M ${pts.map((p) => `${fmt(p.x)},${fmt(p.y)}`).join(" L ")}${close ? " Z" : ""}`;
 }
 
+/** Node tool (stage 3, contract A): the selected shared boundary. Anchors
+ *  are stored in ART units; rendering converts them to client px so they
+ *  stay a constant on-screen size at any zoom. */
+interface NodeEdgeState {
+  edgeId: string;
+  left: string;
+  right: string;
+  kind: string;
+  /** True for closed (Z) boundary rings — a full outline whose last vertex
+   *  equals the first. The anchor list stores UNIQUE vertices; the render
+   *  closes the ring visually and the submission re-appends Z. */
+  closed: boolean;
+  /** Original flattened boundary polyline (art units) — the ghost line. */
+  base: ArtPt[];
+  /** Draggable anchor positions (art units). */
+  anchors: ArtPt[];
+  /** Index of the anchor currently being dragged, null when idle. */
+  dragging: number | null;
+}
+
 /** Art-space point → canvas-container-relative CSS position (px, clamped
  *  inside the canvas; "50%" center fallback). Anchors the Pen confirm
  *  popover at the drawn shape's centroid. */
@@ -164,9 +208,16 @@ function artPointToCanvas(board: VectorBoard, x: number, y: number): { left: num
 }
 
 /** Compact difficulty summary (contract §5): 4-tier bar + score in one row.
+ *  Stage 3 (contract B) adds the play-test metrics line + validated pill.
  *  Legacy "unrated" strings normalize to a muted note; the full metric table
  *  lives in the right panel (DifficultyPanel). */
-function DifficultyMini({ raw }: { raw: string | DifficultyProfile | undefined }) {
+function DifficultyMini({
+  raw,
+  validated,
+}: {
+  raw: string | DifficultyProfile | undefined;
+  validated?: boolean;
+}) {
   const d = normalizeDifficulty(raw);
   if (!d) {
     return (
@@ -178,6 +229,11 @@ function DifficultyMini({ raw }: { raw: string | DifficultyProfile | undefined }
       </p>
     );
   }
+  const metrics = d.profile.metrics ?? {};
+  const ptCount = difficultyMetricNumber(metrics, "playtestCount");
+  const ptMedian = difficultyMetricNumber(metrics, "playtestMedianSeconds");
+  const ptPace = difficultyMetricNumber(metrics, "playtestSecondsPerRegion");
+  const ptMistakes = difficultyMetricNumber(metrics, "playtestMistakesPerRegion");
   return (
     <div
       className="mt-2.5 flex flex-wrap items-center gap-x-2.5 gap-y-1 rounded-lg border border-[#e1e5df] bg-white/70 px-3 py-2"
@@ -201,6 +257,15 @@ function DifficultyMini({ raw }: { raw: string | DifficultyProfile | undefined }
       <span className="text-[10px] font-bold" style={{ color: d.tier.color }}>
         {d.tier.label} · {d.score}/100
       </span>
+      {ptCount != null && (
+        <span className="text-[10px] text-[#657671]">
+          {`Playtests ${ptCount.toLocaleString("en-US")}`}
+          {ptMedian != null ? ` · median ${formatPlaytestClock(ptMedian)}` : ""}
+          {ptPace != null ? ` · ${ptPace.toFixed(1)} s/region` : ""}
+          {ptMistakes != null ? ` · ${ptMistakes.toFixed(2)} mistakes/region` : ""}
+        </span>
+      )}
+      {validated && <PlaytestValidatedBadge />}
     </div>
   );
 }
@@ -225,6 +290,8 @@ export function CanvasWorkspace() {
     setTool,
     cutRegion,
     drawRegion,
+    nodeEdit,
+    recordPlaytest,
     freeColor,
     setBoardFreeColor,
     recentColors,
@@ -286,6 +353,16 @@ export function CanvasWorkspace() {
   const [penPalette, setPenPalette] = useState("1");
   const [penGroup, setPenGroup] = useState("");
 
+  // ---------------------------------------------------- node tool (contract A)
+
+  const [nodeEdge, setNodeEdge] = useState<NodeEdgeState | null>(null);
+  const [nodeConfirmOpen, setNodeConfirmOpen] = useState(false);
+  /** Tap bookmark for the node overlay (pointerdown position). */
+  const nodeTapRef = useRef<{ x: number; y: number } | null>(null);
+  /** The drawing overlay svg itself — node anchors render in its client-px
+   *  coordinate space (viewBox undefined), so its rect defines the origin. */
+  const overlaySvgRef = useRef<SVGSVGElement | null>(null);
+
   const toolActive = view === "inspect" && hasBundle && tool !== "select" && !busy;
 
   const strokeWidthArt = (() => {
@@ -297,6 +374,13 @@ export function CanvasWorkspace() {
   const beginStroke = (e: React.PointerEvent<SVGSVGElement>) => {
     const board = boardRef.current;
     if (!board) return;
+    // Node tool: the pointerdown only bookmarks the tap — the boundary is
+    // picked on pointerup IF the pointer did not drag (anchor handles stop
+    // propagation before this, so drags never bookmark).
+    if (tool === "node") {
+      nodeTapRef.current = { x: e.clientX, y: e.clientY };
+      return;
+    }
     const p = board.clientToArt(e.clientX, e.clientY);
     if (!p) return;
     // Freeze the overlay to the board's CURRENT viewBox: the overlay eats the
@@ -326,6 +410,16 @@ export function CanvasWorkspace() {
   };
 
   const endStroke = (e: React.PointerEvent<SVGSVGElement>) => {
+    // Node tool: resolve the bookmarked tap (down+up without a significant
+    // drag). Tapping empty canvas clears the current boundary selection.
+    if (tool === "node") {
+      const tap = nodeTapRef.current;
+      nodeTapRef.current = null;
+      if (tap && Math.hypot(e.clientX - tap.x, e.clientY - tap.y) < 8) {
+        pickNodeEdge(e.clientX, e.clientY);
+      }
+      return;
+    }
     const raw = strokeRef.current;
     strokeRef.current = [];
     setStrokePts([]);
@@ -337,7 +431,9 @@ export function CanvasWorkspace() {
       }
     }
     const board = boardRef.current;
-    if (!board || !raw.length || tool !== "cut" && tool !== "pen") return;
+    // Node mode returned above before any stroke could start; this guard
+    // keeps the stroke path cut/pen-only.
+    if (!board || !raw.length || (tool !== "cut" && tool !== "pen")) return;
     const pts = rdp(dropDensePoints(raw, 2), 1.2);
     if (tool === "cut") {
       if (pts.length < 2) {
@@ -384,6 +480,197 @@ export function CanvasWorkspace() {
     void drawRegion(draw.d, paletteId, penGroup.trim() || undefined).catch((e: Error) => toast(e.message));
   };
 
+  // ------------------------------------------- node tool handlers (contract A)
+
+  /** Pick the nearest shared boundary (both sides non-null) within ~24 art
+   *  units of the tap — the tap point is converted through board.clientToArt
+   *  exactly like the cut overlay. No hit clears the current selection. */
+  const pickNodeEdge = (clientX: number, clientY: number) => {
+    const board = boardRef.current;
+    if (!board || !bundle) return;
+    const p = board.clientToArt(clientX, clientY);
+    if (!p) return;
+    const edges = bundle.geometry.edges ?? [];
+    let best: { edge: EdgeEntry; dist: number } | null = null;
+    for (const e of edges) {
+      if (!e.leftRegion || !e.rightRegion) continue;
+      const pts = flattenPath(e.d);
+      if (pts.length < 2) continue;
+      const dist = polylineNearestDistance(pts, { x: p.x, y: p.y });
+      if (!best || dist < best.dist) best = { edge: e, dist };
+    }
+    if (!best || best.dist > 24) {
+      setNodeEdge(null);
+      setNodeConfirmOpen(false);
+      toast("Tap directly on a boundary between two regions.");
+      return;
+    }
+    const left = best.edge.leftRegion;
+    const right = best.edge.rightRegion;
+    if (!left || !right) return; // filtered above; keeps narrowing honest
+    const raw = flattenPath(best.edge.d);
+    // Closed rings (Z outlines are the norm for full boundary loops) end with
+    // a repeat of the first vertex: flattenPath pushes it for hit-testing, but
+    // the anchor list keeps UNIQUE vertices (a duplicate handle would let the
+    // start and end drift apart when dragged). The ring closes visually and
+    // the submission re-appends Z.
+    const closed =
+      raw.length >= 4 &&
+      Math.hypot(raw[raw.length - 1].x - raw[0].x, raw[raw.length - 1].y - raw[0].y) < 0.05;
+    const base = closed ? raw.slice(0, -1) : raw;
+    // Capture the art→client transform NOW (event context — refs readable)
+    // so the anchors render on the very first frame after selection.
+    captureNodeTransform();
+    setNodeEdge({
+      edgeId: best.edge.id,
+      left,
+      right,
+      kind: best.edge.kind,
+      closed,
+      base,
+      anchors: base.map((q) => ({ x: q.x, y: q.y })),
+      dragging: null,
+    });
+  };
+
+  /** Anchor pointerdown: the handle owns its pointer (capture) and stops the
+   *  overlay from treating this as a boundary-selection tap. */
+  const beginNodeDrag = (e: React.PointerEvent<SVGCircleElement>, i: number) => {
+    e.stopPropagation();
+    try {
+      e.currentTarget.setPointerCapture(e.pointerId);
+    } catch {
+      /* synthetic events / stale ids — continue without capture */
+    }
+    setNodeEdge((prev) => (prev ? { ...prev, dragging: i } : prev));
+  };
+
+  /** Anchor pointermove: the art-space position under the pointer replaces
+   *  the dragged anchor (client→art via board.clientToArt; no distance
+   *  limit — the server validates the resulting boundary). */
+  const extendNodeDrag = (e: React.PointerEvent<SVGCircleElement>) => {
+    const board = boardRef.current;
+    if (!board) return;
+    const p = board.clientToArt(e.clientX, e.clientY);
+    if (!p) return;
+    setNodeEdge((prev) => {
+      if (!prev || prev.dragging == null) return prev;
+      const dragging = prev.dragging;
+      return { ...prev, anchors: prev.anchors.map((a, i) => (i === dragging ? { x: p.x, y: p.y } : a)) };
+    });
+  };
+
+  const endNodeDrag = (e: React.PointerEvent<SVGCircleElement>) => {
+    if (e.currentTarget.hasPointerCapture?.(e.pointerId)) {
+      try {
+        e.currentTarget.releasePointerCapture(e.pointerId);
+      } catch {
+        /* pointer already released */
+      }
+    }
+    setNodeEdge((prev) => (prev && prev.dragging != null ? { ...prev, dragging: null } : prev));
+  };
+
+  /** Confirm: submit the dragged anchors as the new boundary polyline
+   *  between the edge's two regions (edit action "node"). Closed rings
+   *  re-append Z so the server receives the full outline. */
+  const confirmNode = () => {
+    const edge = nodeEdge;
+    if (!edge) return;
+    setNodeConfirmOpen(false);
+    setNodeEdge(null);
+    void nodeEdit([edge.left, edge.right], pathFromPoints(edge.anchors, edge.closed)).catch((e: Error) => toast(e.message));
+  };
+
+  /** Art → client-px transform for the node overlay (captured OUTSIDE render
+   *  — refs may only be read in handlers/effects). Stored as plain matrix
+   *  components so render stays a pure map over `nodeEdge` state. */
+  const [nodeTransform, setNodeTransform] = useState<{
+    a: number;
+    b: number;
+    c: number;
+    d: number;
+    e: number;
+    f: number;
+    ox: number;
+    oy: number;
+  } | null>(null);
+
+  const captureNodeTransform = useCallback(() => {
+    const board = boardRef.current;
+    const overlay = overlaySvgRef.current;
+    if (!board || !overlay) return;
+    try {
+      const ctm = board.svg.getScreenCTM();
+      const rect = overlay.getBoundingClientRect();
+      if (!ctm || !rect.width || !rect.height) return;
+      setNodeTransform({ a: ctm.a, b: ctm.b, c: ctm.c, d: ctm.d, e: ctm.e, f: ctm.f, ox: rect.left, oy: rect.top });
+    } catch {
+      /* layout unavailable — the observer pass retries */
+    }
+  }, [boardRef]);
+
+  // Render-time adjustments (the free-color sync pattern below): leaving the
+  // Node tool or the inspect view — or a bundle change replacing the board —
+  // discards the selected boundary + its confirm state; entering node mode
+  // resets the overlay to client-space coordinates (viewBox undefined →
+  // 1 user unit = 1 client px).
+  const nodeSessionKey =
+    tool === "node" && view === "inspect" && bundle ? `${bundle.manifest.id}:${bundle.manifest.version}` : null;
+  const [syncedNodeSession, setSyncedNodeSession] = useState<string | null>(null);
+  if (nodeSessionKey !== syncedNodeSession) {
+    setSyncedNodeSession(nodeSessionKey);
+    setNodeEdge(null);
+    setNodeConfirmOpen(false);
+    if (nodeSessionKey != null) setStrokeViewBox(null);
+  }
+
+  // Keep the anchors glued to the artwork when the board view changes
+  // underneath (toolbar zoom / fit / focus — the overlay itself blocks
+  // direct board gestures) and when the window resizes the canvas.
+  const nodeEdgeId = nodeEdge?.edgeId ?? null;
+  useEffect(() => {
+    if (!nodeEdgeId) return;
+    const svg = boardRef.current?.svg;
+    if (!svg) return;
+    captureNodeTransform();
+    const refresh = () => captureNodeTransform();
+    let observer: MutationObserver | null = null;
+    if (typeof MutationObserver !== "undefined") {
+      observer = new MutationObserver(refresh);
+      observer.observe(svg, { attributes: true, attributeFilter: ["viewBox"] });
+    }
+    window.addEventListener("resize", refresh);
+    return () => {
+      observer?.disconnect();
+      window.removeEventListener("resize", refresh);
+    };
+  }, [nodeEdgeId, boardRef, captureNodeTransform]);
+
+  // Node overlay geometry: pure art → client px application of the captured
+  // transform — the anchor handles keep a constant on-screen size at any
+  // zoom. Null until a boundary is selected AND the transform is captured.
+  // Closed rings draw the closing segment (anchorLine re-appends the first
+  // vertex) while the draggable circles stay on the UNIQUE vertices.
+  const closeRing = (pts: Array<{ x: number; y: number }>) =>
+    nodeEdge?.closed && pts.length > 2 ? [...pts, pts[0]] : pts;
+  const nodeGeometry =
+    nodeEdge && nodeTransform
+      ? (() => {
+          const toClient = (p: { x: number; y: number }) => ({
+            x: nodeTransform.a * p.x + nodeTransform.c * p.y + nodeTransform.e - nodeTransform.ox,
+            y: nodeTransform.b * p.x + nodeTransform.d * p.y + nodeTransform.f - nodeTransform.oy,
+          });
+          const base = nodeEdge.base.map(toClient);
+          const anchors = nodeEdge.anchors.map(toClient);
+          return {
+            baseLine: closeRing(base),
+            anchorLine: closeRing(anchors),
+            anchors,
+          };
+        })()
+      : null;
+
   // ----------------------------------------------------- free color (play view)
 
   const [freeHex, setFreeHex] = useState(freeColor);
@@ -404,6 +691,66 @@ export function CanvasWorkspace() {
     }
     setFreeHex(hex.toUpperCase());
     setBoardFreeColor(hex);
+  };
+
+  // ---------------------------------------- play-test run clock (contract B)
+
+  const [playStartMs, setPlayStartMs] = useState<number | null>(null);
+  const [playElapsed, setPlayElapsed] = useState(0);
+  const [playtestRecorded, setPlaytestRecorded] = useState(false);
+  const [playtestSaving, setPlaytestSaving] = useState(false);
+
+  // Fresh-run tracking (render-time adjustment, same pattern): the run clock
+  // (re)starts when the play view is at progress 0 — board mount, "Reset
+  // test", or a revision change — which also lifts the already-recorded
+  // guard so a fresh run can be recorded again.
+  const playRunKey =
+    view === "play" && bundle && (boardState?.completed ?? 0) === 0
+      ? `${bundle.manifest.id}:${bundle.manifest.version}`
+      : null;
+  const [syncedPlayRun, setSyncedPlayRun] = useState<string | null>(null);
+  if (playRunKey !== syncedPlayRun) {
+    setSyncedPlayRun(playRunKey);
+    if (playRunKey != null) {
+      setPlayStartMs(Date.now());
+      setPlayElapsed(0);
+      setPlaytestRecorded(false);
+    }
+  }
+
+  // One-second tick while the play view is mounted — the record button shows
+  // the live run clock. Cleared on view change / unmount (no leaks); recreated
+  // when the clock itself restarts so the closure stays fresh.
+  useEffect(() => {
+    if (view !== "play") return;
+    const id = window.setInterval(() => {
+      setPlayElapsed(playStartMs != null ? Math.floor((Date.now() - playStartMs) / 1000) : 0);
+    }, 1000);
+    return () => window.clearInterval(id);
+  }, [view, playStartMs]);
+
+  const playtestComplete = total > 0 && completed === total;
+  const playtestReady = playtestComplete && !playtestRecorded && !playtestSaving;
+  const playClockLabel = playStartMs != null ? formatPlaytestClock(playElapsed) : null;
+
+  /** Submit the completed run (contract B) — the context action patches the
+   *  difficulty profile in-context; the board is NOT remounted. */
+  const recordPlaytestRun = () => {
+    const seconds = playStartMs != null ? Math.round((Date.now() - playStartMs) / 1000) : 0;
+    if (seconds < 10) {
+      toast("Playtest must run at least 10 seconds.");
+      return;
+    }
+    setPlaytestSaving(true);
+    void recordPlaytest({ seconds, filled: completed, total, mistakes, mode: boardMode })
+      .then(() => {
+        setPlaytestSaving(false);
+        setPlaytestRecorded(true);
+      })
+      .catch((e: Error) => {
+        setPlaytestSaving(false);
+        toast(e.message);
+      });
   };
 
   return (
@@ -615,12 +962,15 @@ export function CanvasWorkspace() {
         {toolActive && (
           <div className="absolute inset-3.5 z-[3]">
             <svg
+              ref={overlaySvgRef}
               xmlns="http://www.w3.org/2000/svg"
               viewBox={strokeViewBox ?? undefined}
               className="h-full w-full touch-none select-none"
               style={{ pointerEvents: "auto", cursor: "crosshair" }}
               role="img"
-              aria-label={`Drawing layer — ${tool === "cut" ? "cut line" : "pen shape"} in progress`}
+              aria-label={`Drawing layer — ${
+                tool === "cut" ? "cut line" : tool === "pen" ? "pen shape" : "boundary anchors"
+              } in progress`}
               onPointerDown={beginStroke}
               onPointerMove={extendStroke}
               onPointerUp={endStroke}
@@ -636,6 +986,54 @@ export function CanvasWorkspace() {
                   strokeLinecap="round"
                   strokeLinejoin="round"
                 />
+              )}
+              {/* Node tool (contract A): ghost of the ORIGINAL boundary + the
+                  live polyline through the dragged anchors, both converted to
+                  client px (viewBox undefined above) so the anchor handles
+                  keep a constant on-screen size at any zoom. Only the circles
+                  take pointer events — the lines never block board taps. */}
+              {tool === "node" && nodeEdge && nodeGeometry && (
+                <g
+                  role="group"
+                  aria-label={`Boundary anchors between ${nodeEdge.left} and ${nodeEdge.right}`}
+                >
+                  <g style={{ pointerEvents: "none" }}>
+                    <polyline
+                      points={nodeGeometry.baseLine.map((p) => `${p.x},${p.y}`).join(" ")}
+                      fill="none"
+                      stroke="#9aa7a1"
+                      strokeWidth={1}
+                      strokeDasharray="4 4"
+                      strokeLinecap="round"
+                      strokeLinejoin="round"
+                    />
+                    <polyline
+                      points={nodeGeometry.anchorLine.map((p) => `${p.x},${p.y}`).join(" ")}
+                      fill="none"
+                      stroke="#087f74"
+                      strokeWidth={2}
+                      strokeLinecap="round"
+                      strokeLinejoin="round"
+                    />
+                  </g>
+                  {nodeGeometry.anchors.map((p, i) => (
+                    <circle
+                      key={i}
+                      cx={p.x}
+                      cy={p.y}
+                      r={nodeEdge.dragging === i ? 7 : 5}
+                      fill={nodeEdge.dragging === i ? "#087f74" : "white"}
+                      stroke="#087f74"
+                      strokeWidth={1.5}
+                      style={{ cursor: nodeEdge.dragging === i ? "grabbing" : "grab" }}
+                      aria-label={`Boundary anchor ${i + 1} of ${nodeGeometry.anchors.length}`}
+                      onPointerDown={(e) => beginNodeDrag(e, i)}
+                      onPointerMove={extendNodeDrag}
+                      onPointerUp={endNodeDrag}
+                      onPointerCancel={endNodeDrag}
+                    />
+                  ))}
+                </g>
               )}
             </svg>
           </div>
@@ -736,7 +1134,10 @@ export function CanvasWorkspace() {
       {/* Compact difficulty mini-panel (contract §5) — full metrics live in
           the right panel (DifficultyPanel). */}
       {hasBundle && view !== "master" && view !== "zoomlab" && (
-        <DifficultyMini raw={bundle?.manifest.difficulty} />
+        <DifficultyMini
+          raw={bundle?.manifest.difficulty}
+          validated={bundle?.manifest.difficultyValidatedByPlaytest}
+        />
       )}
 
       {/* Tools row (inspect view only) */}
@@ -752,6 +1153,7 @@ export function CanvasWorkspace() {
                 { key: "select", label: "Select", icon: MousePointer2 },
                 { key: "cut", label: "Cut", icon: Scissors },
                 { key: "pen", label: "Pen", icon: PenTool },
+                { key: "node", label: "Node", icon: Waypoints },
               ] as Array<{ key: StudioTool; label: string; icon: typeof MousePointer2 }>
             ).map((t) => (
               <button
@@ -760,9 +1162,11 @@ export function CanvasWorkspace() {
                 aria-pressed={tool === t.key}
                 disabled={busy}
                 onClick={() => {
-                  // Switching tools discards any pending cut/pen confirm.
+                  // Switching tools discards any pending cut/pen/node confirm.
                   setPendingCut(null);
                   setPendingDraw(null);
+                  setNodeEdge(null);
+                  setNodeConfirmOpen(false);
                   setTool(t.key);
                 }}
                 className={`flex min-h-11 items-center gap-1.5 rounded-md px-3 text-[10px] font-medium transition-colors disabled:opacity-50 ${
@@ -779,6 +1183,21 @@ export function CanvasWorkspace() {
           <span className="text-[10px] text-[#778481]" role="status">
             {busy ? "Waiting for the current job…" : TOOL_HINTS[tool]}
           </span>
+          {/* Boundary confirm trigger (contract A): visible once the Node tool
+              has a selected boundary. */}
+          {tool === "node" && nodeEdge && (
+            <Button
+              variant="outline"
+              size="sm"
+              className="h-8 rounded-md border-[#cfe6db] bg-[#e5f3ed] text-[10px] font-semibold text-[#126e5e] hover:bg-[#d9ede2] disabled:opacity-50"
+              aria-label="Apply boundary edit"
+              disabled={busy}
+              onClick={() => setNodeConfirmOpen(true)}
+            >
+              <Waypoints className="size-3.5" aria-hidden />
+              Apply
+            </Button>
+          )}
         </div>
       )}
 
@@ -811,6 +1230,43 @@ export function CanvasWorkspace() {
             >
               <Scissors className="size-3.5" aria-hidden />
               {busy ? "Cutting…" : "Cut region"}
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+
+      {/* Node boundary confirmation (contract A) — the dragged anchors become
+          the new shared boundary. Cancel / Escape discards the selection. */}
+      <AlertDialog
+        open={nodeConfirmOpen}
+        onOpenChange={(open) => {
+          if (!open) {
+            setNodeConfirmOpen(false);
+            setNodeEdge(null);
+          }
+        }}
+      >
+        <AlertDialogContent className="rounded-xl border-[#cfe6db] sm:max-w-md">
+          <AlertDialogHeader>
+            <AlertDialogTitle className="text-left text-sm text-[#183837]">
+              Rebuild the shared boundary between {nodeEdge?.left} and {nodeEdge?.right}?
+            </AlertDialogTitle>
+            <AlertDialogDescription className="text-left text-[11px] leading-relaxed text-[#657671]">
+              Moving the anchors redraws the boundary between the two regions; both stay playable tap targets and the
+              boundary keeps its line style.
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter className="gap-2 sm:justify-end">
+            <AlertDialogCancel className="h-9 rounded-md border-[#e1e5df] bg-white text-[10px]">
+              Cancel
+            </AlertDialogCancel>
+            <AlertDialogAction
+              className="h-9 rounded-md bg-[#087f74] text-[10px] font-semibold text-white hover:bg-[#056c62]"
+              disabled={busy}
+              onClick={confirmNode}
+            >
+              <Waypoints className="size-3.5" aria-hidden />
+              {busy ? "Applying…" : "Apply boundary"}
             </AlertDialogAction>
           </AlertDialogFooter>
         </AlertDialogContent>
@@ -854,7 +1310,27 @@ export function CanvasWorkspace() {
                 ? `${completed} / ${total} regions filled · ${mistakes} incorrect attempts`
                 : "Choose a color to test"}
             </span>
-            <div className="flex gap-0.5">
+            <div className="flex flex-wrap gap-0.5">
+              {view === "play" && (
+                <Button
+                  variant="outline"
+                  size="sm"
+                  className="h-6 rounded-md border-[#cfe6db] bg-white px-2 text-[9px] font-semibold text-[#126e5e] hover:bg-[#f0f7f3] disabled:opacity-50"
+                  disabled={!playtestReady}
+                  onClick={recordPlaytestRun}
+                  aria-label="Record playtest result"
+                  title={
+                    playtestComplete
+                      ? "Record this completed run as a play-test difficulty sample"
+                      : "Fill every region to enable play-test recording"
+                  }
+                >
+                  <Timer className="size-3" aria-hidden />
+                  {playtestRecorded
+                    ? "Playtest recorded"
+                    : `Record playtest${playClockLabel != null ? ` (${playClockLabel})` : ""}`}
+                </Button>
+              )}
               <Button
                 variant="ghost"
                 size="sm"

@@ -58,11 +58,11 @@ class PromoteRequest(StrictModel):
 
 class EditRequest(StrictModel):
     base_revision: str
-    action: Literal['merge', 'group', 'palette', 'recolor', 'label', 'decorate', 'split', 'cut', 'draw']
+    action: Literal['merge', 'group', 'palette', 'recolor', 'label', 'decorate', 'split', 'cut', 'draw', 'node']
     region_ids: list[str] = Field(max_length=1600,
-        description='Validated per action: merge>=2, split/cut/label=1, draw=0, others>=1.')
+        description='Validated per action: merge>=2, split/cut/label=1, node=2 (the two regions sharing the dragged boundary), draw=0, others>=1.')
     d: str | None = Field(None, pattern=r'^M[\s\d.,eE+\-MLQCZ]+$',
-        description="SVG path data in master units: 'cut' = open line crossing the region, 'draw' = closed pen shape (Z closes it).")
+        description="SVG path data in master units: 'cut' = open line crossing the region, 'draw' = closed pen shape (Z closes it), 'node' = the dragged new shared-boundary polyline.")
     group: str = Field('unassigned', pattern=r'^[a-z][a-z0-9_-]{0,39}$')
     palette_id: int | None = None
     x: float | None = Field(None, allow_inf_nan=False)
@@ -75,6 +75,14 @@ class ReviewRequest(StrictModel):
     revision: str
     note: str = Field(min_length=10, max_length=1500)
     confirmed: bool
+
+class PlaytestRecord(StrictModel):
+    """One completed play-test run recorded against a revision."""
+    seconds: float = Field(..., ge=10, le=86400)
+    filled: int = Field(..., ge=1)
+    total: int = Field(..., ge=1)
+    mistakes: int = Field(..., ge=0)
+    mode: Literal['number', 'memory', 'free']
 
 class ActivateRequest(StrictModel):
     revision: str

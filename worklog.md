@@ -955,3 +955,328 @@ Stage Summary:
   boundary anchors), the mjs adapter port of the full underpainting cache
   (adapter currently has edges/free-color/rAF only), multistage live run
   (paid), and play-test-time inclusion in the difficulty profile.
+
+---
+Task ID: 11
+Agent: main (Z.ai Code)
+Task: Restore AI configuration (studio reported ai.configured=false after environment restart)
+
+Work Log:
+- Found `mini-services/color-duel-studio/.env` missing (config showed default chatModel gpt-5.4-mini) while the ai-bridge :8787 was still healthy.
+- Recreated `.env` (OPENAI_API_KEY=local-z-ai-bridge, AI_BASE_URL=http://127.0.0.1:8787/v1/, CHAT_MODEL=glm-4.6, IMAGE_MODEL=cogview-4).
+- Learned that plain `nohup ... &` dies when the tool shell is reaped; restarted the studio via the sanctioned double-fork launcher:
+  `python3 /home/z/my-project/.zscripts/daemon.py /home/z/my-project/mini-services/color-duel-studio <dir>/studio.log -- bun run dev`
+- Verified across separate shell calls: /api/config → ai.configured=true (glm-4.6 / cogview-4); /api/projects HTTP 200 (workspace intact: treehouse + SVG-master test projects); bridge healthz 200; Next :3000 200.
+
+Stage Summary:
+- Studio backend is again fully configured (AI chat/generate/SVG live through the z-ai bridge). Restart recipe for any future backend change: kill the 8765 listener pid, then run the daemon.py command above.
+
+---
+Task ID: 12
+Agent: main (Z.ai Code)
+Task: Stage-3 kickoff — define the shared contract for the three remaining gaps (node editing, play-test difficulty factor, shipped-adapter underpainting cache) and dispatch the implementation tasks.
+
+Work Log:
+- Read pipeline.py edit_bundle (actions merge/split/cut/draw/group/palette/recolor/label/decorate; _emit_classified_edges signature; need-dict per-action counts), difficulty_profile (metrics + score blend), app.py routes, models.py EditRequest.
+- Read src/lib/detailed-board.ts underpainting implementation (serializeGradientDefs/serializeArtPath/serializeInkPath/wrapStandaloneSvg/buildUnderpainting/mountUnderpaintImage/blobUrls cleanup) and the shipped integration/detailed-board.mjs layer structure (data-layer vector-paint / ink / edges groups, rAF gestures, freeColors).
+- Read frontend patterns: use-studio.tsx (StudioTool, runEdit → job → revision reload, setBoardFreeColor), canvas-workspace.tsx (tool row, drawing overlay with board.clientToArt + rdp + pathFromPoints, cut/pen confirm dialogs, play progress "N / total regions filled · M incorrect attempts").
+- Verified all services healthy (studio 8765 / bridge 8787 / next 3000 / gateway 81).
+
+Stage Summary — STAGE-3 SHARED CONTRACT (binding for tasks 13-a/13-b/13-c):
+
+### A. Edit action "node" — drag boundary anchors (task 13-a backend + 13-b frontend)
+API: existing POST /api/projects/{pid}/edit (X-Studio-Request: 1). Body:
+  { base_revision, action: "node", region_ids: ["<left>","<right>"] (EXACTLY 2 — the edge's leftRegion/rightRegion), d: "M x y L ..." (NEW open boundary polyline, master/art units) }
+Server semantics (pipeline.edit_bundle):
+ 1. models.py: action literal + 'node'; region_ids description notes node=2; need-dict node:2, exactly-two validation.
+ 2. Find the existing edges entry E whose {leftRegion,rightRegion} equals the chosen pair (either orientation); else ValueError "Select a shared boundary between exactly two regions."
+ 3. old_line / new_line = longest polyline of flatten_d(E.d) / flatten_d(request.d); no-op guard (Hausdorff < 0.75 or lens area < 1 px²) → "Drag at least one anchor to a new position."
+ 4. Lens S = make_valid Polygon(ring = old_line.coords + reversed new_line.coords).
+ 5. Spill guard: union of all OTHER region+decoration polygons (excl. A,B); if area(S ∩ others) > max(2.0, 0.02·area(S)) → "The dragged boundary crosses other regions — keep it between the two selected regions."
+ 6. A' = make_valid((A − S) ∪ (S ∩ B)); B' = make_valid((B − S) ∪ (S ∩ A)).
+ 7. Result guards: non-empty, geom_type Polygon (Multi → "The drag would split region X into disconnected pieces."), area ≥ min_region_pixels (→ "…too small to tap").
+ 8. Rebuild with ids r-n-<sha12 sorted-pair + version + idx>, pack_region(..., source='node-edit') preserving paletteId/objectId/masterShapeId; prune edges referencing A|B; partitionTolerance += max symmetric_difference deviation + 0.01; provenance.lastEdit='node'. QA+difficulty recompute automatic.
+ 9. Edge re-emission: prior_art_lines from artwork edges of A|B BEFORE pruning; ref_lines=[LineString(new_line)]; near_kind = E.kind (artwork boundaries STAY artwork); far_kind = other; _emit_classified_edges for A' and B' with self_id.
+Frontend: StudioTool + "node" (+ hint + lucide icon), tool row button; tap near an edge (both sides non-null, within ~24 art-px) selects it; anchors = flattenPath(e.d) rendered draggable on the drawing overlay (clientToArt), ghost of original line + live polyline; AlertDialog confirm → runEdit('node', {d: pathFromPoints(anchors,false)}, [left,right]). New util src/lib/svg-path.ts: flattenPath(d, curveSamples=8) → {x,y}[] parsing absolute+relative M/L/C/Q/Z with de Casteljau sampling (also used for edge-hit distance).
+
+### B. Play-test difficulty factor (13-a backend + 13-b frontend)
+API (new): POST /api/projects/{pid}/revisions/{revision}/playtest (X-Studio-Request: 1)
+ body { seconds: 10..86400, filled ≥1, total ≥1, mistakes ≥0, mode: 'number'|'memory'|'free' }
+ → appends {recordedAt, seconds, filled, total, mistakes, mode} to revisions/<rev>/playtests.json (cap 50), recomputes difficulty WITH playtests, rewrites the manifest difficulty block in place, returns {manifest, playtestCount, medianSeconds}. 404 unknown ids, 422 invalid body.
+pipeline.difficulty_profile(bundle, playtests=None): completed = entries with filled ≥ total; validated = len(completed) ≥ 1. New metrics when present: playtestCount, playtestMedianSeconds, playtestSecondsPerRegion (median/count), playtestMistakesPerRegion. Score blend when validated: pace = min(1, (medianSeconds/count)/20); score = round(0.9·base + 10·pace) (i.e. ±10% modulation); rating thresholds unchanged; m['difficultyValidatedByPlaytest'] = validated. emit_bundle: read playtests.json next to the output folder when present (new revision folders after edits start unvalidated).
+Frontend: play view tracks run start (board mount at progress 0 / reset); "Record playtest (m:ss)" button enabled when completed === total && total > 0; submit via new studio-api recordPlaytest(); on success toast + patch the in-context revision manifest difficulty (no full board remount); DifficultyPanel/DifficultyMini show playtest rows (count, median m:ss, s/region) + "Playtest validated" state; manifest type gains optional fields; legacy 'unrated' fallback unchanged.
+
+### C. Shipped mjs adapter underpainting cache (13-c)
+Port from src/lib/detailed-board.ts into integration/detailed-board.mjs AND web/detailed-board.mjs (kept in sync): serializeGradientDefs/serializeArtPath/serializeInkPath/wrapStandaloneSvg, buildUnderpainting (art = [...paths, ...inkPaths].sort(z) art-serialized; ink = inkPaths ink-serialized), mountUnderpaintImage (blob URL + Image probe + replaceChildren + xlink:href fallback, silent fallback keeps live paths), blobUrls revoked in destroy(). Target groups: data-layer 'vector-paint' (below masks) and 'ink' (above masks) — attribute logic must mirror each group's own live mount code. Keep ALL existing features (edges overlay, freeColors, rAF gestures). Extend scripts/adapter-contract-check.mjs to assert the underpaint swap (await image onload → group children = 1 image node) and run it + pytest tests/test_game_adapter.py.
+
+Task split (no file overlaps): 13-a = studio/{models.py,pipeline.py,app.py} + tests/test_pipeline.py + tests/test_api.py; 13-b = src/** only; 13-c = integration/ + web/ + scripts/adapter-contract-check.mjs + tests/test_game_adapter.py. Integration + live browser verification = task 14 (main).
+
+---
+Task ID: 13-c
+Agent: general-purpose
+Task: Port the cached-underpainting renderer (stage-3 contract §C) from
+src/lib/detailed-board.ts to the SHIPPED vanilla-JS game adapter
+(integration/ + web/ detailed-board.mjs) and extend the regression gates.
+
+Work Log:
+- Read the worklog stage-3 shared contract (§C binding), Task 8 §8 and the
+  9-a/9-b/10 entries; read integration/detailed-board.mjs fully (mount layer
+  groups 'vector-paint'/'ink'/edges, rAF gesture batching, freeColors,
+  destroy) and the TS underpainting (serializeGradientDefs/serializeArtPath/
+  serializeInkPath/wrapStandaloneSvg/buildUnderpainting/mountUnderpaintImage/
+  blobUrls cleanup).
+- integration/detailed-board.mjs (web/ copy kept byte-identical): ported the
+  module-level serializers — serializeGradientDefs (gradient defs cloned into
+  the standalone doc, userSpaceOnUse, null params skipped, XML-escaped),
+  serializeArtPath (EXACT mirror of the mjs live 'vector-paint' group: same
+  SAFE_HEX stroke-only skip, fill/fill-rule/stroke/stroke-width defaults
+  0.55/fill-opacity/opacity, and its stroke-override branch), serializeInkPath
+  (EXACT mirror of the mjs live 'ink' group: open stroke line art with
+  linecap/linejoin vs closed ink fills), wrapStandaloneSvg (BASE viewBox from
+  this.base — never the zoomed view — plus width/height).
+- VectorBoard additions: this.artLayer/this.inkLayer group refs captured in
+  mount(); blobUrls/underpaintAttempts/destroyed tracked; buildUnderpainting()
+  called at the end of mount() (art body = orderedPaint() z-sorted entries,
+  art-serialized skipping nulls; ink body = paint.inkPaths ink-serialized;
+  swap only when a body is non-empty AND the group exists — masks, labels,
+  edges overlay and hatch stay live SVG); mountUnderpaintImage (blob URL →
+  Image probe → onload creates one <image> with href + xlink:href fallback,
+  x/y/width/height = base box, preserveAspectRatio 'xMidYMid meet',
+  pointer-events none → group.replaceChildren(image); onerror releases the
+  blob and silently keeps the live paths; 'typeof Image' guard so headless
+  runs never crash); revokeUnderpaintBlobs() in destroy() AND at the top of
+  mount() (full re-mount); public underpaintState() → {attempted, blobCount}
+  for gate introspection. Header contract comment documents the stage-3
+  underpainting. Reset/undo/paint semantics untouched (static appearance).
+- serializeArtPath builds the SAME attrs objects the live mount builds and
+  stringifies them once (attrString + escapeXml) instead of concatenating
+  strings: the mjs live group's stroke-override branch would otherwise emit a
+  DUPLICATE stroke attribute in XML, which is a hard parse error when the
+  standalone SVG is decoded as an <image> (strict XML). Verified on the
+  MASTER_SVG fixture (rect with stroke #223311 width 2): single stroke attr,
+  gradient def cloned, nonzero rules + fill-opacity preserved.
+- scripts/adapter-contract-check.mjs extended: after the existing per-folder
+  validateBundle pass, every bundle is ALSO mounted headlessly on the shipped
+  VectorBoard (CheckEl DOM stubs, same technique as tests/adapter-board-
+  check.mjs, plus deterministic Image/blob-URL stubs — bun has no image
+  decode pipeline, so URL.createObjectURL captures the Blob and the probe
+  fires onload on a microtask). Assertions: live layer counts match the
+  documented mount rules; underpaintState {attempted, blobCount}; after the
+  probe lands each appearance group holds exactly ONE <image> node with
+  href/xlink:href, base-viewBox x/y/width/height, preserveAspectRatio and
+  pointer-events none; the serialized standalone docs start with the
+  xmlns+BASE viewBox header, carry the exact path counts, fill="none" only
+  for stroke ink, every url(#…) resolves to a gradient def cloned into THAT
+  doc, and no duplicate attributes anywhere; destroy() empties the board and
+  revokes every blob URL. Bundles without paint appearance must attempt 0
+  image mounts.
+- tests/test_game_adapter.py: +1 test (test_shipped_adapter_swaps_underpaint_
+  images) that runs the check on the compiled SVG-master fixture and requires
+  the underpaint gate line — the python side cannot run a DOM, so the real
+  assertions live in the bun gate (schema side unchanged; no new fields).
+- web/detailed-board.mjs synced with cp + cmp (byte-identical); grepped the
+  web demo — studio.mjs/index.html only use loadArtwork/VectorBoard public
+  API, no internals touched.
+- Fallback paths verified explicitly with one-off bun runs: probe onerror →
+  live paths kept (6 art/1 ink), blob released, attempted=2/blobCount=0;
+  missing Image global → mount OK, live paths kept, attempted=0, no crash.
+- Gates run: bun scripts/adapter-contract-check.mjs on examples/compiled-
+  treehouse (622 regions: 81 art live paths → 1 <image>, 1 ink → 1 <image>,
+  2 blob URLs revoked on destroy) and on a freshly compiled MASTER_SVG
+  bundle (gradient + stroke + nonzero + fill-opacity + open ink: 6 live
+  paths → 1 image, 1 → 1 image, gradient def cloned into both docs); bun
+  tests/adapter-board-check.mjs (31 assertions, 0 failures — unchanged
+  behavior for empty-paint bundles); /home/z/.venv/bin/python3.12 -m pytest
+  tests/test_game_adapter.py -q → 12 passed (11 baseline + 1 new).
+  tests/test_pipeline.py and tests/test_api.py NOT run (13-a is mid-edit on
+  them, per instructions). No studio/*.py, src/** or integration/
+  DetailedArtwork.jsx touched.
+
+Stage Summary:
+- Files changed: integration/detailed-board.mjs (+underpainting port),
+  web/detailed-board.mjs (byte-identical sync, cmp-verified),
+  scripts/adapter-contract-check.mjs (underpaint gate),
+  tests/test_game_adapter.py (+1 gate test).
+- Gate results: adapter-contract-check PASS on the 622-region treehouse and
+  a fresh SVG-master compile (underpaint swap + blob revoke asserted);
+  adapter-board-check 31/31; pytest tests/test_game_adapter.py 12/12.
+- Deviations from the TS reference (all deliberate, documented above):
+  (1) serializeInkPath omits fill-opacity on closed ink fills because the
+  mjs live 'ink' group renders without it — the cached image must match the
+  mjs fallback pixel-for-pixel (the TS serializer includes it; its own live
+  group also does). (2) 'typeof Image !== 'function'' guard for headless
+  environments. (3) serializeArtPath serializes the mount attrs object once
+  instead of string concatenation to make the stroke-override branch
+  XML-safe (no duplicate attributes — strict XML parse requirement for
+  decoded <image> docs). (4) The gate stubs Image/blob-URL deterministically
+  rather than awaiting a real decode (bun has no decode pipeline) and
+  asserts via underpaintState() + group nodes + serialized document content.
+- Next: task 14 (main) — live browser verification of the shipped adapter
+  and the web demo with the underpaint cache active.
+---
+Task ID: 13-a
+Agent: general-purpose
+Task: Stage-3 backend per the Task 12 shared contract — edit action "node"
+(drag boundary anchors between exactly two regions) and the play-test
+difficulty factor (playtests.json recording, difficulty blend, new playtest
+route).
+
+Work Log:
+- models.py: EditRequest action literal += 'node'; region_ids description now
+  documents node=2 (the pair sharing the dragged boundary) and d documents the
+  node polyline; new PlaytestRecord StrictModel (seconds 10..86400, filled>=1,
+  total>=1, mistakes>=0, mode number|memory|free).
+- pipeline.py edit_bundle, new 'node' branch (contract A, order per contract):
+  * need-dict {'merge':2,'split':1,'cut':1,'label':1,'node':2} + node hint
+    ('exactly two regions sharing a boundary') + an exact-two check; the
+    'exactly one region' tuple untouched.
+  * Pair match: first edges entry whose {leftRegion,rightRegion} == the chosen
+    pair (either orientation; edges None/empty or no match -> 'Select a shared
+    boundary between exactly two regions.').
+  * old_line = longest flatten_d(E.d) polyline; new_line = longest
+    flatten_d(request.d); missing/unparsable -> 'Draw the new boundary first —
+    drag at least one anchor.'
+  * No-op guard: Hausdorff(old,new) < 0.75 OR lens area < 1.0 -> 'Drag at
+    least one anchor to a new position.' Lens S = make_valid(Polygon(old.coords
+    + reversed new.coords)); polygon parts extracted + _safe_union (a
+    GeometryCollection from make_valid with zero-area line artifacts is
+    handled); failure treated as the no-op error.
+  * Spill guard: union of all OTHER region+decoration polygons; area(S ∩
+    others) > max(2.0, 0.02·area(S)) -> 'The dragged boundary crosses other
+    regions — keep it between the two selected regions.'
+  * A' = make_valid((A−S) ∪ (S∩B)), B' symmetric; guards: non-empty ('would
+    erase region …'), single Polygon (MultiPolygon/disconnected -> 'The drag
+    would split region X into disconnected pieces — keep the boundary in one
+    piece.'), area >= min_region_pixels ('Region X would be only N px² after
+    the drag — too small to tap.').
+  * Rebuild: prior_art_lines collected from artwork edges of the pair BEFORE
+    pruning; regions A,B removed; _prune_edges; ids 'r-n-'+sha12(sorted pair +
+    version + idx); pack_region(…, source='node-edit', fit_tolerance) with
+    paletteId/objectId/masterShapeId inherited (cut-branch pattern).
+  * Edge re-emission: _RegionIndex over the new regions; ref_lines=[new_line];
+    near_kind = E's ORIGINAL kind ('true boundary stays true': artwork stays
+    artwork, subdivision stays subdivision), far_kind = the other kind;
+    _emit_classified_edges for both A' and B' with self_id (prior_art re-check
+    stays subdivision-only per the existing helper — fine for artwork E).
+  * partitionTolerance += max symmetric_difference deviation + 0.01; the
+    shared edit_bundle tail (lastEdit='node', sourceMaster/build-settings
+    copy, QA + difficulty recompute) unchanged.
+- pipeline.py difficulty_profile(bundle, playtests=None) (contract B):
+  completed = entries with filled >= total; when playtests present, metrics
+  gain playtestCount / playtestMedianSeconds / playtestSecondsPerRegion /
+  playtestMistakesPerRegion (time+mistakes from the completed runs when any
+  exist — a completion time needs a filled board — else from all recorded
+  runs, partial data without validation); when completed exist: pace =
+  min(1, (median/count)/20), score = round(0.9·base + 10·pace, 1) (clamped to
+  100); rating thresholds unchanged; return dict unchanged (callers set the
+  flag).
+- pipeline.py emit_bundle: reads playtests.json from the OUTPUT folder when
+  present and passes it to difficulty_profile; sets
+  m['difficultyValidatedByPlaytest'] (default False); qa['difficulty'].note
+  now states the playtest validation state ('blended with recorded play-test
+  completion times' vs the previous 'stays false until a real playtest').
+- app.py: new POST /api/projects/{pid}/revisions/{revision}/playtest
+  (X-Studio-Request: 1, same middleware; PlaytestRecord body): locates
+  project+revision (404s), appends {recordedAt, seconds, filled, total,
+  mistakes, mode} to revisions/<rev>/playtests.json (list created when absent,
+  newest 50 kept), recomputes difficulty WITH the entries, patches
+  artwork.json's difficulty + difficultyValidatedByPlaytest in place (rest of
+  the manifest untouched — contentHash/checksums stay valid), returns
+  {manifest summary incl. difficulty, playtestCount, medianSeconds}; 422 via
+  FastAPI validation, 409 while a job runs.
+- tests/test_pipeline.py: node_asset (2-rect side-by-side SVG) + strips_asset
+  (3 vertical strips) fixtures; success: node edit moves the shared boundary
+  (2 r-n-* regions, areas 24000/16000, masterShapeId inherited, artwork kind
+  preserved on the new shared edge, old ids fully pruned, QA + runtime export
+  clean, partitionTolerance grows) and cut-then-node keeps the subdivision
+  kind (areas 4000/2400, both-new-id subdivision edges); rejections: no
+  shared edge between the pair, no-op drag, missing d, spill into a third
+  region, too-small region, disconnected result (crossing new boundary);
+  difficulty_profile blend/unvalidated-regression tests + emit_bundle
+  playtests.json read test.
+- tests/test_api.py: POST /edit node route e2e (build from a 2-rect SVG upload
+  -> node drag -> 2 r-n-* regions, QA passed; fake pair -> failed job with the
+  actionable message); POST playtest route: 200 + playtests.json written +
+  manifest difficulty gains the 4 metrics + difficultyValidatedByPlaytest true
+  + exact 0.9·base+10 blend + manifest otherwise untouched + second run
+  refreshes the median; invalid bodies -> 422; unknown project/revision ->
+  404.
+- validate_runtime_contract: confirmed unchanged — node emits standard
+  EdgeEntry shape (verified via a live make_export of a node-edited bundle:
+  lean regions.json carries the r-n-* regions + 5 valid edges).
+- Studio service restarted via .zscripts/daemon.py (old :8765 PID killed
+  first); smoke: /api/config 200 (version 0.3.0, ai.configured true, glm-4.6/
+  cogview-4), playtest bad body -> 422 (pydantic), playtest unknown ids ->
+  404, node edit on a fake pair -> actionable job failure ('Select existing
+  playable regions…'), node edit on a real non-adjacent pair -> 'Select a
+  shared boundary between exactly two regions.', invalid action literal /
+  bad d pattern -> 422; studio.log clean (no 500s/tracebacks); the smoke
+  project's job status restored to done/Ready afterwards (no revisions were
+  created by the failing smoke edits).
+- Full suite: 58 passed (45 baseline + 13 new; baseline unregressed) via
+  `bun run test`.
+
+Stage Summary:
+- Edit action "node" is live end-to-end: a dragged boundary polyline between
+  exactly two regions swaps area through a validated lens (no-op, spill,
+  erase, split and too-small guards with actionable messages), rebuilds both
+  regions as r-n-* with inherited palette/object/masterShapeId, prunes and
+  re-emits classified edges preserving the original boundary kind (artwork
+  stays artwork), extends partitionTolerance, and flows through the normal
+  immutable-revision + QA + difficulty path.
+- Difficulty now carries a play-test factor: difficulty_profile(bundle,
+  playtests) blends the score ±10% by completion pace once a run with
+  filled >= total is recorded, exposes playtestCount/median seconds/seconds-
+  per-region/mistakes-per-region metrics; emit_bundle picks up
+  revisions/<rev>/playtests.json and sets difficultyValidatedByPlaytest; the
+  new POST …/revisions/{revision}/playtest route records runs (cap 50),
+  recomputes and patches the manifest difficulty block in place and returns
+  the summary + counts.
+- Deviation from the task letter (documented): the smoke-test expectation
+  "edit with action 'node' on a nonexistent pair returns 422" — the edit
+  route is async by design (like every edit action), so body-level problems
+  (unknown action literal, bad d pattern) return 422 while semantic
+  validation errors surface as job failures with the same actionable
+  messages (verified live; no 500s). Metrics source choice (completed runs,
+  falling back to all recorded runs when none completed) is an interpretation
+  of the contract's unspecified median source, chosen so partial runs show
+  data without validating the rating.
+
+---
+Task ID: 13-b
+Agent: general-purpose (completed by main after an agent-session timeout — code was fully written; only verification/worklog were pending)
+Task: Frontend half of stage-3 — Node tool (drag boundary anchors) + play-test recording + difficulty panel rows
+
+Work Log:
+- src/lib/svg-path.ts (NEW, 185 lines): flattenPath(d, curveSamples=8) — tokenizer for M/L/C/Q/Z absolute+relative (commas/whitespace/scientific notation, never throws) with de Casteljau/Bernstein curve sampling; polylineNearestDistance (point→polyline segment projection).
+- src/lib/studio-api.ts: EditAction + 'node'; EditPayload.d docs; DifficultyMetrics + playtestCount/playtestMedianSeconds/playtestSecondsPerRegion/playtestMistakesPerRegion; Revision.manifest? patch field; recordPlaytest() direct-call helper (POST /projects/{pid}/revisions/{rev}/playtest, X-Studio-Request: 1) + PlaytestRecordBody/PlaytestResponse types.
+- src/lib/detailed-board.ts: Manifest.difficultyValidatedByPlaytest?: boolean (type only).
+- src/components/studio/use-studio.tsx: StudioTool + 'node'; nodeEdit([left,right], d) → runEdit('node', {d}, ids); recordPlaytest(payload) → api call + immutable revision.manifest patch + IN-PLACE bundle manifest field swap (bundle object identity kept — the board is NOT remounted, play progress survives) + success toast; both exported on StudioApi.
+- src/components/studio/canvas-workspace.tsx (+476): Node tool in the tool row (Waypoints icon, hint, aria-pressed); tap-pick nearest shared edge (both sides non-null) within 24 art-px via clientToArt+flattenPath+polylineNearestDistance (miss → toast, clears selection); NodeEdgeState {base, anchors (art units), dragging}; anchor circles rendered in overlay client-px space via captured getScreenCTM matrix (constant on-screen size at any zoom, MutationObserver on board viewBox + resize keeps them glued); pointer-capture drag updates anchors; ghost polyline (gray dashed) + live polyline (teal); "Apply" button → AlertDialog confirm → nodeEdit([left,right], pathFromPoints(anchors,false)); switching tools/views/bundle clears node state; stroke guards extended so node never starts cut/pen strokes; play-view run clock (restarts when progress hits 0; 1s interval, cleared on view change), "Record playtest" button enabled only when completed===total && !recorded, ≥10s guard, mode from boardMode; DifficultyMini gains playtest line + validated pill.
+- src/components/studio/difficulty.tsx: formatPlaytestClock (m:ss), difficultyMetricNumber, PlaytestValidatedBadge; DifficultyPanel rows: Playtests / Median completion / Pace / Mistakes-per-region + validated pill next to the tier badge.
+- src/components/studio/right-panel.tsx: DifficultyPanel wired with validated from bundle.manifest.difficultyValidatedByPlaytest.
+
+Stage Summary:
+- bunx tsc --noEmit clean; bun run lint 0 problems; dev.log clean after changes (dev server auto-recompiled GET / 200). Live end-to-end behavior verified subsequently under task 14. No deviations from the stage-3 contract.
+
+---
+Task ID: 14
+Agent: main (Z.ai Code)
+Task: Stage-3 integration — end-to-end browser verification of node editing, play-test recording and overall health; fixes found live; final worklog.
+
+Work Log:
+- Fixed a real closed-ring defect found during live testing: flattenPath pushes the start vertex on Z, so closed boundary rings (13/452 shared edges in the treehouse bundle; ALL edges in the rect fixtures) rendered a duplicate anchor handle whose drag would desynchronize the ring start/end. Frontend (canvas-workspace.tsx): NodeEdgeState.closed flag; anchor list keeps UNIQUE vertices; render closes the ring (baseLine/anchorLine) while circles stay on unique vertices; submission re-appends Z (pathFromPoints(anchors, closed)). Backend: verified the lens math already handles closed rings correctly (a first incorrect "reject closed edges" guard was reverted — the 13-a tests prove closed rings are the norm and work); added tests/test_pipeline.py::test_node_closed_ring_submission (d with Z → success, areas 24000/16000).
+- Fixed a REAL root cause found live (three failed drags before it): the lens was swept from the SIMPLIFIED edge 'd' polyline while region polygons carry the refit-shared boundary, so the swept strip detached from its new owner (offline repro: B' = [4787.2 main + 314.6 DETACHED strip]; A' had a 10.8 px² sliver). pipeline.py node branch now sweeps from the ACTUAL shared boundary (A∩B LineString — adjacent regions touch exactly; fallback = edge line) and result guards drop refit slivers (parts sorted by area; loss > max(8, 0.005·main) still rejects as a genuine split). Offline repro after fix: area conserved exactly (9280→9280), B gains the bulge (+312.5), artifacts ≤ 1.2 px².
+- LIVE browser verification (gateway :81, agent-browser):
+  * Page: 0 console errors, 0 page errors after fresh reload (early parse-error console entries were stale history from the broken-edit window; dev.log compiles clean).
+  * NODE TOOL on the treehouse scratch project (v0.19, 163 regions, 516 edges): Node tool button in the Select/Cut/Pen/Node row; tapped the open shared edge e-0059 → 5 unique anchors + ghost/live polylines; dragged anchor 3 → Apply → confirm dialog → job done → **v0.20.0 · node · 163 regions**: two r-n-* regions, old ids fully pruned (0 stale edge refs), boundary re-emitted as 4 subdivision edges (subdivision stays subdivision), difficulty recomputed (hard 59.2), provenance.lastEdit=node. Board re-rendered the new revision (region buttons r-n-8c9a…/r-n-059f… live; VLM screenshot check: artwork fully rendered, no defects).
+  * Negative paths live: leftward bulge → job failure toast "The dragged boundary crosses other regions…" (verified the region is fragmented there — guard correct); over-large drag → "would split region … into disconnected pieces" before the sliver fix.
+  * PLAYTEST on the 5-region project: play view → free mode → tapped all 5 regions → "5 / 5 regions filled · 0 incorrect attempts" → "Record playtest result" (auto-disabled after success) → **mini panel: "Playtests 1 · median 0:31 · 6.2 s/region · 0.00 mistakes/region · PLAYTEST VALIDATED"**; right DifficultyPanel: tier bar EASY + PLAYTEST VALIDATED pill + rows Playtests/Median completion/Pace/Mistakes-per-region; board NOT remounted (progress stayed 5/5); playtests.json written ({seconds:31, filled:5, total:5, mistakes:0, mode:"free"}); manifest difficulty patched (easy 15.2, difficultyValidatedByPlaytest=true, 4 playtest metrics); state persists across reload.
+  * Mobile 390×844: bodyScrollW == 390 (no overflow), board 328px, footer flush to the bottom edge on scroll-to-end (789→844), pushed naturally on the long page; screenshot saved.
+- Final gates: bunx tsc --noEmit clean; bun run lint 0 problems; pytest (pipeline+api+game_adapter) **71 passed**; adapter-contract-check PASS (622-region example: 81 art paths → 1 <image>, 1 ink → 1 <image>, blobs revoked on destroy); dev.log clean (GET / 200).
+- Workspace cleanup (precedent from earlier stages): removed scratch projects art-9761ab8df8004aa3 (13-a smoke, 20 revs incl. the node-edit evidence — documented above) and art-ce7d4f067750478c (9-a auto-subdivide test); kept New illustrated world (5 regions, playtest-validated), Cascade Treehouse (flagship 571 regions), Cliffside Cottage at Golden Hour (AI demo). Cleared the stored project; fresh reload auto-opens the playtest-validated project with 0 errors.
+- Services left running: Next dev :3000, studio :8765 (daemon.py, ai.configured=true), ai-bridge :8787, gateway :81.
+
+Stage Summary:
+- Stage-3 complete and live-verified end-to-end: (1) node editing (drag boundary anchors) with server-side topology rebuild — including two real robustness fixes (actual-shared-boundary sweep + sliver tolerance + closed-ring anchors); (2) play-test difficulty factor recorded from the real UI, blended into the score, shown in both difficulty panels with the validated pill, persistent in the manifest; (3) the shipped mjs adapter now carries the cached-underpainting renderer (from 13-c, gates green).
+- Known remaining limits (documented): node lens is not designed for degenerate fully-nested ring morphs (guards reject safely); multistage AI generation still awaits a confirmed paid run; difficulty playtest blend is ±10% of the deterministic score.

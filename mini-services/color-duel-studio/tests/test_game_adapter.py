@@ -293,3 +293,21 @@ def test_adapter_free_color_and_board_api():
                           cwd=str(ROOT), timeout=120)
     assert proc.returncode == 0, f'adapter free-color/edges board check failed:\n{proc.stdout}\n{proc.stderr}'
     assert '0 failures' in proc.stdout
+
+
+# ---------------------------------------------------------------------------
+# Stage-3 contract: shipped adapter swaps the cached underpainting in
+# ---------------------------------------------------------------------------
+
+
+def test_shipped_adapter_swaps_underpaint_images(svg_bundle):
+    """The adapter contract check must mount the compiled bundle on the
+    SHIPPED board and verify the cached-underpainting swap: the paint/ink
+    appearance groups serialize into standalone SVG documents (base viewBox
+    + cloned gradient defs), each group swaps its live paths for a single
+    blob-URL <image> node once the Image probe loads, and every blob URL is
+    revoked on destroy(). bun cannot decode images, so the gate stubs the
+    Image/blob-URL pair deterministically instead of requiring a real decode."""
+    proc = _run_adapter(svg_bundle)
+    assert proc.returncode == 0, f'underpaint gate failed:\n{proc.stdout}\n{proc.stderr}'
+    assert 'underpaint' in proc.stdout.lower(), 'contract check did not exercise the underpaint swap'

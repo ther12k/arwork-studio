@@ -27,6 +27,12 @@
  *    mistake counting in free mode. BoardState.customColor exposes the brush.
  *  - Gestures are rAF-batched: pointermove/wheel store the latest event and run
  *    ONE scheduled frame; label visibility updates pause during a gesture.
+ *  - Cached underpainting (stage 3): the paint + ink appearance groups
+ *    serialize ONCE per bundle into standalone SVG documents (BASE viewBox,
+ *    cloned gradient defs) and each group swaps to a single blob-URL <image>
+ *    node once an Image probe decodes it — 200k+ live path commands leave
+ *    the live DOM while masks/labels/edges/hatch stay interactive SVG.
+ *    Failure at any step silently keeps the live path layers.
  */
 const NS = 'http://www.w3.org/2000/svg';
 let sequence = 0;
@@ -43,6 +49,69 @@ const SAFE_HEX = /^#[0-9A-Fa-f]{6}$/;
 const SAFE_GRADIENT_REF = /^url\(#g-[a-zA-Z0-9_-]+\)$/;
 const SAFE_GRADIENT_ID = /^g-[a-zA-Z0-9_-]+$/;
 const finite = (v) => Number.isFinite(v);
+
+// ---------------------------------------------------------------------------
+// Cached underpainting serialization (stage-3 contract §C) — standalone SVG
+// documents mirroring each appearance group's own live mount() logic, so a
+// swapped <image> is rendering-equivalent to the live-path fallback.
+// ---------------------------------------------------------------------------
+const XML_ESCAPES = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&apos;' };
+const escapeXml = (value) => String(value).replace(/[&<>"']/g, (c) => XML_ESCAPES[c]);
+const attrString = (attrs) => Object.entries(attrs).map(([k, v]) => `${k}="${escapeXml(v)}"`).join(' ');
+
+/** Clone the paint gradient defs into the standalone document (the hatch
+ *  pattern and palette gradients stay live in the board DOM). */
+function serializeGradientDefs(gradients) {
+  const parts = [];
+  for (const g of gradients) {
+    const tag = g.type === 'linear' ? 'linearGradient' : 'radialGradient';
+    const attrs = [`id="${escapeXml(g.id)}"`, 'gradientUnits="userSpaceOnUse"'];
+    const params = g.type === 'linear'
+      ? [['x1', g.x1], ['y1', g.y1], ['x2', g.x2], ['y2', g.y2]]
+      : [['cx', g.cx], ['cy', g.cy], ['r', g.r], ['fx', g.fx], ['fy', g.fy]];
+    for (const [key, value] of params) if (value != null) attrs.push(`${key}="${value}"`);
+    const stops = g.stops.map(s => {
+      const sa = [`offset="${s.offset}"`, `stop-color="${escapeXml(s.color)}"`];
+      if (s.opacity != null && s.opacity !== 1) sa.push(`stop-opacity="${s.opacity}"`);
+      return `<stop ${sa.join(' ')}/>`;
+    }).join('');
+    parts.push(`<${tag} ${attrs.join(' ')}>${stops}</${tag}>`);
+  }
+  return parts.join('');
+}
+
+/** Art-layer path (below the masks) — the EXACT attribute logic the live
+ *  'vector-paint' group uses in mount(); stroke-only ink entries are skipped
+ *  the same way (they render in the ink layer above the masks). */
+function serializeArtPath(p) {
+  if (p.filled === false || (p.strokeWidth != null && !SAFE_HEX.test(p.fill))) return null;
+  const gradientFill = p.fill.startsWith('url(#');
+  const attrs = { d: p.d, fill: p.fill, 'fill-rule': p.fillRule || 'evenodd' };
+  if (!gradientFill) { attrs.stroke = p.stroke || p.fill; attrs['stroke-width'] = p.strokeWidth ?? 0.55; attrs['stroke-linejoin'] = 'round'; }
+  if (p.fillOpacity != null && p.fillOpacity < 0.999) attrs['fill-opacity'] = p.fillOpacity;
+  if (p.opacity != null && p.opacity < 0.999) attrs.opacity = p.opacity;
+  if (p.stroke && p.strokeWidth > 0) { attrs.stroke = p.stroke; attrs['stroke-width'] = p.strokeWidth; attrs['stroke-linejoin'] = 'round'; }
+  return `<path ${attrString(attrs)}/>`;
+}
+
+/** Ink-layer path (above the masks) — the EXACT attribute logic the live
+ *  'ink' group uses in mount(): open stroke line art vs closed ink fills. */
+function serializeInkPath(p) {
+  if (p.strokeWidth != null || p.filled === false) {
+    return `<path d="${escapeXml(p.d)}" fill="none" stroke="${escapeXml(p.fill)}" stroke-width="${p.strokeWidth ?? 1.5}" stroke-linecap="round" stroke-linejoin="round"/>`;
+  }
+  const attrs = { d: p.d, fill: p.fill, 'fill-rule': p.fillRule || 'evenodd' };
+  if (p.opacity != null && p.opacity < 0.999) attrs.opacity = p.opacity;
+  return `<path ${attrString(attrs)}/>`;
+}
+
+/** Standalone document wrapper — always the BASE (art-space) viewBox, never
+ *  the zoomed one, so the image stays aligned with the live layers at any
+ *  zoom (the browser re-rasterizes it crisply). */
+function wrapStandaloneSvg(defs, body, bx, by, bw, bh) {
+  return `<svg xmlns="${NS}" viewBox="${bx} ${by} ${bw} ${bh}" width="${bw}" height="${bh}">` +
+    (defs ? `<defs>${defs}</defs>` : '') + body.join('') + '</svg>';
+}
 
 export function validateBundle(bundle) {
   const {manifest: m, geometry: g, palette: p} = bundle || {};
@@ -164,6 +233,7 @@ export class VectorBoard {
     if (!['number','memory','free'].includes(this.mode)) throw new Error('Invalid coloring mode');
     this.prefix = `cdv-${++sequence}-`;
     this.handlers = []; this.pointers = new Map(); this.history = []; this.preview = false;
+    this.artLayer = null; this.inkLayer = null; this.blobUrls = []; this.underpaintAttempts = 0; this.destroyed = false;
     this.ctx = document.createElement('canvas').getContext('2d');
     if (!this.ctx) throw new Error('Canvas hit-testing is unavailable');
     this.regions = new Map(bundle.geometry.regions.map(r => [r.id, r]));
@@ -181,6 +251,7 @@ export class VectorBoard {
     this.mount(); this.bindGestures(); this.refresh();
   }
   mount() {
+    this.revokeUnderpaintBlobs();   // full re-mount: release prior underpaint images
     this.svg.replaceChildren();
     this.svg.setAttribute('viewBox', this.view.join(' '));
     this.svg.setAttribute('aria-label', `${this.bundle.manifest.title}, interactive coloring artwork`);
@@ -229,6 +300,7 @@ export class VectorBoard {
         if (p.stroke && p.strokeWidth > 0) { attrs.stroke = p.stroke; attrs['stroke-width'] = p.strokeWidth; attrs['stroke-linejoin'] = 'round'; }
         art.append(svgNode('path', attrs));
       }
+      this.artLayer = art;
       this.svg.append(art);
     }
     const regions = svgNode('g',{'stroke': this.edgeMode ? 'none' : g.stroke,'stroke-width':g.strokeWidth,'stroke-linejoin':'round'});
@@ -257,6 +329,7 @@ export class VectorBoard {
             ...(p.opacity != null && p.opacity < 0.999 ? {opacity: p.opacity} : {})}));
         }
       }
+      this.inkLayer = ink;
       this.svg.append(ink);
     }
     if (this.edges) {
@@ -294,6 +367,7 @@ export class VectorBoard {
       const id = e.target.getAttribute?.('data-region-id');
       if (id && (e.key==='Enter' || e.key===' ')) {e.preventDefault();this.paint(id);}
     });
+    this.buildUnderpainting();
   }
   /** Paint + ink entries merged into original drawing order (by z). */
   orderedPaint() {
@@ -301,6 +375,72 @@ export class VectorBoard {
     if (!paint) return [];
     const entries = [...(paint.paths ?? []), ...(paint.inkPaths ?? [])];
     return entries.sort((a, b) => (a.z ?? Infinity) - (b.z ?? Infinity) || 0);
+  }
+  /** Introspection for the cached underpainting (tests/tooling): image
+   *  mounts attempted for this board and blob URLs still live. */
+  underpaintState() { return { attempted: this.underpaintAttempts, blobCount: this.blobUrls.length }; }
+  /** Cached underpainting (ported from the studio's src/lib/detailed-board.ts):
+   *  serialize the paint + ink appearance ONCE into standalone SVG documents
+   *  (base viewBox, cloned gradient defs only) and swap each appearance group
+   *  for a single <image> element once its blob decodes — one image node
+   *  replaces 200k+ live path commands while staying crisp at any zoom, where
+   *  a fixed bitmap would blur. TWO images cover the two z-slots the
+   *  appearance occupies (art BELOW the region masks, ink ABOVE them) so the
+   *  classic layering is preserved exactly. Masks, labels, the edges overlay
+   *  and the hatch pattern stay live SVG (interactive/ARIA-relevant). Reset
+   *  and undo only affect region fills; the underpainting is static
+   *  appearance. If serialization or decoding fails, the live path layers
+   *  simply remain mounted — the fallback is automatic and silent. */
+  buildUnderpainting() {
+    if (!this.detailed || !this.bundle.paint) return;
+    const paint = this.bundle.paint;
+    const defs = serializeGradientDefs(paint.gradients ?? []);
+    const [bx, by, bw, bh] = this.base;
+    // Art layer (below the masks): closed fills, z-sorted — mirrors mount().
+    const artBody = [];
+    for (const p of this.orderedPaint()) {
+      const serialized = serializeArtPath(p);
+      if (serialized) artBody.push(serialized);
+    }
+    // Ink layer (above the masks): open line art + closed ink fills.
+    const inkBody = paint.inkPaths.map(p => serializeInkPath(p));
+    if (this.artLayer && artBody.length)
+      this.mountUnderpaintImage(this.artLayer, wrapStandaloneSvg(defs, artBody, bx, by, bw, bh), 'underpaint-art');
+    if (this.inkLayer && inkBody.length)
+      this.mountUnderpaintImage(this.inkLayer, wrapStandaloneSvg(defs, inkBody, bx, by, bw, bh), 'underpaint-ink');
+  }
+  /** Load the serialized SVG via a blob URL, verify it decodes with an Image
+   *  probe, and only then swap the live group children for the image. */
+  mountUnderpaintImage(group, svgString, id) {
+    if (typeof Image !== 'function') return;   // headless env: keep live paths
+    let url;
+    try { url = URL.createObjectURL(new Blob([svgString], { type: 'image/svg+xml' })); }
+    catch { return; }                          // silent fallback: live paths stay mounted
+    this.blobUrls.push(url);
+    this.underpaintAttempts++;
+    const probe = new Image();
+    probe.onload = () => {
+      if (this.destroyed) return;
+      const [bx, by, bw, bh] = this.base;
+      const image = svgNode('image', {
+        id: this.prefix + id, href: url, x: bx, y: by, width: bw, height: bh,
+        preserveAspectRatio: 'xMidYMid meet', 'pointer-events': 'none'
+      });
+      // xlink:href for engines that predate SVG2 href on <image>.
+      image.setAttributeNS('http://www.w3.org/1999/xlink', 'xlink:href', url);
+      group.replaceChildren(image);
+    };
+    probe.onerror = () => {
+      // Silent fallback: keep the live path layer, release the blob.
+      this.blobUrls = this.blobUrls.filter(u => u !== url);
+      try { URL.revokeObjectURL(url); } catch { /* headless env */ }
+    };
+    probe.src = url;
+  }
+  /** Release every underpaint blob URL (destroy + full re-mount). */
+  revokeUnderpaintBlobs() {
+    for (const url of this.blobUrls) { try { URL.revokeObjectURL(url); } catch { /* headless env */ } }
+    this.blobUrls = [];
   }
   listen(el,type,fn,options) {el.addEventListener(type,fn,options);this.handlers.push(()=>el.removeEventListener(type,fn,options));}
   state() {
@@ -498,5 +638,12 @@ export class VectorBoard {
       if (d.moved) {const now=this.clientToArt(e.clientX,e.clientY,d.inverse);this.applyView([d.view[0]-(now.x-d.anchor.x),d.view[1]-(now.y-d.anchor.y),d.view[2],d.view[3]]);}
     }
   }
-  destroy() {for(const remove of this.handlers)remove();this.handlers=[];this.svg.replaceChildren();this.pointers.clear();}
+  destroy() {
+    this.destroyed = true;
+    for (const remove of this.handlers) remove();
+    this.handlers = [];
+    this.svg.replaceChildren();
+    this.revokeUnderpaintBlobs();   // release the underpainting blob URLs
+    this.pointers.clear();
+  }
 }

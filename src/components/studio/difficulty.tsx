@@ -6,7 +6,8 @@
  * `manifest.difficulty` is a union: legacy bundles carry the string "unrated",
  * upgraded ones the full profile `{ rating, score, metrics }`. Both the compact
  * canvas mini-panel and the full right-panel profile render from these
- * primitives so the tier math cannot drift between them.
+ * primitives so the tier math cannot drift between them. Stage 3 adds the
+ * play-test metric helpers (clock format, metric getter, validated pill).
  */
 
 import type { DifficultyProfile } from "@/lib/studio-api";
@@ -45,4 +46,27 @@ export function normalizeDifficulty(raw: string | DifficultyProfile | undefined 
   const byScore =
     DIFFICULTY_TIERS.find((t) => score < t.max) ?? DIFFICULTY_TIERS[DIFFICULTY_TIERS.length - 1];
   return { tier: byRating ?? byScore, score, profile: raw };
+}
+
+/** Format seconds as `m:ss` — play-test medians and run clocks share it. */
+export function formatPlaytestClock(seconds: number): string {
+  const s = Math.max(0, Math.round(seconds));
+  return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`;
+}
+
+/** Number metric getter (metrics tolerate unknown string values). */
+export function difficultyMetricNumber(metrics: { [key: string]: unknown }, key: string): number | null {
+  const v = metrics[key];
+  const n = typeof v === "number" ? v : Number(v);
+  return Number.isFinite(n) ? n : null;
+}
+
+/** "Playtest validated" pill (contract B) — shown next to the difficulty
+ *  score once a completed run has been recorded for the revision. */
+export function PlaytestValidatedBadge() {
+  return (
+    <span className="rounded-full border border-[#cce7dc] bg-[#e5f3ed] px-2 py-0.5 text-[9px] font-semibold uppercase tracking-[0.06em] text-[#087f74]">
+      Playtest validated
+    </span>
+  );
 }
