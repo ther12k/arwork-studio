@@ -70,6 +70,16 @@ class EditRequest(StrictModel):
     # 'recolor' (visible appearance, distinct from 'palette' = number group):
     color: str | None = Field(None, pattern=r'^#[0-9A-Fa-f]{6}$')
     preserve_shading: bool = Field(False, description='Keep gradient shading (tinted toward the target color) instead of replacing the fill.')
+    # 'draw' artwork pen (P0 contract): emit a paint.json path with a stable
+    # shapeId for the drawn shape, set masterShapeId on the playable region and
+    # keep the palette swatch in sync - the normal recolor / QA / revision flow
+    # then works on pen-drawn art exactly like imported SVG shapes.
+    paint: bool = Field(False,
+        description="'draw': also emit a paint.json artwork path (stable shapeId + masterShapeId, fill, z-order). False = gameplay-only white tap target (region pen).")
+    stroke_width: float | None = Field(None, ge=0, le=8,
+        description="'draw' with paint=true: draw an ink outline of this width on the paint path (0 or null = no outline).")
+    z_behind: bool = Field(False,
+        description="'draw' with paint=true: place the new paint path BEHIND the existing art (min z - 1) instead of on top (max z + 1).")
 
 class ReviewRequest(StrictModel):
     revision: str
@@ -77,12 +87,17 @@ class ReviewRequest(StrictModel):
     confirmed: bool
 
 class PlaytestRecord(StrictModel):
-    """One completed play-test run recorded against a revision."""
+    """One completed play-test run recorded against a revision.
+
+    Puzzle modes (number/memory/duel) feed difficulty calibration; 'free' is
+    tracked as an engagement/interaction metric only and never blended into
+    the puzzle difficulty score.
+    """
     seconds: float = Field(..., ge=10, le=86400)
     filled: int = Field(..., ge=1)
     total: int = Field(..., ge=1)
     mistakes: int = Field(..., ge=0)
-    mode: Literal['number', 'memory', 'free']
+    mode: Literal['number', 'memory', 'duel', 'free']
 
 class ActivateRequest(StrictModel):
     revision: str

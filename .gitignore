@@ -52,3 +52,7 @@ prompt
 server.log
 # Skills directory
 /skills/
+# color-duel-studio backend: never commit runtime state, caches or release output
+__pycache__/
+mini-services/color-duel-studio/workspace/
+mini-services/color-duel-studio/dist/

@@ -59,8 +59,8 @@ const VIEW_ORDER: StudioView[] = ["master", "colored", "numbered", "play", "insp
 
 const TOOL_HINTS: Record<StudioTool, string> = {
   select: "Tap regions to select",
-  cut: "Drag a line across a region to cut it",
-  pen: "Draw a closed shape to create a region",
+  cut: "Drag a line across a region — outside one edge to outside the opposite edge",
+  pen: "Draw a closed shape — the artwork pen paints it, the region pen is gameplay-only",
   node: "Tap a boundary between two regions, then drag its anchor points.",
 };
 
@@ -234,6 +234,8 @@ function DifficultyMini({
   const ptMedian = difficultyMetricNumber(metrics, "playtestMedianSeconds");
   const ptPace = difficultyMetricNumber(metrics, "playtestSecondsPerRegion");
   const ptMistakes = difficultyMetricNumber(metrics, "playtestMistakesPerRegion");
+  const freeCount = difficultyMetricNumber(metrics, "freePlayCount");
+  const freeMedian = difficultyMetricNumber(metrics, "freeMedianSeconds");
   return (
     <div
       className="mt-2.5 flex flex-wrap items-center gap-x-2.5 gap-y-1 rounded-lg border border-[#e1e5df] bg-white/70 px-3 py-2"
@@ -263,6 +265,12 @@ function DifficultyMini({
           {ptMedian != null ? ` · median ${formatPlaytestClock(ptMedian)}` : ""}
           {ptPace != null ? ` · ${ptPace.toFixed(1)} s/region` : ""}
           {ptMistakes != null ? ` · ${ptMistakes.toFixed(2)} mistakes/region` : ""}
+        </span>
+      )}
+      {freeCount != null && (
+        <span className="text-[10px] text-[#778481]">
+          {`Free-color plays ${freeCount.toLocaleString("en-US")} (engagement)`}
+          {freeMedian != null ? ` · ${formatPlaytestClock(freeMedian)}` : ""}
         </span>
       )}
       {validated && <PlaytestValidatedBadge />}
@@ -352,6 +360,20 @@ export function CanvasWorkspace() {
   } | null>(null);
   const [penPalette, setPenPalette] = useState("1");
   const [penGroup, setPenGroup] = useState("");
+  /** Artwork pen (paint=true): the shape becomes finished artwork (paint.json
+   *  path + masterShapeId). Region pen (paint=false): gameplay-only tap
+   *  target. Default = artwork — Pen is primarily an artwork tool. */
+  const [penMode, setPenMode] = useState<"artwork" | "region">("artwork");
+  /** Fill of the new artwork path — defaults to the number group's swatch;
+   *  a custom fill syncs the group swatch (answer key) like recolor. */
+  const [penFill, setPenFill] = useState("");
+  const [penOutline, setPenOutline] = useState(false);
+  const [penStrokeWidth, setPenStrokeWidth] = useState("1.5");
+  const [penBehind, setPenBehind] = useState(false);
+  /** Hex of the currently chosen number group (fallback #808080). */
+  const penGroupHex =
+    paletteEntries.find((p) => String(p.id) === penPalette)?.hex ?? "#808080";
+  const penFillHex = FREE_HEX_RE.test(penFill) ? penFill.toUpperCase() : penGroupHex;
 
   // ---------------------------------------------------- node tool (contract A)
 
@@ -443,7 +465,10 @@ export function CanvasWorkspace() {
       const mid = polylineMidpoint(pts);
       const regionId = mid ? board.hitRegion(mid.x, mid.y) : null;
       if (!regionId) {
-        toast("Start and end the cut line inside the same region.");
+        // Backend contract: the cut crosses the whole region (the engine even
+        // extends it past the bbox), so the LINE only has to cross it — the
+        // midpoint must land inside the target region.
+        toast("Drag the line across the region so its midpoint lands inside it — outside one edge to outside the other.");
         return;
       }
       setPendingCut({ regionId, d: pathFromPoints(pts, false) });
@@ -458,6 +483,10 @@ export function CanvasWorkspace() {
         return;
       }
       setPenPalette(String(boardState?.selectedPaletteId ?? paletteEntries[0]?.id ?? 1));
+      // A fresh stroke resets the fill to the chosen number group's swatch
+      // (the default answer-key color) — the artist can override in the
+      // confirm popover.
+      setPenFill("");
       setPenGroup(objectGroup || "");
       const cx = pts.reduce((s, p) => s + p.x, 0) / pts.length;
       const cy = pts.reduce((s, p) => s + p.y, 0) / pts.length;
@@ -476,8 +505,21 @@ export function CanvasWorkspace() {
     const draw = pendingDraw;
     if (!draw) return;
     const paletteId = Number(penPalette) || 1;
+    const artwork = penMode === "artwork";
+    // Custom fill only when the artist actually changed it from the group
+    // swatch (empty = default); the outline/layer options are artwork-only.
+    const customFill = artwork && penFill && FREE_HEX_RE.test(penFill) ? penFillHex : undefined;
+    const outlineW = artwork && penOutline ? Math.max(0, Math.min(8, Number(penStrokeWidth) || 0)) : undefined;
     setPendingDraw(null);
-    void drawRegion(draw.d, paletteId, penGroup.trim() || undefined).catch((e: Error) => toast(e.message));
+    void drawRegion(
+      draw.d,
+      paletteId,
+      penGroup.trim() || undefined,
+      artwork,
+      customFill,
+      outlineW,
+      artwork ? penBehind : undefined
+    ).catch((e: Error) => toast(e.message));
   };
 
   // ------------------------------------------- node tool handlers (contract A)
@@ -1057,22 +1099,62 @@ export function CanvasWorkspace() {
             aria-hidden
           />
           <PopoverContent
-            className="w-80 rounded-xl border-[#cfe6db] bg-[#edf6f2] p-3.5"
+            className="w-84 max-w-[calc(100vw-2.5rem)] rounded-xl border-[#cfe6db] bg-[#edf6f2] p-3.5"
             align="center"
             sideOffset={10}
-            aria-label="Confirm new pen-drawn region"
+            aria-label="Confirm new pen-drawn shape"
           >
-            <p className="text-[11px] font-semibold text-[#183837]">Create a region from the drawn shape?</p>
-            <p className="mt-0.5 text-[10px] leading-relaxed text-[#657671]">
-              Closes a {pendingDraw ? Math.round(pendingDraw.area).toLocaleString("en-US") : "…"} px² surface. It
-              becomes a white tap target (gameplay-only — the artist paints it later).
+            <p className="text-[11px] font-semibold text-[#183837]">
+              {penMode === "artwork" ? "Create artwork shape + region?" : "Create a gameplay region?"}
             </p>
+            <p className="mt-0.5 text-[10px] leading-relaxed text-[#657671]">
+              Closes a {pendingDraw ? Math.round(pendingDraw.area).toLocaleString("en-US") : "…"} px² surface.{" "}
+              {penMode === "artwork"
+                ? "The shape becomes finished artwork (a paint layer path with fill, outline and z-order) plus the playable tap region — recolor works like any imported shape."
+                : "It becomes a white tap target (gameplay-only — the artist paints it later)."}
+            </p>
+            {/* Pen mode: artwork (paints + region) vs region-only */}
+            <div
+              className="mt-2.5 flex flex-wrap gap-0.5 rounded-[9px] bg-[#e0e8e2] p-1"
+              role="group"
+              aria-label="Pen mode"
+            >
+              {(
+                [
+                  { key: "artwork", label: "Artwork + region" },
+                  { key: "region", label: "Region only" },
+                ] as Array<{ key: "artwork" | "region"; label: string }>
+              ).map((m) => (
+                <button
+                  key={m.key}
+                  type="button"
+                  aria-pressed={penMode === m.key}
+                  disabled={busy}
+                  onClick={() => setPenMode(m.key)}
+                  className={`flex-1 rounded-md px-2 py-1.5 text-[10px] font-medium transition-colors disabled:opacity-50 ${
+                    penMode === m.key
+                      ? "bg-white text-[#087f74] shadow-[0_1px_4px_rgba(18,47,34,0.13)]"
+                      : "text-[#657671] hover:text-[#183837]"
+                  }`}
+                >
+                  {m.label}
+                </button>
+              ))}
+            </div>
             <div className="mt-2.5 grid grid-cols-2 gap-2">
               <div>
                 <label htmlFor="studio-pen-palette" className="text-[10px] leading-snug text-[#657671]">
                   Number group
                 </label>
-                <Select value={penPalette} onValueChange={setPenPalette} disabled={busy}>
+                <Select
+                  value={penPalette}
+                  onValueChange={(v) => {
+                    setPenPalette(v);
+                    // A group switch resets the fill to that group's swatch.
+                    setPenFill("");
+                  }}
+                  disabled={busy}
+                >
                   <SelectTrigger
                     id="studio-pen-palette"
                     className="mt-1 h-9 w-full rounded-md border-[#e1e5df] bg-white text-xs"
@@ -1103,6 +1185,110 @@ export function CanvasWorkspace() {
                 />
               </div>
             </div>
+            {penMode === "artwork" && (
+              <div className="mt-2.5 rounded-lg border border-[#dce4dd] bg-white/70 p-2.5">
+                <div className="flex flex-wrap items-center gap-2">
+                  <label
+                    htmlFor="studio-pen-fill"
+                    className="text-[10px] leading-snug text-[#657671]"
+                  >
+                    Fill
+                  </label>
+                  <input
+                    id="studio-pen-fill"
+                    type="color"
+                    value={penFillHex}
+                    onChange={(e) => setPenFill(e.target.value.toUpperCase())}
+                    disabled={busy}
+                    className="size-8 shrink-0 cursor-pointer rounded-md border border-[#e1e5df] bg-white p-0.5"
+                    aria-label="Artwork fill color"
+                  />
+                  <Input
+                    value={penFill || penGroupHex}
+                    onChange={(e) => setPenFill(e.target.value.toUpperCase())}
+                    placeholder={penGroupHex}
+                    inputMode="text"
+                    spellCheck={false}
+                    maxLength={7}
+                    disabled={busy}
+                    aria-label="Artwork fill hex value"
+                    className="h-8 w-24 shrink-0 rounded-md bg-white font-mono text-[10px] uppercase"
+                  />
+                  {!penFill && (
+                    <span className="text-[9px] leading-snug text-[#778481]">
+                      matches the number-group color
+                    </span>
+                  )}
+                </div>
+                {penFill && !FREE_HEX_RE.test(penFill) && (
+                  <p className="mt-1 text-[9px] text-[#b3541e]" role="alert">
+                    Use a #RRGGBB hex value — falling back to the group color.
+                  </p>
+                )}
+                <div className="mt-2 flex flex-wrap items-center gap-2">
+                  <label
+                    htmlFor="studio-pen-outline"
+                    className="flex min-h-11 items-center gap-1.5 text-[10px] leading-snug text-[#657671]"
+                  >
+                    <input
+                      id="studio-pen-outline"
+                      type="checkbox"
+                      checked={penOutline}
+                      onChange={(e) => setPenOutline(e.target.checked)}
+                      disabled={busy}
+                      className="size-3.5 accent-[#087f74]"
+                    />
+                    Ink outline
+                  </label>
+                  {penOutline && (
+                    <Input
+                      value={penStrokeWidth}
+                      onChange={(e) => setPenStrokeWidth(e.target.value)}
+                      inputMode="decimal"
+                      disabled={busy}
+                      aria-label="Ink outline width"
+                      className="h-8 w-16 rounded-md bg-white text-[10px]"
+                    />
+                  )}
+                  {penOutline && <span className="text-[9px] text-[#778481]">px stroke</span>}
+                </div>
+                <div className="mt-2 flex flex-wrap items-center gap-2">
+                  <span className="text-[10px] leading-snug text-[#657671]">Layer</span>
+                  <div
+                    className="flex flex-wrap gap-0.5 rounded-[9px] bg-[#e0e8e2] p-0.5"
+                    role="group"
+                    aria-label="Paint layer placement"
+                  >
+                    {(
+                      [
+                        { key: "above", label: "Above art" },
+                        { key: "behind", label: "Behind art" },
+                      ] as Array<{ key: "above" | "behind"; label: string }>
+                    ).map((l) => (
+                      <button
+                        key={l.key}
+                        type="button"
+                        aria-pressed={penBehind === (l.key === "behind")}
+                        disabled={busy}
+                        onClick={() => setPenBehind(l.key === "behind")}
+                        className={`rounded-md px-2 py-1 text-[9px] font-medium transition-colors disabled:opacity-50 ${
+                          penBehind === (l.key === "behind")
+                            ? "bg-white text-[#087f74] shadow-[0_1px_4px_rgba(18,47,34,0.13)]"
+                            : "text-[#657671] hover:text-[#183837]"
+                        }`}
+                      >
+                        {l.label}
+                      </button>
+                    ))}
+                  </div>
+                  {penBehind && (
+                    <span className="text-[9px] leading-snug text-[#778481]">
+                      may be hidden by opaque layers above
+                    </span>
+                  )}
+                </div>
+              </div>
+            )}
             <div className="mt-2.5 flex flex-wrap justify-end gap-2">
               <Button
                 variant="outline"
@@ -1119,7 +1305,11 @@ export function CanvasWorkspace() {
                 onClick={confirmDraw}
               >
                 <PenTool className="size-3.5" aria-hidden />
-                {busy ? "Creating…" : "Create region"}
+                {busy
+                  ? "Creating…"
+                  : penMode === "artwork"
+                    ? "Create artwork"
+                    : "Create region"}
               </Button>
             </div>
           </PopoverContent>
@@ -1215,8 +1405,8 @@ export function CanvasWorkspace() {
               Cut region {pendingCut?.regionId} along the drawn line?
             </AlertDialogTitle>
             <AlertDialogDescription className="text-left text-[11px] leading-relaxed text-[#657671]">
-              Creates a new revision; both pieces stay playable tap targets and the new boundary is drawn as a
-              dashed subdivision edge.
+              The line crosses the region from outside one edge to outside the opposite edge. Creates a new revision; both
+              pieces stay playable tap targets and the new boundary is drawn as a dashed subdivision edge.
             </AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter className="gap-2 sm:justify-end">

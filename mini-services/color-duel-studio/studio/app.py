@@ -385,7 +385,10 @@ def create_app(workspace: Path|None=None, transport=None):
             profile = difficulty_profile(load_bundle(d), entries)
             manifest = read_json(d / 'artwork.json')
             manifest['difficulty'] = profile
-            completed = [e for e in entries if e.get('filled', 0) >= e.get('total', 0)]
+            # Only completed PUZZLE runs (number/memory/duel) validate the
+            # rating; free-color completions are engagement data only.
+            completed = [e for e in entries if e.get('filled', 0) >= e.get('total', 0)
+                         and e.get('mode') in (None, 'number', 'memory', 'duel')]
             manifest['difficultyValidatedByPlaytest'] = bool(completed)
             write_json(d / 'artwork.json', manifest)
         return {'manifest': {'id': manifest['id'], 'version': manifest['version'],
@@ -393,7 +396,8 @@ def create_app(workspace: Path|None=None, transport=None):
                              'difficulty': manifest['difficulty'],
                              'difficultyValidatedByPlaytest': manifest['difficultyValidatedByPlaytest']},
                 'playtestCount': len(entries),
-                'medianSeconds': profile['metrics'].get('playtestMedianSeconds')}
+                'medianSeconds': profile['metrics'].get('playtestMedianSeconds'),
+                'freePlayCount': profile['metrics'].get('freePlayCount')}
     @app.get('/api/projects/{pid}/revisions/{revision}/files/{name}')
     def artifact(pid:str,revision:str,name:str):
         if name not in FILES:raise HTTPException(404)

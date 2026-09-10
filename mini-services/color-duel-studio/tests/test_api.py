@@ -156,6 +156,21 @@ def test_edit_cut_and_draw_routes(client):
     p=wait(client,pid);assert p['job']['status']=='done',p['job']
     regs3=client.get(f'/api/projects/{pid}/revisions/{p["currentRevision"]}/files/regions.json').json()['regions']
     assert [r3 for r3 in regs3 if r3['id'].startswith('r-p-')]
+    # artwork pen: the drawn shape also becomes a paint.json artwork path
+    draw_art={'base_revision':p['currentRevision'],'action':'draw','region_ids':[],'d':'M 8,150 L 42,150 L 42,184 L 8,184 Z',
+              'palette_id':1,'paint':True,'color':'#FF7348','stroke_width':1.2}
+    r=client.post(f'/api/projects/{pid}/edit',headers=H,json=draw_art)
+    assert r.status_code==200,r.text
+    p=wait(client,pid);assert p['job']['status']=='done',p['job']
+    rev4=p['currentRevision']
+    base4=f'/api/projects/{pid}/revisions/{rev4}'
+    regs4=client.get(base4+'/files/regions.json').json()['regions']
+    pen=next(r4 for r4 in regs4 if r4['id'].startswith('r-p-') and r4.get('masterShapeId'))
+    paint=client.get(base4+'/files/paint.json').json()
+    entry=next(p4 for p4 in paint['paths'] if p4['shapeId']==pen['masterShapeId'])
+    assert entry['fill']=='#FF7348' and entry['strokeWidth']==1.2
+    qa4=client.get(base4+'/files/validation.json').json()
+    assert qa4['passed']
 
 def test_edit_cut_missing_d_rejected(client):
     pid,rev=_svg_project(client)

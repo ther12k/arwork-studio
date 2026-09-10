@@ -189,12 +189,70 @@ def test_pen_draw_creates_non_overlapping_region(pen_asset,tmp_path):
     # masks never overlap: the pen region is disjoint from the existing rect
     rect=next(r for r in regs if not r['id'].startswith('r-p-'))
     assert region_polygon(pen[0]).intersection(region_polygon(rect)).area < 1.0
-    # gameplay-only surface: no new paint path was added
-    assert not any(str(p.get('shapeId','')).startswith('r-p-') for p in after['paint']['paths'])
+    # region pen (paint=False default): gameplay-only surface, no paint path
+    # is added and the region carries no masterShapeId
+    before=load_bundle(pen_asset/'bundle')
+    assert len(after['paint']['paths'])==len(before['paint']['paths'])
+    assert 'masterShapeId' not in pen[0]
     # pen edges reference the new region (left/right = adjacent region ids)
     edges=after['geometry'].get('edges') or []
     assert any(pen[0]['id'] in (e.get('leftRegion'),e.get('rightRegion')) for e in edges)
     assert validate_bundle(after)['passed']
+
+def test_pen_artwork_paints_and_recolors(pen_asset,tmp_path):
+    """Artwork pen (P0): the drawn shape becomes finished artwork - a stable
+    paint.json path (sp-* shapeId, fill, z-order) the region references via
+    masterShapeId, so the normal recolor flow works on pen-drawn art."""
+    before=load_bundle(pen_asset/'bundle')
+    n_paths=len(before['paint']['paths'])
+    max_z=max(p.get('z',0) for p in before['paint']['paths'])
+    group_hex=next(e['hex'] for e in before['palette'] if e['id']==1)
+    result=edit_bundle(pen_asset/'bundle',tmp_path/'penart',
+        EditRequest(base_revision='x',action='draw',region_ids=[],d='M 10,10 L 40,10 L 40,40 L 10,40 Z',
+                    palette_id=1,group='doodle',paint=True),'0.2.0')
+    assert result['validation']['passed']
+    after=load_bundle(tmp_path/'penart')
+    pen=next(r for r in after['geometry']['regions'] if r['id'].startswith('r-p-'))
+    sid=pen.get('masterShapeId')
+    assert sid and sid.startswith('sp-')
+    entries=[p for p in after['paint']['paths'] if p.get('shapeId')==sid]
+    assert len(entries)==1
+    entry=entries[0]
+    # fill defaults to the number group's swatch, z lands above the art
+    assert entry['fill']==group_hex
+    assert entry['z']>max_z
+    # the painted surface and the tap surface coincide exactly
+    assert entry['d']==pen['d'] and entry['fillRule']==pen['fillRule']
+    assert after['paint']['sourceColorShapeCount']==before['paint']['sourceColorShapeCount']+1
+    # the colored reveal actually shows the drawn shape
+    assert entry['d'][:8] in (tmp_path/'penart'/'colored.svg').read_text()
+    # normal recolor flow now works on the pen-drawn shape
+    recolor=edit_bundle(tmp_path/'penart',tmp_path/'recolor',
+        EditRequest(base_revision='x',action='recolor',region_ids=[pen['id']],color='#FF7348'),'0.3.0')
+    assert recolor['validation']['passed']
+    after2=load_bundle(tmp_path/'recolor')
+    entry2=next(p for p in after2['paint']['paths'] if p.get('shapeId')==sid)
+    assert entry2['fill']=='#FF7348'
+    # palette swatch stays in sync with the new appearance (answer key)
+    assert next(e['hex'] for e in after2['palette'] if e['id']==1)=='#FF7348'
+
+def test_pen_artwork_custom_fill_stroke_and_layer(pen_asset,tmp_path):
+    before=load_bundle(pen_asset/'bundle')
+    min_z=min(p.get('z',0) for p in before['paint']['paths'])
+    result=edit_bundle(pen_asset/'bundle',tmp_path/'penfill',
+        EditRequest(base_revision='x',action='draw',region_ids=[],d='M 10,10 L 40,10 L 40,40 L 10,40 Z',
+                    palette_id=1,paint=True,color='#21b6c7',stroke_width=1.5,z_behind=True),'0.2.0')
+    assert result['validation']['passed']
+    after=load_bundle(tmp_path/'penfill')
+    pen=next(r for r in after['geometry']['regions'] if r['id'].startswith('r-p-'))
+    entry=next(p for p in after['paint']['paths'] if p.get('shapeId')==pen['masterShapeId'])
+    assert entry['fill']=='#21B6C7' and entry['stroke']=='#29383E' and entry['strokeWidth']==1.5
+    assert entry['z']<min_z                    # behind the existing art
+    # custom fill keeps the number-group swatch in sync (recolor semantics)
+    assert next(e['hex'] for e in after['palette'] if e['id']==1)=='#21B6C7'
+    assert validate_bundle(after)['passed']
+    # the exported runtime contract still accepts the pen paint path
+    assert make_export(tmp_path/'penfill')  # does not raise
 
 def test_pen_full_overlap_rejected(pen_asset,tmp_path):
     with pytest.raises(ValueError,match='overlaps fully'):
@@ -420,11 +478,23 @@ def test_difficulty_profile_playtest_blend(svg_asset):
     pace=min(1.0,(150.0/count)/20.0)
     assert blended['score']==round(min(100.0,0.9*base['score']+10.0*pace),1)
     assert blended['rating'] in ('easy','medium','hard','master')
-    # Uncompleted runs carry data but never validate or blend the score.
+    # Mode separation (contract: free is engagement, not puzzle difficulty):
+    # uncompleted free runs carry engagement data but never feed the puzzle
+    # metrics, validate the rating or blend the score.
     partial=[{'seconds':60.0,'filled':1,'total':count,'mistakes':0,'mode':'free'}]
     unvalidated=difficulty_profile(b,partial)
     assert unvalidated['score']==base['score']
-    assert unvalidated['metrics']['playtestCount']==1
+    assert 'playtestCount' not in unvalidated['metrics']
+    assert unvalidated['metrics']['freePlayCount']==1
+    assert unvalidated['metrics']['freeMedianSeconds']==60.0
+    # even a COMPLETED free run never validates or blends puzzle difficulty
+    free_done=[{'seconds':60.0,'filled':count,'total':count,'mistakes':0,'mode':'free'}]
+    free_profile=difficulty_profile(b,free_done)
+    assert free_profile['score']==base['score']
+    assert 'playtestCount' not in free_profile['metrics']
+    # duel is a puzzle mode and blends like number/memory
+    duel=[{'seconds':100.0,'filled':count,'total':count,'mistakes':0,'mode':'duel'}]
+    assert difficulty_profile(b,duel)['metrics']['playtestCount']==1
 
 def test_emit_bundle_reads_playtest_records(svg_asset,tmp_path):
     b=load_bundle(svg_asset/'bundle')
@@ -436,3 +506,32 @@ def test_emit_bundle_reads_playtest_records(svg_asset,tmp_path):
     assert m['difficulty']['metrics']['playtestCount']==1
     qa=read_json(out/'validation.json')
     assert 'blended' in qa['difficulty']['note']
+    # free-only playtests never validate the rating
+    out2=tmp_path/'rev2';out2.mkdir()
+    write_json(out2/'playtests.json',[{'seconds':42.0,'filled':2,'total':2,'mistakes':0,'mode':'free'}])
+    emit_bundle(out2,b,previews=False)
+    m2=read_json(out2/'artwork.json')
+    assert m2['difficultyValidatedByPlaytest'] is False
+    assert m2['difficulty']['metrics']['freePlayCount']==1
+
+def test_exports_render_semantic_edges(svg_asset,tmp_path):
+    """numbered/linework exports use the semantic edges[] overlay (artwork
+    solid, subdivision light+dashed) - visually identical to the runtime
+    board, not the outline-per-region style."""
+    b=load_bundle(svg_asset/'bundle')
+    target=next(r for r in b['geometry']['regions'] if region_polygon(r).covers(Point(100,100)))
+    edit_bundle(svg_asset/'bundle',tmp_path/'cut',
+        EditRequest(base_revision='x',action='cut',region_ids=[target['id']],d='M 100 40 L 100 160'),'0.2.0')
+    line=(tmp_path/'cut'/'linework.svg').read_text()
+    numbered=(tmp_path/'cut'/'numbered.svg').read_text()
+    for text in (line,numbered):
+        assert 'data-layer="edges"' in text
+        assert 'data-edge-kind="artwork"' in text
+        assert 'data-edge-kind="subdivision"' in text
+        assert 'stroke-dasharray="3 2.2"' in text
+        assert 'stroke="#29383E"' in text
+    # masks render fill-only (the overlay draws the boundaries)
+    assert '<g fill-rule="evenodd">' in numbered
+    # legacy bundles without edges keep the outline-per-region fallback
+    line_svg_asset=(svg_asset/'bundle'/'linework.svg').read_text()
+    assert 'data-layer="edges"' in line_svg_asset  # svg masters always carry edges

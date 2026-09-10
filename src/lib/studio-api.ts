@@ -225,8 +225,10 @@ export interface EditPayload {
   palette_id?: number;
   x?: number;
   y?: number;
-  /** 'recolor': the visible appearance color (#RRGGBB). Distinct from
-   * 'palette', which assigns the gameplay number group. */
+  /** 'recolor': the visible appearance color (#RRGGBB). Also 'draw' with
+   * paint=true: the fill of the new artwork path (defaults to the number
+   * group's swatch). Distinct from 'palette', which assigns the gameplay
+   * number group. */
   color?: string;
   /** 'recolor': keep gradient shading (tinted toward the target color)
    * instead of replacing the fill. */
@@ -235,6 +237,15 @@ export interface EditPayload {
    *  region outline (M…Z). 'node': the NEW open boundary polyline between
    *  the two selected region ids. Pattern upstream accepts M/L/C/Q/Z. */
   d?: string;
+  /** 'draw' artwork pen: also emit a paint.json path (stable shapeId +
+   *  masterShapeId on the region, fill, z-order) so the drawn shape becomes
+   *  finished artwork — recolor works like any imported shape. */
+  paint?: boolean;
+  /** 'draw' with paint: ink outline width on the paint path (0 = none). */
+  stroke_width?: number;
+  /** 'draw' with paint: place the new paint path behind the existing art
+   *  (min z − 1) instead of on top (max z + 1). */
+  z_behind?: boolean;
 }
 
 /** Difficulty metrics from the compiler analyzer (contract §5).
@@ -251,12 +262,17 @@ export interface DifficultyMetrics {
   avgNeighbors?: number;
   subdivisionEdges?: number;
   objectDensity?: number;
-  /** Play-test factor (stage 3, contract B) — present once a completed run
-   *  has been recorded for the revision. */
+  /** Play-test factor (stage 3, contract B) — present once a completed
+   *  PUZZLE-mode run (number/memory/duel) has been recorded for the
+   *  revision. Free-color runs never feed these. */
   playtestCount?: number;
   playtestMedianSeconds?: number;
   playtestSecondsPerRegion?: number;
   playtestMistakesPerRegion?: number;
+  /** Engagement / interaction metrics from free-color runs — a different
+   *  task than puzzle difficulty (no target, no mistakes). */
+  freePlayCount?: number;
+  freeMedianSeconds?: number;
   [key: string]: unknown;
 }
 
@@ -413,7 +429,7 @@ export interface PlaytestRecordBody {
   filled: number;
   total: number;
   mistakes: number;
-  mode: "number" | "memory" | "free";
+  mode: "number" | "memory" | "duel" | "free";
 }
 
 export const recordPlaytest = (

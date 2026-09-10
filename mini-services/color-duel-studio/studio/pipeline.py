@@ -1289,6 +1289,37 @@ def svg_ink(paint):
     return '<g>' + ''.join(parts) + '</g>'
 
 
+def _edges_overlay(g: dict) -> str:
+    """Semantic boundary overlay for the static exports (linework / numbered).
+
+    Mirrors the runtime board's edges layer exactly: artwork edges render
+    solid INK (1.6), subdivision edges render light and dashed (0.85,
+    '3 2.2'), with optional ``boundaryStyle`` overrides per kind. Returns ''
+    for legacy bundles without edges (callers fall back to the
+    outline-per-region style).
+    """
+    edges = g.get('edges') or []
+    if not edges:
+        return ''
+    style = g.get('boundaryStyle') or {}
+    runs = []
+    for kind in EDGE_KINDS:
+        ds = [e['d'] for e in edges if e.get('kind') == kind]
+        if not ds:
+            continue
+        base = dict(BOUNDARY_STYLE_DEFAULT[kind])
+        custom = style.get(kind) or {}
+        for key in ('stroke', 'strokeWidth', 'dash'):
+            if custom.get(key) is not None:
+                base[key] = custom[key]
+        dash = f' stroke-dasharray="{_xa(str(base["dash"]))}"' if base.get('dash') else ''
+        runs.append(f'<g fill="none" stroke="{_xa(str(base["stroke"]))}" '
+                    f'stroke-width="{number(float(base["strokeWidth"]))}" '
+                    f'stroke-linecap="round" stroke-linejoin="round"{dash} data-edge-kind="{kind}">'
+                    + ''.join(f'<path d="{_xa(d)}"/>' for d in ds) + '</g>')
+    return '<g data-layer="edges">' + ''.join(runs) + '</g>'
+
+
 # ---------------------------------------------------------------------------
 # Validation (geometry tests; visual review is reported separately)
 # ---------------------------------------------------------------------------
@@ -1496,12 +1527,16 @@ def difficulty_profile(bundle: dict, playtests: list | None = None) -> dict:
     """Deterministic difficulty profile of a compiled bundle (contract 5).
 
     Weighted score 0-100; rating easy <25 <= medium <50 <= hard <75 <= master.
-    ``playtests`` (stage-3 contract B): recorded play-test runs; completed
-    runs (filled >= total) blend the score by completion pace (±10% band).
-    The ``difficultyValidatedByPlaytest`` manifest flag is set by callers.
-    Time/mistake metrics come from the completed runs when at least one
-    exists (a completion time is only meaningful when the board was filled);
-    otherwise from all recorded runs (partial-run data, no blend).
+    ``playtests`` (stage-3 contract B): recorded play-test runs. Only PUZZLE
+    runs (mode number/memory/duel; legacy entries without a mode count as
+    number) calibrate the score - completed puzzle runs blend it by completion
+    pace (±10% band) and drive ``difficultyValidatedByPlaytest``. Free-color
+    runs measure engagement/interaction, not puzzle difficulty: they surface
+    as ``freePlayCount`` / ``freeMedianSeconds`` metrics and are NEVER blended
+    into the score. Time/mistake metrics come from the completed puzzle runs
+    when at least one exists (a completion time is only meaningful when the
+    board was filled); otherwise from all recorded puzzle runs (partial-run
+    data, no blend).
     """
     g, p = bundle['geometry'], bundle['palette']
     regs = g.get('regions') or []
@@ -1581,18 +1616,30 @@ def difficulty_profile(bundle: dict, playtests: list | None = None) -> dict:
              + min(1.0, degrees / 8.0) * 12
              + min(1.0, density / 10.0) * 10)
     score = round(min(100.0, max(0.0, score)), 1)
-    # Play-test factor (stage-3 contract B): completed runs validate the rating
-    # and blend the score by completion pace - fast boards ease, slow climb.
-    completed = [e for e in (playtests or []) if e.get('filled', 0) >= e.get('total', 0)]
-    if playtests:
-        source = completed or list(playtests)
+    # Play-test factor (stage-3 contract B, mode-separated): puzzle runs
+    # (number/memory/duel) calibrate the score - completed runs validate the
+    # rating and blend it by completion pace, fast boards ease, slow climb.
+    # Free-color runs are engagement metrics only (never blended).
+    PUZZLE_MODES = (None, 'number', 'memory', 'duel')
+    puzzle_runs = [e for e in (playtests or []) if e.get('mode') in PUZZLE_MODES]
+    free_runs = [e for e in (playtests or []) if e.get('mode') == 'free']
+    completed = [e for e in puzzle_runs if e.get('filled', 0) >= e.get('total', 0)]
+    if puzzle_runs:
+        source = completed or puzzle_runs
         seconds = [float(e.get('seconds', 0.0) or 0.0) for e in source]
         median_seconds = float(np.median(seconds)) if seconds else 0.0
-        metrics['playtestCount'] = len(playtests)
+        metrics['playtestCount'] = len(puzzle_runs)
         metrics['playtestMedianSeconds'] = round(median_seconds, 1)
         metrics['playtestSecondsPerRegion'] = round(median_seconds / max(1, count), 2)
         metrics['playtestMistakesPerRegion'] = round(
             sum(float(e.get('mistakes', 0) or 0.0) for e in source) / max(1, count), 3)
+    if free_runs:
+        # Engagement / interaction metrics: free coloring is a different task
+        # (no puzzle target, no mistakes), so it never touches the difficulty
+        # score or the validated flag.
+        metrics['freePlayCount'] = len(free_runs)
+        metrics['freeMedianSeconds'] = round(float(np.median(
+            [float(e.get('seconds', 0.0) or 0.0) for e in free_runs])), 1)
     if completed:
         pace = min(1.0, (median_seconds / max(1, count)) / 20.0)
         score = round(min(100.0, 0.9 * score + 10.0 * pace), 1)
@@ -1621,28 +1668,43 @@ def emit_bundle(folder: Path, bundle: dict, previews=True) -> dict:
         except Exception:
             playtests = None
     m['difficulty'] = difficulty_profile(bundle, playtests)
-    completed = [e for e in (playtests or []) if e.get('filled', 0) >= e.get('total', 0)]
+    # Only completed PUZZLE runs (number/memory/duel) validate the rating;
+    # free-color completions are engagement data, not difficulty evidence.
+    completed = [e for e in (playtests or [])
+                 if e.get('filled', 0) >= e.get('total', 0) and e.get('mode') in (None, 'number', 'memory', 'duel')]
     m['difficultyValidatedByPlaytest'] = bool(completed)
     w, h = map(int, g['viewBox'][2:]); vb = svg_open(w, h)
     write_json(folder / 'regions.json', g); write_json(folder / 'palette.json', p); write_json(folder / 'paint.json', paint)
     m['contentHash'] = hashlib.sha256(b''.join((folder / f).read_bytes() for f in ['regions.json', 'palette.json', 'paint.json'])).hexdigest()
     final = vb + svg_paint(paint) + '</svg>'
     (folder / 'colored.svg').write_text(final)
-    outlines = '<g fill="none" stroke="' + INK + '" stroke-width="0.65" stroke-linejoin="round">' + \
-        ''.join(f'<path d="{r["d"]}"/>' for r in g['regions']) + '</g>'
+    # Static exports render the semantic edges overlay (contract: visually
+    # identical to the runtime board) - artwork edges solid, subdivision
+    # edges light+dashed. Legacy bundles without edges fall back to the
+    # outline-per-region style.
+    edges_svg = _edges_overlay(g)
+    if edges_svg:
+        outlines = edges_svg
+    else:
+        outlines = '<g fill="none" stroke="' + INK + '" stroke-width="0.65" stroke-linejoin="round">' + \
+            ''.join(f'<path d="{r["d"]}"/>' for r in g['regions']) + '</g>'
     (folder / 'linework.svg').write_text(vb + outlines + svg_ink(paint) + '</svg>')
     (folder / 'ink.svg').write_text(vb + svg_ink(paint) + '</svg>')
 
     def numbered(selected=False):
         select = g['regions'][0]['paletteId'] if g['regions'] else 1
         defs = '<defs><pattern id="sel" width="8" height="8" patternUnits="userSpaceOnUse"><rect width="8" height="8" fill="#F0F3F6"/><path d="M0 0H4V4H0Z M4 4H8V8H4Z" fill="#CBD5DD"/></pattern></defs>'
-        masks = '<g stroke="' + INK + '" stroke-width=".65" fill-rule="evenodd">' + ''.join(
+        # With a semantic edges overlay the masks render FILL-ONLY (the
+        # overlay draws every boundary), matching the runtime board.
+        mask_attrs = 'fill-rule="evenodd"' if edges_svg \
+            else 'stroke="' + INK + '" stroke-width=".65" fill-rule="evenodd"'
+        masks = '<g ' + mask_attrs + '>' + ''.join(
             f'<path d="{r["d"]}"' + (' fill-rule="nonzero"' if r.get('fillRule') == 'nonzero' else '')
             + ' fill="' + ('url(#sel)' if selected and r['paletteId'] == select else 'white') + '"/>' for r in g['regions']) + '</g>'
         labels = '<g font-family="sans-serif" text-anchor="middle" dominant-baseline="central" fill="' + INK + '">' + ''.join(
             f'<text x="{r["label"]["x"]}" y="{r["label"]["y"]}" font-size="{r["label"]["fontSize"]}">{r["paletteId"]}</text>' for r in g['regions']) + '</g>'
         paint_under = {'gradients': paint.get('gradients'), 'paths': paint['paths'], 'inkPaths': []}
-        return vb + defs + svg_paint(paint_under) + masks + svg_ink(paint) + labels + '</svg>'
+        return vb + defs + svg_paint(paint_under) + masks + edges_svg + svg_ink(paint) + labels + '</svg>'
 
     (folder / 'numbered.svg').write_text(numbered())
     (folder / 'selected-preview.svg').write_text(numbered(True))
@@ -1652,9 +1714,9 @@ def emit_bundle(folder: Path, bundle: dict, previews=True) -> dict:
     m['qa'] = {'status': 'draft-needs-human-review', 'passedGeometryChecks': True, 'humanReviewed': False}
     qa['difficulty'] = {'rating': m['difficulty']['rating'], 'score': m['difficulty']['score'],
                         'metrics': m['difficulty']['metrics'],
-                        'note': ('Deterministic analyzer blended with recorded play-test completion times (difficultyValidatedByPlaytest true).'
+                        'note': ('Deterministic analyzer blended with completed puzzle-mode (number/memory/duel) play-test times; free-color runs are engagement metrics only.'
                                  if m['difficultyValidatedByPlaytest'] else
-                                 'Deterministic analyzer; difficultyValidatedByPlaytest stays false until a real playtest.')}
+                                 'Deterministic analyzer; difficultyValidatedByPlaytest stays false until a completed number/memory/duel playtest. Free-color runs never count as difficulty evidence.')}
     write_json(folder / 'validation.json', qa)
     if previews:
         import cairosvg
@@ -2281,15 +2343,55 @@ def edit_bundle(source: Path, output: Path, request, version: str):
             raise ValueError('The drawn shape overlaps fully with existing regions; '
                              'draw over empty canvas instead.')
         drawn_ref = [LineString(ring) for ring in rings]
+        # Artwork pen (P0 contract): the drawn shape also becomes finished
+        # artwork - a paint.json path with a stable shapeId (sp-*), fill,
+        # optional ink outline and z-order is emitted, and every playable
+        # region references it via masterShapeId, so the normal recolor /
+        # QA / revision flow works on pen-drawn art exactly like imported SVG
+        # shapes. The region pen (paint=False) stays a gameplay-only white tap
+        # target (the artist paints it later).
+        paint = bundle['paint']
+        palette_entry = next((entry for entry in bundle['palette'] if entry['id'] == pid), None)
+        if request.paint and request.color:
+            fill = request.color.upper()
+            if not SAFE_HEX.match(fill):
+                raise ValueError('Choose a #RRGGBB fill color for the artwork shape.')
+        else:
+            fill = (palette_entry or {}).get('hex', '#808080')
+        zs = [float(entry.get('z', 0) or 0)
+              for entry in (paint.get('paths') or []) + (paint.get('inkPaths') or [])]
+        if not zs:
+            z_order = 1
+        elif request.paint and request.z_behind:
+            z_order = int(math.floor(min(zs))) - 1
+        else:
+            z_order = int(math.floor(max(zs))) + 1
+        stroke_w = round(float(request.stroke_width or 0.0), 3)
         new_regions = []
         for idx, piece in enumerate(usable):
             pen_id = 'r-p-' + hashlib.sha256((request.d + version + str(idx)).encode()).hexdigest()[:12]
-            # Pen regions are gameplay-only surfaces: NO paint.json path is
-            # added (white tap target that colors in; the artist recolors later).
             reg = pack_region(piece, pen_id, int(pid), request.group,
                               source='pen-drawn', fit_tolerance=fit_tolerance)
+            if request.paint:
+                shape_id = 'sp-' + hashlib.sha256((pen_id + 'shape').encode()).hexdigest()[:12]
+                # The paint path carries the region's master geometry so the
+                # painted surface and the tap surface coincide exactly.
+                entry = {'z': z_order, 'shapeId': shape_id, 'd': reg['d'],
+                         'fillRule': reg['fillRule'], 'fill': fill}
+                if stroke_w > 0:
+                    entry['stroke'] = INK
+                    entry['strokeWidth'] = stroke_w
+                paint['paths'].append(entry)
+                paint['sourceColorShapeCount'] = int(paint.get('sourceColorShapeCount', 0) or 0) + 1
+                reg['masterShapeId'] = shape_id
             g['regions'].append(reg)
             new_regions.append(reg)
+        if request.paint and palette_entry is not None and str(palette_entry.get('hex', '')).upper() != fill:
+            # Keep the palette swatch (= the answer-key color of the number
+            # group) in sync with the painted appearance, mirroring recolor.
+            palette_entry['hex'] = fill
+            palette_entry['paint'] = {'type': 'linearGradient',
+                                      'stops': [{'offset': 0, 'color': fill}, {'offset': 1, 'color': fill}]}
         g.setdefault('edges', [])
         g.setdefault('boundaryStyle', BOUNDARY_STYLE_DEFAULT)
         index = _RegionIndex(g['regions'])

@@ -88,8 +88,20 @@ export interface StudioApi {
   setTool: (t: StudioTool) => void;
   /** Cut a region along a drawn line: edit action "cut" with the path d. */
   cutRegion: (regionId: string, d: string) => Promise<void>;
-  /** Create a gameplay-only region from a drawn closed shape: edit action "draw". */
-  drawRegion: (d: string, paletteId: number, group?: string) => Promise<void>;
+  /** Create a region from a drawn closed shape: edit action "draw". With
+   *  paint=true (artwork pen) the shape also becomes finished artwork — a
+   *  paint.json path with a stable shapeId, fill, optional ink outline and
+   *  z-order; the region references it via masterShapeId so recolor works.
+   *  paint=false (region pen) stays a gameplay-only white tap target. */
+  drawRegion: (
+    d: string,
+    paletteId: number,
+    group?: string,
+    paint?: boolean,
+    color?: string,
+    strokeWidth?: number,
+    zBehind?: boolean
+  ) => Promise<void>;
   /** Rebuild the shared boundary between two regions (dragged anchors):
    *  edit action "node" with the new open boundary path d. */
   nodeEdit: (regionIds: [string, string], d: string) => Promise<void>;
@@ -828,10 +840,20 @@ export function StudioProvider({ children }: { children: React.ReactNode }) {
   );
 
   /** Create a region from a drawn closed shape — edit action "draw"
-   *  (contract §3): gameplay-only surface, painted later by the artist. */
+   *  (contract §3). paint=true (artwork pen) also emits the paint.json path
+   *  (stable shapeId/masterShapeId, fill, outline, z-order) so the shape is
+   *  real finished artwork; paint=false stays a gameplay-only surface. */
   const drawRegion = useCallback(
-    (d: string, paletteId: number, group?: string) =>
-      runEdit("draw", { d, palette_id: paletteId, ...(group ? { group } : {}) }, []),
+    (d: string, paletteId: number, group?: string, paint?: boolean, color?: string, strokeWidth?: number, zBehind?: boolean) =>
+      runEdit("draw", {
+        d,
+        palette_id: paletteId,
+        ...(group ? { group } : {}),
+        ...(paint ? { paint: true } : {}),
+        ...(paint && color ? { color } : {}),
+        ...(paint && strokeWidth ? { stroke_width: strokeWidth } : {}),
+        ...(paint && zBehind ? { z_behind: true } : {}),
+      }, []),
     [runEdit]
   );
 

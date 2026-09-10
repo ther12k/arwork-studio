@@ -112,14 +112,20 @@ function DifficultyPanel({ raw, validated }: { raw: string | DifficultyProfile |
     ["Label clearance", String(metrics.labelClearance ?? "—")],
   ];
   // Play-test factor (contract B) — only when a run has been recorded.
+  // Puzzle runs (number/memory/duel) calibrate difficulty; free-color runs
+  // surface as engagement metrics and never feed the score.
   if (num(metrics.playtestCount) != null)
-    rows.push(["Playtests", num(metrics.playtestCount)!.toLocaleString("en-US")]);
+    rows.push(["Playtests (puzzle)", num(metrics.playtestCount)!.toLocaleString("en-US")]);
   if (num(metrics.playtestMedianSeconds) != null)
     rows.push(["Median completion", formatPlaytestClock(num(metrics.playtestMedianSeconds)!)]);
   if (num(metrics.playtestSecondsPerRegion) != null)
     rows.push(["Pace", `${num(metrics.playtestSecondsPerRegion)!.toFixed(1)} s/region`]);
   if (num(metrics.playtestMistakesPerRegion) != null)
     rows.push(["Mistakes/region", num(metrics.playtestMistakesPerRegion)!.toFixed(2)]);
+  if (num(metrics.freePlayCount) != null)
+    rows.push(["Free-color plays", `${num(metrics.freePlayCount)!.toLocaleString("en-US")} (engagement)`]);
+  if (num(metrics.freeMedianSeconds) != null)
+    rows.push(["Free median time", formatPlaytestClock(num(metrics.freeMedianSeconds)!)]);
   return (
     <div className="rp-wide mt-4 rounded-[10px] border border-[#dfe6d8] bg-[#eff3ec] px-3 py-2.5">
       <div className="flex items-center justify-between gap-2">
