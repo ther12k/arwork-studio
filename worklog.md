@@ -1461,3 +1461,30 @@ Work Log:
 Stage Summary:
 - The Semantic Object Model contract is now 100% watertight: decorative shading and ink shapes retain their object ownership through all region editing operations without orphan warnings, and parent hierarchies are preserved even when parent nodes hold no direct playable regions.
 - Ready for Phase 2: Create with AI (chat-first, scene plan preview, targeted object regeneration) and Create from Image (Reference vs Convert pipelines with Fidelity presets and difficulty tiers).
+
+---
+Task ID: 21
+Agent: main (ZCode)
+Task: Phase 2A — Generation Orchestrator: ScenePlan draft stage, structured mutations, transactional sessions, isolation & atomic revision commit.
+
+Work Log:
+- Implemented `studio/generation.py` (Generation Orchestrator):
+  * Difficulty preset ranges and targets: Easy (100–180, init 140), Medium (180–320, init 250), Hard (320–550, init 430), Master (550–800, init 650). Preserves requestedDifficulty vs measuredDifficulty distinction.
+  * Fidelity policy configurations: Stylized, Balanced (default), Faithful with distinct semantic/layout/contour/palette settings.
+  * ScenePlan schema (v1) and normalization: title, description, aspect, viewBox, requestedDifficulty, targetRegionRange, targetRegions, and structured planned objects (id, name, description, role, z, bbox, fills, detailWeight, parentId, subdivision, generation).
+  * Structured mutations engine (`apply_scene_mutations`): deterministic operations `update_object`, `add_object`, `remove_object` (with parentId cleanup), `reorder_objects`, `set_difficulty` (recomputing target ranges), `update_plan`.
+  * `GenerationSessionManager`: state machine (`draft_plan` -> `compiling` -> `ready_to_commit` -> `committed` / `failed` / `canceled`) operating inside isolated `workspace/projects/{pid}/sessions/{session_id}/`.
+  * Atomic commit (`commit_session`): promotes verified bundle from session temp dir into immutable `revisions/rev-*`, enriches `artwork.json` with generation metadata (mode, requestedDifficulty, targetRegionRange, measuredDifficulty, fidelity, scenePlan, sessionId, committedAt), and updates `session.json` status to 'committed'.
+  * Rollback & failure isolation: compile failures, invalid SVGs, or cancellations update session status to 'failed'/'canceled' without touching or corrupting current healthy revisions.
+- Extended `studio/models.py`: `CreateSessionRequest`, `MutateScenePlanRequest`, `CommitSessionRequest`.
+- Extended `studio/app.py`:
+  * Endpoints: POST/GET `/api/projects/{pid}/generation/sessions`, GET `/api/projects/{pid}/generation/sessions/{sid}`, POST `.../mutate`, POST `.../cancel`, DELETE `.../{sid}`, POST `.../compile`, POST `.../commit`.
+  * Added `objects.json` to the allowed artifact download whitelist (`FILES`).
+- Tests (`tests/test_api.py`, 3 new comprehensive tests; suite: **84 passed, 7 skipped** via Docker runner):
+  * `test_generation_session_crud_and_mutations`: CRUD lifecycle, structured mutations (add object, set difficulty, parent cleanup), cancellation semantics.
+  * `test_generation_session_transaction_and_isolation`: verifies compile executes in session workspace without touching existing healthy revision, atomic commit promotes to new revision with complete `generation` manifest block and `objects.json`.
+  * `test_generation_session_failure_rollback`: verifies both upload sanitization failure and compilation failure update session to failed while leaving project's healthy revision and revisions list 100% intact.
+- Documentation: updated `FORMAT.md` (Generation sessions and provenance section), `AGENTS.md` (Phase 2A architecture rules).
+
+Stage Summary:
+- Phase 2A (Generation Orchestrator) complete: the transactional foundation for AI generation is established. All subsequent AI creation modes (2B Create with AI, 2C Image Reference, 2D Image Convert) now share this isolated session orchestrator with structured ScenePlans, failure rollback, and atomic revision commit.

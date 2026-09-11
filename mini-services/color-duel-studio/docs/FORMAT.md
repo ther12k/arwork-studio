@@ -45,6 +45,37 @@ Edit synchronization (`_sync_objects_from_regions`) reconciles object records af
 
 QA (`validation.json → objects`) reports orphan shapes/regions, missing shapeIds, invalid parents, zero-geometry objects and impossible budgets as **warnings** — they never fail geometry validation.
 
+## Generation sessions and provenance (authoring layer)
+
+AI generation and image workflows are orchestrated transactionally via `GenerationSessionManager`. A session isolates all drafts in `workspace/projects/{pid}/sessions/{session_id}/` (ScenePlan, vector fragments, candidate master SVG, compiled test bundle) and only promotes to an immutable project revision (`revisions/rev-*`) upon explicit commit after passing QA. If generation fails, cancels, or fails validation, current project revisions remain completely untouched.
+
+When committed, `artwork.json` records generation provenance:
+
+```json
+{
+  "generation": {
+    "mode": "ai_chat",
+    "requestedDifficulty": "hard",
+    "targetRegionRange": [320, 550],
+    "measuredDifficulty": {
+      "rating": "hard",
+      "score": 68.4
+    },
+    "fidelity": "balanced",
+    "sessionId": "sess-a1b2c3d4e5f6",
+    "scenePrompt": "Cozy forest café beside a waterfall",
+    "scenePlan": {
+      "schemaVersion": 1,
+      "title": "Cozy forest café",
+      "requestedDifficulty": "hard",
+      "targetRegions": 430,
+      "objects": [...]
+    },
+    "committedAt": "2026-09-11T12:00:00Z"
+  }
+}
+```
+
 ## Difficulty profile
 
 `artwork.json` carries `manifest.difficulty = {rating, score, metrics}` computed deterministically for every revision: `rating` is easy (<25) / medium (<50) / hard (<75) / master; `score` is a 0–100 weighted sum over `regionCount, medianRegionArea, tinyRegionPct, requiredZoom` (worst-case zoom for a 44px touch target from a fit viewport), `labelClearance` (ok/tight/conflict), `paletteAmbiguity` (low/medium/high), `paletteGroups, avgNeighbors, subdivisionEdges, objectDensity`. It replaces the old `"unrated"` placeholder; `difficultyValidatedByPlaytest` stays false until a real playtest.

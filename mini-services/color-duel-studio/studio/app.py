@@ -16,11 +16,19 @@ from .pipeline import (BACKENDS, clean_image, compile_image, compile_svg_master,
                         load_bundle, validate_bundle, legacy_geometry)
 from .svg_master import clean_svg
 from .ai import Provider
+from .generation import (
+    GenerationSessionManager,
+    create_scene_plan,
+    apply_scene_mutations,
+    DIFFICULTY_RANGES,
+    DIFFICULTY_TIERS,
+)
 
 BASE = Path(__file__).resolve().parents[1]
 load_dotenv(BASE / '.env')
 SAFE = re.compile(r'^[a-zA-Z0-9][a-zA-Z0-9_-]{0,80}$')
-FILES = {'artwork.json', 'regions.json', 'palette.json', 'paint.json', 'colored.svg', 'numbered.svg', 'linework.svg',
+FILES = {'artwork.json', 'regions.json', 'palette.json', 'paint.json', 'objects.json',
+         'colored.svg', 'numbered.svg', 'linework.svg',
          'ink.svg', 'selected-preview.svg', 'thumbnail.webp', 'source-master.png', 'source-master.svg',
          'colored-preview.png', 'numbered-preview.png', 'validation.json', 'build-settings.json'}
 
@@ -439,6 +447,132 @@ def create_app(workspace: Path|None=None, transport=None):
         if width*round(width*h/w)>20_000_000:raise HTTPException(400,'Export exceeds 20 megapixels.')
         content=cairosvg.svg2png(url=str(d/'colored.svg'),output_width=width,output_height=round(width*h/w))
         return Response(content,media_type='image/png',headers={'Content-Disposition':'attachment; filename="vector-export.png"'})
+    # -----------------------------------------------------------------------
+    # Generation Orchestrator routes (Phase 2A)
+    # -----------------------------------------------------------------------
+    @app.post('/api/projects/{pid}/generation/sessions')
+    def create_generation_session_route(pid: str, body: CreateSessionRequest):
+        with lock:
+            p = project(pid)
+            editable(p)
+            sm = GenerationSessionManager(folder(pid), pid)
+            session = sm.create_session(
+                mode=body.mode,
+                requested_difficulty=body.requested_difficulty,
+                prompt=body.prompt,
+                aspect=body.aspect,
+                fidelity=body.fidelity or 'balanced',
+            )
+            return session
+
+    @app.get('/api/projects/{pid}/generation/sessions')
+    def list_generation_sessions_route(pid: str):
+        sm = GenerationSessionManager(folder(pid), pid)
+        return {'sessions': sm.list_sessions()}
+
+    @app.get('/api/projects/{pid}/generation/sessions/{sid}')
+    def get_generation_session_route(pid: str, sid: str):
+        sm = GenerationSessionManager(folder(pid), pid)
+        try:
+            return sm.get_session(sid)
+        except (FileNotFoundError, ValueError):
+            raise HTTPException(404, f'Session {sid} not found.')
+
+    @app.post('/api/projects/{pid}/generation/sessions/{sid}/mutate')
+    def mutate_session_plan_route(pid: str, sid: str, body: MutateScenePlanRequest):
+        with lock:
+            p = project(pid)
+            editable(p)
+            sm = GenerationSessionManager(folder(pid), pid)
+            try:
+                return sm.mutate_plan(sid, body.mutations)
+            except (ValueError, FileNotFoundError) as exc:
+                raise HTTPException(400, str(exc))
+
+    @app.post('/api/projects/{pid}/generation/sessions/{sid}/cancel')
+    def cancel_generation_session_route(pid: str, sid: str):
+        with lock:
+            sm = GenerationSessionManager(folder(pid), pid)
+            try:
+                return sm.cancel_session(sid)
+            except (ValueError, FileNotFoundError) as exc:
+                raise HTTPException(400, str(exc))
+
+    @app.delete('/api/projects/{pid}/generation/sessions/{sid}')
+    def delete_generation_session_route(pid: str, sid: str):
+        with lock:
+            sm = GenerationSessionManager(folder(pid), pid)
+            try:
+                sm.discard_session(sid)
+            except ValueError as exc:
+                raise HTTPException(400, str(exc))
+            return {'ok': True}
+
+    @app.post('/api/projects/{pid}/generation/sessions/{sid}/compile')
+    def compile_session_route(pid: str, sid: str, master_file: UploadFile | None = None):
+        with lock:
+            p = project(pid)
+            editable(p)
+            sm = GenerationSessionManager(folder(pid), pid)
+            try:
+                sdir = sm.session_path(sid)
+            except ValueError as exc:
+                raise HTTPException(400, str(exc))
+            target_svg = sdir / 'source-master.svg'
+            if master_file:
+                content = master_file.file.read()
+                try:
+                    clean_svg(content, target_svg)
+                except ValueError as exc:
+                    sm.update_status(sid, 'failed', error=str(exc))
+                    raise HTTPException(400, f'Invalid SVG master: {exc}')
+            if not target_svg.is_file():
+                raise HTTPException(400, 'Session has no master SVG to compile.')
+
+        def run(tick):
+            tick(0.2, 'Compiling session bundle')
+            try:
+                res = sm.compile_session(sid, target_svg, progress=tick)
+                return {'session': sm.get_session(sid), 'validation': res['validation']}
+            except Exception as exc:
+                sm.update_status(sid, 'failed', error=str(exc))
+                raise
+
+        return start(pid, 'session vector compilation', run)
+
+    @app.post('/api/projects/{pid}/generation/sessions/{sid}/commit')
+    def commit_session_route(pid: str, sid: str, body: CommitSessionRequest = CommitSessionRequest()):
+        with lock:
+            p = project(pid)
+            editable(p)
+            sm = GenerationSessionManager(folder(pid), pid)
+            version = f'0.{len(p["revisions"]) + 1}.0'
+            title = body.title or p['title']
+            try:
+                res = sm.commit_session(sid, version=version, title=title)
+            except (ValueError, FileNotFoundError) as exc:
+                raise HTTPException(400, str(exc))
+
+            p['revisions'].append(res['revision'])
+            p['currentRevision'] = res['revision']['id']
+
+            # If session produced a master SVG, promote it to project master
+            sdir = sm.session_path(sid)
+            draft_svg = sdir / 'source-master.svg'
+            if draft_svg.is_file():
+                dest_name = f'master-{ident()}.svg'
+                shutil.copy2(draft_svg, folder(pid) / dest_name)
+                im = clean_svg(draft_svg.read_bytes(), folder(pid) / dest_name)
+                p['master'] = {
+                    'file': dest_name,
+                    **im,
+                    'source': f"AI-generated ({res['manifest']['generation']['mode']})",
+                    'rightsConfirmed': False,
+                    'createdAt': now(),
+                }
+            save(p)
+            return res
+
     app.mount('/static',StaticFiles(directory=BASE/'web'),name='static')
     @app.get('/')
     def index():return FileResponse(BASE/'web/index.html')

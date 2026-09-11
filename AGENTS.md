@@ -85,6 +85,11 @@ Backend (in `mini-services/color-duel-studio/`):
   `<g data-cd-object>` groups and is stamped by the AI scene planner before generation; edit
   actions preserve it via `_sync_objects_from_regions`. Auto-subdivide consumes per-object budgets
   (area × detailWeight × complexity, clamped, normalized); QA reports object issues as warnings.
+- Generation orchestrator (Phase 2A): multi-step AI creation runs in transactional sessions
+  (`GenerationSessionManager` under `sessions/{session_id}`). ScenePlan drafts support structured
+  mutations (add/remove/update/reorder/difficulty). Healthy revisions are never mutated or corrupted
+  during generation; failed/canceled sessions rollback cleanly; commit promotes the passed bundle
+  atomically into `revisions/rev-*` with enriched `generation` provenance.
 
 ## Conventions & hygiene
 

@@ -343,3 +343,173 @@ def test_playtest_payload_hardening(client):
     assert 'region count' in client.post(base+'/playtest',headers=H,json={**good,'total':region_count+7}).json()['detail']
     # the well-formed shape still records normally
     assert client.post(base+'/playtest',headers=H,json=good).status_code==200
+
+
+def test_generation_session_crud_and_mutations(client):
+    pid = new(client)
+    # Create session
+    r = client.post(f'/api/projects/{pid}/generation/sessions', headers=H,
+                    json={'mode': 'ai_chat', 'requested_difficulty': 'hard', 'prompt': 'Cozy fantasy village'})
+    assert r.status_code == 200, r.text
+    sess = r.json()
+    sid = sess['id']
+    assert sess['status'] == 'draft_plan'
+    assert sess['requestedDifficulty'] == 'hard'
+    assert sess['targetRegionRange'] == [320, 550]
+    assert sess['targetRegions'] == 430
+
+    # List sessions
+    r = client.get(f'/api/projects/{pid}/generation/sessions', headers=H)
+    assert r.status_code == 200
+    assert any(s['id'] == sid for s in r.json()['sessions'])
+
+    # Get session
+    r = client.get(f'/api/projects/{pid}/generation/sessions/{sid}', headers=H)
+    assert r.status_code == 200
+    assert r.json()['id'] == sid
+
+    # Mutate plan: add object + set difficulty to master
+    mutations = [
+        {'op': 'add_object', 'object': {
+            'id': 'obj-waterfall', 'name': 'Waterfall', 'role': 'midground', 'z': 2,
+            'bbox': [100, 100, 200, 300], 'fills': ['#4AA3DF'], 'detailWeight': 1.5
+        }},
+        {'op': 'set_difficulty', 'difficulty': 'master'},
+    ]
+    r = client.post(f'/api/projects/{pid}/generation/sessions/{sid}/mutate', headers=H,
+                    json={'mutations': mutations})
+    assert r.status_code == 200, r.text
+    mutated = r.json()
+    assert mutated['requestedDifficulty'] == 'master'
+    assert mutated['targetRegionRange'] == [550, 800]
+    assert mutated['targetRegions'] == 650
+    obj_ids = [o['id'] for o in mutated['scenePlan']['objects']]
+    assert 'obj-waterfall' in obj_ids
+    waterfall = next(o for o in mutated['scenePlan']['objects'] if o['id'] == 'obj-waterfall')
+    assert waterfall['detailWeight'] == 1.5
+
+    # Cancel session
+    r = client.post(f'/api/projects/{pid}/generation/sessions/{sid}/cancel', headers=H)
+    assert r.status_code == 200
+    assert r.json()['status'] == 'canceled'
+
+    # Cannot mutate canceled session
+    r = client.post(f'/api/projects/{pid}/generation/sessions/{sid}/mutate', headers=H,
+                    json={'mutations': [{'op': 'set_difficulty', 'difficulty': 'easy'}]})
+    assert r.status_code == 400
+
+
+def test_generation_session_transaction_and_isolation(client, tmp_path):
+    # Setup initial healthy revision
+    pid, rev1 = _svg_project(client)
+    p_initial = client.get(f'/api/projects/{pid}').json()
+    assert p_initial['currentRevision'] == rev1
+    revs_initial_count = len(p_initial['revisions'])
+
+    # Start generation session
+    r = client.post(f'/api/projects/{pid}/generation/sessions', headers=H,
+                    json={'mode': 'ai_chat', 'requested_difficulty': 'easy', 'prompt': 'Two color fields'})
+    assert r.status_code == 200
+    sid = r.json()['id']
+
+    # Compile session using an SVG master
+    test_svg = b'''<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 200 200">
+    <g data-cd-object="obj-sky" data-cd-name="Sky">
+      <rect x="0" y="0" width="200" height="100" fill="#3366AA"/>
+    </g>
+    <g data-cd-object="obj-ground" data-cd-name="Ground">
+      <rect x="0" y="100" width="200" height="100" fill="#44AA66"/>
+    </g>
+    </svg>'''
+    r = client.post(f'/api/projects/{pid}/generation/sessions/{sid}/compile', headers=H,
+                    files={'master_file': ('master.svg', test_svg, 'image/svg+xml')})
+    assert r.status_code == 200
+    p = wait(client, pid)
+    assert p['job']['status'] == 'done'
+
+    # Check isolation: project's currentRevision is STILL rev1!
+    # Generation was in session temp workspace, NOT touching current revision!
+    p_current = client.get(f'/api/projects/{pid}').json()
+    assert p_current['currentRevision'] == rev1
+    assert len(p_current['revisions']) == revs_initial_count
+
+    # Session is now ready_to_commit
+    sess = client.get(f'/api/projects/{pid}/generation/sessions/{sid}').json()
+    assert sess['status'] == 'ready_to_commit'
+    assert sess['meta']['qa']['passed'] is True
+
+    # Now commit session to project revision
+    r = client.post(f'/api/projects/{pid}/generation/sessions/{sid}/commit', headers=H,
+                    json={'title': 'Committed AI Generation'})
+    assert r.status_code == 200, r.text
+    commit_res = r.json()
+    rev2 = commit_res['revision']['id']
+    assert rev2 != rev1
+
+    # Project now points to rev2
+    p_after = client.get(f'/api/projects/{pid}').json()
+    assert p_after['currentRevision'] == rev2
+    assert len(p_after['revisions']) == revs_initial_count + 1
+
+    # Check manifest enrichment with generation block
+    manifest = client.get(f'/api/projects/{pid}/revisions/{rev2}/files/artwork.json').json()
+    assert 'generation' in manifest
+    gen = manifest['generation']
+    assert gen['mode'] == 'ai_chat'
+    assert gen['requestedDifficulty'] == 'easy'
+    assert gen['sessionId'] == sid
+    assert 'measuredDifficulty' in gen
+    assert 'scenePlan' in gen
+
+    # Check objects.json was emitted
+    objs = client.get(f'/api/projects/{pid}/revisions/{rev2}/files/objects.json').json()
+    assert objs['schemaVersion'] == 1
+    obj_ids = {o['id'] for o in objs['objects']}
+    assert {'obj-sky', 'obj-ground'} <= obj_ids
+
+
+def test_generation_session_failure_rollback(client):
+    # Setup initial healthy revision
+    pid, rev1 = _svg_project(client)
+    p_initial = client.get(f'/api/projects/{pid}').json()
+
+    # Test 1: Uploading an empty/unsupported SVG master immediately fails
+    r = client.post(f'/api/projects/{pid}/generation/sessions', headers=H,
+                    json={'mode': 'ai_chat', 'requested_difficulty': 'easy'})
+    sid1 = r.json()['id']
+    empty_svg = b'''<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 200 200"></svg>'''
+    r = client.post(f'/api/projects/{pid}/generation/sessions/{sid1}/compile', headers=H,
+                    files={'master_file': ('master.svg', empty_svg, 'image/svg+xml')})
+    assert r.status_code == 400
+    sess1 = client.get(f'/api/projects/{pid}/generation/sessions/{sid1}').json()
+    assert sess1['status'] == 'failed'
+    assert 'no supported drawable shapes' in sess1['error']
+
+    # Test 2: Master passes sanitization but fails vector compilation (shapes too small)
+    r = client.post(f'/api/projects/{pid}/generation/sessions', headers=H,
+                    json={'mode': 'ai_chat', 'requested_difficulty': 'easy'})
+    sid2 = r.json()['id']
+    tiny_svg = b'''<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 200 200">
+    <rect x="0" y="0" width="1" height="1" fill="#112233"/>
+    </svg>'''
+    r = client.post(f'/api/projects/{pid}/generation/sessions/{sid2}/compile', headers=H,
+                    files={'master_file': ('master.svg', tiny_svg, 'image/svg+xml')})
+    assert r.status_code == 200
+    p = wait(client, pid)
+    assert p['job']['status'] == 'failed'
+
+    # Session status is failed with error message
+    sess2 = client.get(f'/api/projects/{pid}/generation/sessions/{sid2}').json()
+    assert sess2['status'] == 'failed'
+    assert 'too small' in sess2['error']
+
+    # Rollback guarantee: healthy current revision and revisions list remain 100% untouched!
+    p_after = client.get(f'/api/projects/{pid}').json()
+    assert p_after['currentRevision'] == rev1
+    assert len(p_after['revisions']) == len(p_initial['revisions'])
+
+    # Cannot commit a failed session
+    r = client.post(f'/api/projects/{pid}/generation/sessions/{sid2}/commit', headers=H)
+    assert r.status_code == 400
+
+

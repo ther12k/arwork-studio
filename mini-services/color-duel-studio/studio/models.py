@@ -101,3 +101,17 @@ class PlaytestRecord(StrictModel):
 
 class ActivateRequest(StrictModel):
     revision: str
+
+class CreateSessionRequest(StrictModel):
+    mode: Literal['ai_chat', 'image_reference', 'image_convert'] = 'ai_chat'
+    requested_difficulty: Literal['easy', 'medium', 'hard', 'master'] = 'hard'
+    prompt: str = Field('', max_length=12000)
+    aspect: Literal['1024x1536', '1536x1024', '1024x1024'] = '1024x1536'
+    fidelity: Literal['stylized', 'balanced', 'faithful'] | None = 'balanced'
+
+class MutateScenePlanRequest(StrictModel):
+    mutations: list[dict] = Field(..., max_length=50)
+
+class CommitSessionRequest(StrictModel):
+    title: str | None = Field(None, max_length=100)
+
