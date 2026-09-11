@@ -96,6 +96,17 @@ Backend (in `mini-services/color-duel-studio/`):
   Phase 2C adds `/reference-plan` (Use as Reference): the uploaded image is attached to the vision
   planning call and drafts a NEW semantic ScenePlan — the source is never traced; artwork is then
   generated natively via the same `/generate` step.
+- Convert Artwork (Phase 2D, `/convert`): AI decides *what* the objects are (semantic ScenePlan,
+  bboxes scaled from plan space into image pixel space); deterministic CV decides *where* pixel
+  boundaries are (SLIC → tiny merge → Lab ΔE adjacent merge). Candidate segmentation is
+  difficulty-independent (`CONVERT_CANDIDATE_BASE`) — changing difficulty must never alter the
+  paint reconstruction (same `rc-*` shapeIds and path bytes; asserted by tests). Fidelity presets
+  are real algorithm parameters: `segmentDensity` scales SLIC candidate count,
+  `colorMergeDeltaE` drives the CIELAB adjacent merge, `curveTolerance`/`minComponentArea`/
+  `paletteTarget` flow into BuildSettings. Raster paint paths carry stable shapeIds + `objectId`;
+  the INITIAL converted revision emits `objects.json`. Quality gates score `visualFidelity` and
+  `gameReadiness` independently and reject over-vectorization; geometry QA is enforced upstream
+  by `emit_bundle`.
 
 ## Conventions & hygiene
 

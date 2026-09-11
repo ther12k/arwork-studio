@@ -2124,26 +2124,181 @@ def emit_bundle(folder: Path, bundle: dict, previews=True) -> dict:
 # Compilation: raster masters
 # ---------------------------------------------------------------------------
 
-def _image_labels(source: Path, settings: BuildSettings):
+def _lab_of(rgb: np.ndarray) -> np.ndarray:
+    """RGB → CIE Lab (D65) for perceptual ΔE merge decisions."""
+    return cv2.cvtColor(rgb.astype(np.float32) / 255.0, cv2.COLOR_RGB2LAB)
+
+
+def _merge_similar_adjacent(labels: np.ndarray, rgb: np.ndarray, delta_e: float,
+                            min_size: int) -> np.ndarray:
+    """Fidelity pass (Phase 2D.1): iteratively merge adjacent candidate
+    segments whose mean Lab ΔE is below the policy threshold. Runs BEFORE
+    semantic association and region building, so colorMergeDeltaE genuinely
+    changes the candidate geometry (photo noise joins its neighbours; flat
+    illustration bands stay separate)."""
+    if delta_e <= 0:
+        return labels
+    lab = _lab_of(rgb)
+    changed = True
+    guard = 0
+    while changed and guard < 8:
+        changed = False
+        guard += 1
+        values = [int(v) for v in np.unique(labels) if int(v) != 0]
+        if len(values) < 2:
+            break
+        means: Dict[int, np.ndarray] = {}
+        areas: Dict[int, int] = {}
+        for v in values:
+            mask = labels == v
+            means[v] = lab[mask].mean(0)
+            areas[v] = int(mask.sum())
+        pairs: Dict[int, List[int]] = defaultdict(list)
+        for a, b in ((labels[:, :-1], labels[:, 1:]), (labels[:-1, :], labels[1:, :])):
+            edge = a != b
+            for la, lb in zip(a[edge], b[edge]):
+                la, lb = int(la), int(lb)
+                if la and lb and la != lb and lb not in pairs[la]:
+                    pairs[la].append(lb)
+                    pairs[lb].append(la)
+        # smallest-first merge plan keeps the plan deterministic
+        plan: List[Tuple[int, int]] = []
+        for v in values:
+            for n in sorted(pairs.get(v, [])):
+                if n <= v:
+                    continue
+                de = float(np.sqrt(((means[v] - means[n]) ** 2).sum()))
+                if de <= delta_e:
+                    small, large = (v, n) if areas[v] <= areas[n] else (n, v)
+                    if areas[large] >= min_size or areas[small] < min_size:
+                        plan.append((small, large))
+        if not plan:
+            break
+        # Single-pass, conflict-free merge: a segment merges into at most one
+        # survivor this round, and a survivor absorbs at most one partner.
+        # Chain merges (A→B, B→C) are deferred to the next round after means
+        # are recomputed — this keeps every merged label area consistent and
+        # the region partition overlap-free.
+        busy: set = set()
+        relabel: Dict[int, int] = {}
+        for small, large in sorted(plan):
+            if small in busy or large in busy:
+                continue
+            relabel[small] = large
+            busy.add(small)
+            busy.add(large)
+        if not relabel:
+            break
+        out = labels.copy()
+        for src, dst in sorted(relabel.items()):
+            out[labels == src] = dst
+        labels = out
+        changed = True
+    # Merging whole labels can create non-connected label areas; region and
+    # paint builders require connected geometry — split into fresh ids per
+    # connected component (deterministic: row-major scan order).
+    split = np.zeros_like(labels)
+    nxt = 0
+    for v in [int(v) for v in np.unique(labels) if int(v) != 0]:
+        mask = (labels == v).astype(np.uint8)
+        n_comp, comp = cv2.connectedComponents(mask, connectivity=4)
+        for idx in range(1, n_comp):
+            nxt += 1
+            split[comp == idx] = nxt
+    return split
+
+
+def _image_labels(source: Path, settings: BuildSettings,
+                  segment_density: float = 1.0, color_merge_delta_e: float = 0.0):
     """Shared SLIC + tiny-merge step for raster compilation (Phase 2D entry).
 
     Returns (rgb, labels, original_size, working_size) so semantic converters
-    can analyze the EXACT same labels the region compiler will consume."""
+    can analyze the EXACT same labels the region compiler will consume.
+
+    Convert fidelity knobs (Phase 2D.1):
+    - segment_density scales the CANDIDATE segment count independently of the
+      gameplay target (candidate segmentation ≠ final gameplay regions);
+    - color_merge_delta_e (CIE Lab) merges perceptually-equal adjacent
+      candidates BEFORE association, so fidelity genuinely changes geometry."""
     im = Image.open(source).convert('RGB'); original = im.size
     im.thumbnail((settings.max_edge, settings.max_edge), Image.Resampling.LANCZOS)
     rgb = np.array(im); h, w = rgb.shape[:2]
-    labels = slic(rgb, n_segments=settings.target_regions, compactness=settings.compactness,
+    n_candidates = max(30, int(round(settings.target_regions * max(0.2, segment_density))))
+    labels = slic(rgb, n_segments=n_candidates, compactness=settings.compactness,
                   sigma=.8, start_label=1, enforce_connectivity=True, min_size_factor=.25, channel_axis=-1)
     labels = merge_tiny(labels, rgb, settings.min_region_pixels)
+    if color_merge_delta_e > 0:
+        labels = _merge_similar_adjacent(labels, rgb, color_merge_delta_e, settings.min_region_pixels)
     return rgb, labels, original, (w, h)
+
+
+def _semantic_raster_paint(labels: np.ndarray, rgb: np.ndarray, label_map: dict,
+                           settings: BuildSettings, artwork_id: str, w: int, h: int) -> dict:
+    """Object-aware raster paint for Convert (Phase 2D.1).
+
+    Builds the visual reconstruction from the SAME candidate labels the
+    gameplay regions use, but grouped by SEMANTIC object + fill hex — each
+    group becomes one paint path with a stable rc-* shapeId. Visual layer and
+    gameplay layer stay separate (no per-region paint), yet the reconstruction
+    carries real ownership:
+
+        obj-tree -> rc-tree-0001, rc-tree-0002, ...
+        obj-house -> rc-house-0001, ...
+
+    Same color areas of different objects never share a path, so later
+    targeted edits/regeneration can address one object's artwork."""
+    corner_cos = _corner_cos(settings.corner_angle_deg)
+    masters = masters_from_labels(labels, background=0,
+                                  fit_tolerance=settings.curve_tolerance, corner_cos=corner_cos)
+    paths = []
+    groups: Dict[Tuple[str, str], List[str]] = defaultdict(list)
+    for value, comps in masters.items():
+        oid = label_map.get(int(value), 'unassigned')
+        mask = labels == int(value)
+        hx = '#' + ''.join(f'{int(v):02X}' for v in np.clip(rgb[mask].mean(0), 0, 255)) if mask.any() else '#808080'
+        for comp in comps:
+            groups[(oid, hx)].append(format_path(comp['master']))
+    counters: Dict[str, int] = defaultdict(int)
+    for (oid, hx), ds in sorted(groups.items()):
+        slug = oid.replace('obj-', '').replace('unassigned', 'canvas')
+        counters[slug] += 1
+        shape_id = f'rc-{slug}-{counters[slug]:04d}'
+        paths.append({'shapeId': shape_id, 'objectId': oid, 'fill': hx, 'd': ' '.join(ds)})
+    return {'schemaVersion': 2, 'artworkId': artwork_id, 'viewBox': [0, 0, w, h],
+            'paths': paths, 'inkPaths': [], 'sourceColorShapeCount': len(paths),
+            'notes': ('Object-aware reconstruction from semantic candidate segments; each path '
+                      'carries a stable shapeId and object ownership (rc-* shapes).')}
+
+
+def _objects_from_segment_map(segment_object_map: dict, paint: dict) -> list | None:
+    """Initial object records for converted bundles (Phase 2D.1): one record
+    per object referenced by the segment map, owning its rc-* paint shapes."""
+    if not segment_object_map:
+        return None
+    owned: Dict[str, List[str]] = defaultdict(list)
+    for p in (paint.get('paths') or []):
+        oid = p.get('objectId')
+        sid = p.get('shapeId')
+        if oid and oid != 'unassigned' and sid:
+            owned[oid].append(sid)
+    if not owned:
+        return None
+    records = [{'id': oid,
+                'name': oid.replace('obj-', '').replace('-', ' ').title(),
+                'shapeIds': sorted(sids)}
+               for oid, sids in sorted(owned.items())]
+    return normalize_objects({'objects': records})
 
 
 def compile_image(source: Path, output: Path, *, artwork_id: str, version: str, title: str,
                   settings: BuildSettings, provenance: dict | None = None,
                   segment_object_map: dict | None = None,
+                  segment_density: float = 1.0, color_merge_delta_e: float = 0.0,
                   progress: Callable = lambda *_: None) -> dict:
     progress(.04, 'Preparing approved master')
-    rgb, labels, original, (w, h) = _image_labels(source, settings)
+    rgb, labels, original, (w, h) = _image_labels(source, settings,
+                                                  segment_density=segment_density,
+                                                  color_merge_delta_e=color_merge_delta_e)
     curved = settings.backend == 'spline-local'
     corner_cos = _corner_cos(settings.corner_angle_deg)
     progress(.24, 'Fitting shared boundary chains into curved masters' if curved else 'Extracting pixel-edge polygons (legacy)')
@@ -2204,7 +2359,12 @@ def compile_image(source: Path, output: Path, *, artwork_id: str, version: str, 
     if not regions:
         raise ValueError('No playable regions. Lower the label radius or region count.')
     progress(.48, 'Tracing the detailed vector paint layer' if curved else 'Tracing pixel-edge paint polygons (legacy)')
-    paint, _ = trace_paint(rgb, settings, artwork_id, curved=curved)
+    if segment_object_map:
+        # Convert (Phase 2D.1): object-aware reconstruction — stable rc-* shapeIds
+        # with semantic ownership, built from the same candidate labels.
+        paint = _semantic_raster_paint(labels, rgb, segment_object_map, settings, artwork_id, w, h)
+    else:
+        paint, _ = trace_paint(rgb, settings, artwork_id, curved=curved)
     geometry = {'schemaVersion': 2, 'geometrySchema': GEOMETRY_SCHEMA, 'source': 'raster',
                 'artworkId': artwork_id, 'artworkVersion': version,
                 'viewBox': [0, 0, w, h], 'fillRule': 'evenodd', 'stroke': INK, 'strokeWidth': .65,
@@ -2230,6 +2390,13 @@ def compile_image(source: Path, output: Path, *, artwork_id: str, version: str, 
                                'rasterizedMaster': False},
                 'provenance': provenance or {'source': 'User-supplied image; rights not independently verified'}}
     bundle = {'manifest': manifest, 'geometry': geometry, 'palette': palette, 'paint': paint}
+    if segment_object_map:
+        # Converted bundles ship objects.json from the FIRST revision (not
+        # only after an edit): same first-class contract as native SVG/AI art.
+        objects = _objects_from_segment_map(segment_object_map, paint)
+        if objects:
+            bundle['objects'] = objects
+            manifest['objectsCount'] = len(objects)
     output.mkdir(parents=True, exist_ok=True)
     shutil.copy2(source, output / 'source-master.png')
     progress(.70, 'Checking topology, labels and runtime exports')

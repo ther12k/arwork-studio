@@ -78,6 +78,28 @@ When committed, `artwork.json` records generation provenance:
 }
 ```
 
+## Convert Artwork (image → vectors)
+
+`image_convert` sessions follow the same first-class semantic contract as native AI artwork. The division of labour: **the AI decides *what* the objects are** (semantic ScenePlan with approximate bboxes in plan viewBox space, scaled into image pixel space before association); **deterministic CV decides *where* the pixel boundaries are** (SLIC superpixels → tiny-component merge → Lab ΔE adjacent merge, then connected-component split).
+
+**Candidate segmentation is independent of gameplay subdivision.** Reconstruction always segments the source at `CONVERT_CANDIDATE_BASE` (220) candidate labels regardless of the requested difficulty; difficulty only steers the gameplay subdivision of already-reconstructed paint. Consequence (asserted by tests): converting the same source at the same fidelity produces byte-identical paint shapeIds and path `d` strings for Easy and Master — only `regions.json`, labels and difficulty metrics differ.
+
+Fidelity presets change real algorithm parameters (`studio/generation.py → CONVERT_POLICIES`):
+
+| Preset | segmentDensity | colorMergeDeltaE | curveTolerance | minComponentArea | paletteTarget | visualGate |
+|---|---|---|---|---|---|---|
+| stylized | 0.6 | 14 | 2.0 | 120 | 16 | 55 |
+| balanced | 1.0 | 9 | 1.1 | 42 | 24 | 70 |
+| faithful | 1.8 | 5 | 0.6 | 18 | 40 | 82 |
+
+- `segmentDensity` scales the SLIC candidate count (`target_regions × max(0.2, density)`, floor 30) — it is *not* the final gameplay region count.
+- `colorMergeDeltaE` drives a real adjacent-segment merge pass in mean CIELAB space (conflict-free one-to-one merges per pass; chains deferred to later passes).
+- `curveTolerance`, `minComponentArea`, `paletteTarget` flow into `BuildSettings`.
+
+Raster paint reconstruction is object-aware: every paint path carries a stable `shapeId` (`rc-<object>-<n>`, e.g. `rc-tree-0042`) and an `objectId`, grouped by `(objectId, fill)`. The **initial converted revision** therefore ships `objects.json` whose records own the live `rc-*` shapes — same contract as native SVG artwork, not something that only appears after the first edit. Session quality scores `visualFidelity` (vs the policy's visual gate) and `gameReadiness` (gate 80 for all presets) independently; over-vectorization (gameplay regions ≫ candidate segments) fails the session with an actionable message. Geometry QA is enforced upstream — `compile_image → emit_bundle` raises on `validate_bundle` failures before the quality scorer runs.
+
+Session intermediates: `source.png` (normalized via `clean_image`), `decomposition.json`, `reconstructed-master.svg`, `bundle/`. On commit the bundle is promoted atomically to `revisions/rev-*` and the project master becomes the normalized raster source (`master-*.png`), so later edit actions rebuild from the same pixels.
+
 ## Difficulty profile
 
 `artwork.json` carries `manifest.difficulty = {rating, score, metrics}` computed deterministically for every revision: `rating` is easy (<25) / medium (<50) / hard (<75) / master; `score` is a 0–100 weighted sum over `regionCount, medianRegionArea, tinyRegionPct, requiredZoom` (worst-case zoom for a 44px touch target from a fit viewport), `labelClearance` (ok/tight/conflict), `paletteAmbiguity` (low/medium/high), `paletteGroups, avgNeighbors, subdivisionEdges, objectDensity`. It replaces the old `"unrated"` placeholder; `difficultyValidatedByPlaytest` stays false until a real playtest.

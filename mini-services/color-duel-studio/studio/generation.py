@@ -453,6 +453,11 @@ CONVERT_POLICIES: Dict[str, Dict[str, Any]] = {
 }
 
 
+CONVERT_CANDIDATE_BASE = 220      # fidelity-only candidate density base; NEVER
+                                  # scaled by the difficulty target (2D.1: the
+                                  # reconstruction is difficulty-invariant)
+
+
 def resolve_convert_policy(fidelity: str, overrides: dict | None = None) -> dict:
     """Resolved, reproducible convert policy stored in the session."""
     base = dict(CONVERT_POLICIES.get(fidelity, CONVERT_POLICIES['balanced']))
@@ -473,7 +478,9 @@ def _hex_rgb(hx: str) -> np.ndarray:
 
 
 def associate_segments_to_objects(rgb: np.ndarray, labels: np.ndarray, objects: list,
-                                  policy: dict) -> Tuple[Dict[int, str], List[dict], List[dict]]:
+                                  policy: dict,
+                                  plan_space: Tuple[float, float] | None = None
+                                  ) -> Tuple[Dict[int, str], List[dict], List[dict]]:
     """Score-based assignment of deterministic CV segments to AI-decided
     semantic objects (Phase 2D association layer).
 
@@ -506,14 +513,22 @@ def associate_segments_to_objects(rgb: np.ndarray, labels: np.ndarray, objects: 
                 stats[la]['neighbors'].add(lb)
                 stats[lb]['neighbors'].add(la)
     # ---- independent scoring pass ----
-    obj_bboxes = [o['bbox'] for o in objects]
+    # Plan bboxes live in the ScenePlan viewBox space (e.g. 576x768); segment
+    # bboxes live in image pixel space. Scale the plan bboxes into image space
+    # before comparing, or the overlap prior is meaningless (2D.1 fix).
+    plan_vw, plan_vh = plan_space or (float(w), float(h))
+    sx, sy = (float(w) / max(1e-6, plan_vw), float(h) / max(1e-6, plan_vh))
+    obj_bboxes = []
+    for o in objects:
+        bx, by, bw, bh = o['bbox']
+        obj_bboxes.append((bx * sx, by * sy, (bx + bw) * sx, (by + bh) * sy))
     obj_rgbs = [np.mean([_hex_rgb(f) for f in (o.get('fills') or ['#808080'])], axis=0) for o in objects]
 
     def bbox_score(bb, ob):
-        ix = max(0.0, min(bb[2], ob[0] + ob[2]) - max(bb[0], ob[0]))
-        iy = max(0.0, min(bb[3], ob[1] + ob[3]) - max(bb[1], ob[1]))
+        ix = max(0.0, min(bb[2], ob[2]) - max(bb[0], ob[0]))
+        iy = max(0.0, min(bb[3], ob[3]) - max(bb[1], ob[1]))
         inter = ix * iy
-        union = (bb[2] - bb[0]) * (bb[3] - bb[1]) + ob[2] * ob[3] - inter
+        union = (bb[2] - bb[0]) * (bb[3] - bb[1]) + (ob[2] - ob[0]) * (ob[3] - ob[1]) - inter
         return inter / union if union > 0 else 0.0
 
     scores: Dict[int, Dict[str, float]] = {}
@@ -543,8 +558,10 @@ def associate_segments_to_objects(rgb: np.ndarray, labels: np.ndarray, objects: 
             if votes:
                 nb_oid, nb_votes = max(votes.items(), key=lambda kv: kv[1])
                 share = nb_votes / len(st_neighbors)
-                # neighbor consensus can rescue a close call, never override a strong one
-                if best < 0.45 and share >= 0.5 and row[nb_oid] >= 0.6 * best:
+                # neighbor consensus can rescue a close call, never override a
+                # strong one; 'unassigned' neighbours carry no object vote.
+                if (nb_oid != 'unassigned' and best < 0.45 and share >= 0.5
+                        and row.get(nb_oid, 0.0) >= 0.6 * best):
                     best_oid = nb_oid
                     best = max(best, 0.45)
         smoothed[v] = best_oid if best >= float(policy.get('assocConfidence', 0.35)) else 'unassigned'
@@ -613,7 +630,9 @@ def conversion_quality_score(bundle: dict, source_rgb: np.ndarray, policy: dict)
     readiness -= min(25.0, tiny_ratio * 100 * 0.9)          # microscopic fragments
     readiness -= min(20.0, max(0.0, shapes_per_megapixel - 120) * 0.15)  # fragment storm
     readiness -= min(15.0, short_edges * 1.5)               # traced-bitmap signatures
-    qa = bundle.get('manifest', {}).get('qa') or {}
+    # NOTE: geometry QA is not re-checked here — compile_image → emit_bundle
+    # already RAISES on validate_bundle failures, so invalid geometry can
+    # never reach this scorer.
     readiness = max(0.0, min(100.0, readiness))
     unassigned = sum(1 for r in g['regions'] if (r.get('objectId') or 'unassigned') == 'unassigned')
     unassigned_pct = round(100 * unassigned / len(g['regions']), 1) if g['regions'] else 100.0
@@ -946,19 +965,35 @@ class GenerationSessionManager:
         write_json(sdir / 'session.json', session)
 
         # 2+3. candidate segmentation + semantic association (deterministic CV)
+        # Candidate count is FIDELITY-ONLY (Phase 2D.1): a fixed base density
+        # scaled by segmentDensity, never by the difficulty target — the
+        # reconstruction must be byte-identical across Easy..Master; gameplay
+        # density comes from per-object subdivision budgets, not from here.
         self.update_status(session_id, 'compiling')
+        convert_settings = BuildSettings(
+            target_regions=CONVERT_CANDIDATE_BASE,    # fidelity-only; see above
+            auto_subdivide=False,
+            curve_tolerance=float(policy['curveTolerance']),
+            min_region_pixels=max(4, int(policy['minComponentArea'])),
+            palette_colors=max(4, min(80, int(policy['paletteTarget']))),
+        )
+        # build_settings keeps the SESSION difficulty target for the record
         settings = BuildSettings(
             target_regions=int(session['targetRegions']),
-            auto_subdivide=False,          # convert subdivides via object budgets later, not here
+            auto_subdivide=False,
             curve_tolerance=float(policy['curveTolerance']),
             min_region_pixels=max(4, int(policy['minComponentArea'])),
             palette_colors=max(4, min(80, int(policy['paletteTarget']))),
         )
         progress(.30, 'Segmenting the image (candidate regions)')
         from .pipeline import _image_labels
-        rgb, labels, original, (w, h) = _image_labels(source_png, settings)
+        rgb, labels, original, (w, h) = _image_labels(source_png, convert_settings,
+                                                      segment_density=float(policy['segmentDensity']),
+                                                      color_merge_delta_e=float(policy['colorMergeDeltaE']))
         progress(.42, 'Associating segments with semantic objects')
-        label_map, segments, object_stats = associate_segments_to_objects(rgb, labels, plan['objects'], policy)
+        plan_vw, plan_vh = plan['viewBox'][2], plan['viewBox'][3]
+        label_map, segments, object_stats = associate_segments_to_objects(
+            rgb, labels, plan['objects'], policy, plan_space=(plan_vw, plan_vh))
         decomposition = {'schemaVersion': 1, 'policy': {k: v for k, v in policy.items()},
                          'objects': plan['objects'], 'objectStats': object_stats,
                          'segments': segments,
@@ -973,7 +1008,9 @@ class GenerationSessionManager:
         try:
             result = compile_image(source_png, bundle_dir, artwork_id=self.pid,
                                    version='0.0.0-draft', title=plan['title'],
-                                   settings=settings, segment_object_map=label_map,
+                                   settings=convert_settings, segment_object_map=label_map,
+                                   segment_density=float(policy['segmentDensity']),
+                                   color_merge_delta_e=float(policy['colorMergeDeltaE']),
                                    provenance={'source': 'User-supplied image (Convert pipeline; semantic decomposition + deterministic segmentation)',
                                                'rightsConfirmedByUser': True,
                                                'legalClearanceVerified': False},

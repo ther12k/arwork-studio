@@ -962,3 +962,89 @@ def test_convert_round_trip_edits_keep_objects_valid(client, monkeypatch):
         qa = c.get(f'/api/projects/{pid}/revisions/{rev2}/files/validation.json').json()
         assert qa['passed']
         assert qa['objects']['orphanShapes'] == 0
+
+
+# ---------------------------------------------------------------------------
+# Phase 2D.1 — semantic/fidelity hardening
+# ---------------------------------------------------------------------------
+
+def test_convert_fidelity_params_change_segmentation(client, monkeypatch):
+    """segmentDensity and colorMergeDeltaE must genuinely change the candidate
+    segmentation output, not just sit in policy metadata."""
+    monkeypatch.setenv('OPENAI_API_KEY', 'fake-key')
+    from studio.pipeline import _image_labels
+    from studio.models import BuildSettings
+    src = Path(tempfile.mkdtemp()) / 'src.png'
+    Image.open(io.BytesIO(_convert_fixture_png())).save(src, format='PNG')
+    settings = BuildSettings(target_regions=60, min_region_pixels=8, max_edge=256)
+    rgb_a, labels_a, *_ = _image_labels(src, settings, segment_density=0.5, color_merge_delta_e=0.0)
+    rgb_b, labels_b, *_ = _image_labels(src, settings, segment_density=2.0, color_merge_delta_e=0.0)
+    n_a = len(np.unique(labels_a)); n_b = len(np.unique(labels_b))
+    assert n_b > n_a, f'density must change candidate count (low={n_a}, high={n_b})'
+    # ΔE merge on the same flat fixture: identical-color bands merge aggressively
+    _, labels_m, *_ = _image_labels(src, settings, segment_density=1.0, color_merge_delta_e=25.0)
+    assert len(np.unique(labels_m)) < len(np.unique(_image_labels(src, settings, segment_density=1.0, color_merge_delta_e=0.0)[1]))
+    # and a strict ΔE keeps the flat bands apart
+    _, labels_s, *_ = _image_labels(src, settings, segment_density=1.0, color_merge_delta_e=2.0)
+    assert len(np.unique(labels_s)) >= 3          # sky/house/grass stay separate
+
+
+def test_convert_paint_hash_invariant_across_difficulty(client, monkeypatch):
+    """Difficulty independence is now architectural: Easy vs Master sessions
+    on the same source + fidelity must produce the SAME paint reconstruction
+    (same shapeIds; identical path bytes) — only gameplay targets differ."""
+    monkeypatch.setenv('OPENAI_API_KEY', 'fake-key')
+    paints = {}
+    for difficulty in ('easy', 'master'):
+        with TestClient(create_app(Path(tempfile.mkdtemp()), transport=_convert_transport([]))) as c:
+            pid = new(c)
+            sid = c.post(f'/api/projects/{pid}/generation/sessions', headers=H,
+                         json={'mode': 'image_convert', 'requested_difficulty': difficulty,
+                               'fidelity': 'balanced'}).json()['id']
+            assert _run_convert(c, pid, sid, _convert_fixture_png()).status_code == 200
+            p = wait(c, pid)
+            assert p['job']['status'] == 'done', p['job']
+            sdir = Path(c.app.state.root) / pid / 'sessions' / sid
+            paint = json.loads((sdir / 'bundle' / 'paint.json').read_text())
+            # difficulty must not alter the RECONSTRUCTION: same shapes, same
+            # ids, same path bytes (artworkId differs per project, hence the
+            # structural comparison instead of raw bytes)
+            paints[difficulty] = {p['shapeId']: p['d'] for p in paint['paths']}
+    assert paints['easy'] == paints['master'], 'paint reconstruction must not depend on difficulty'
+
+
+def test_convert_initial_revision_has_objects_json(client, monkeypatch):
+    """First-class contract: the INITIAL converted revision (before any edit)
+    ships objects.json whose records own the rc-* paint shapes; orphanShapes
+    is 0 with a NON-EMPTY owned set (unlike the pre-2D.1 vacuous pass)."""
+    monkeypatch.setenv('OPENAI_API_KEY', 'fake-key')
+    with TestClient(create_app(Path(tempfile.mkdtemp()), transport=_convert_transport([]))) as c:
+        pid = new(c)
+        # Easy keeps the candidate count low, so the three flat bands stay
+        # distinct segments and each semantic object owns real geometry.
+        sid = c.post(f'/api/projects/{pid}/generation/sessions', headers=H,
+                     json={'mode': 'image_convert', 'requested_difficulty': 'easy',
+                           'fidelity': 'balanced'}).json()['id']
+        assert _run_convert(c, pid, sid, _convert_fixture_png()).status_code == 200
+        wait(c, pid)
+        r = c.post(f'/api/projects/{pid}/generation/sessions/{sid}/commit', headers=H, json={})
+        assert r.status_code == 200, r.text
+        rev = r.json()['revision']['id']
+        base = f'/api/projects/{pid}/revisions/{rev}'
+        # objects.json exists at commit time (not only after an edit)
+        objs = c.get(base + '/files/objects.json').json()
+        recs = {o['id']: o for o in objs['objects']}
+        assert {'obj-sky', 'obj-house', 'obj-grass'} <= set(recs)
+        # every record owns rc-* paint shapes
+        for o in objs['objects']:
+            assert o['shapeIds'] and all(s.startswith('rc-') for s in o['shapeIds']), o
+        # paint paths carry stable shapeIds and ownership
+        paint = c.get(base + '/files/paint.json').json()
+        assert paint['paths'] and all(p.get('shapeId') for p in paint['paths'])
+        owned = {s for o in objs['objects'] for s in o['shapeIds']}
+        live = {p['shapeId'] for p in paint['paths']}
+        assert owned == live, 'objects.json must own exactly the live rc-* shapes'
+        # orphan QA now verifies a NON-EMPTY ownership set
+        qa = c.get(base + '/files/validation.json').json()
+        assert qa['objects']['orphanShapes'] == 0
+        assert qa['objects']['assignedRegions'] > 0
