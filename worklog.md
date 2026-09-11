@@ -1309,3 +1309,23 @@ Stage Summary:
 - Difficulty calibration is mode-separated: number/memory/duel completions validate and blend; free-color runs are engagement metrics only (freePlayCount/freeMedianSeconds) and never validate the rating.
 - Production hygiene: clean release archive script with leak guard, .gitignore hardening, CI workflow (pytest + archive hygiene + bun lint).
 - Remaining from the verdict (not started this round): node-editing of SOURCE artwork paint paths, semantic per-object auto-subdivision allocation, real-device performance benchmarks.
+
+---
+Task ID: 15-a
+Agent: general-purpose (subagent)
+Task: Repo hygiene (git untrack runtime artifacts), CI hardening (tsc + real archive leak assertion), version alignment to 0.3.1.
+
+Work Log:
+- Read prior worklog sections (Task 11, Task 14) for context; no studio source or test files touched (pipeline.py / app.py / models.py / ai.py / tests untouched).
+- Untracked runtime/generated files from the git index with `git rm -r --cached` (index-only; every file kept on disk): mini-services/color-duel-studio/workspace (139 paths), studio/__pycache__ (7 .pyc), tool-results (51), download (11 incl. screenshots + README.md), .env, db/custom.db — 210 index deletions total, zero physical deletions. No other __pycache__/.pyc remained tracked (checked `git ls-files`).
+- Verified: `git ls-files | grep -cE 'workspace/|tool-results|^download/|__pycache__'` → 0; .env and db/custom.db untracked; .env, db/custom.db, workspace/ (3 projects), download/ (11), tool-results/ (52), studio/__pycache__/ (7 files) all still present on disk after the commit.
+- Hardened .gitignore (additive only, all existing entries kept): added `.env`, `db/`, `tool-results/`, `download/`, `*.pyc` under a new "secrets, databases, tool output and downloaded artifacts" section; `__pycache__/`, `mini-services/color-duel-studio/workspace/`, `mini-services/color-duel-studio/dist/` were already present. Confirmed coverage with `git check-ignore -v` for all 8 target patterns.
+- CI (.github/workflows/ci.yml): backend "Release archive hygiene" step replaced with a REAL leak assertion — runs scripts/package_release.py, then `if tar -tzf dist/*.tar.gz | grep -E 'workspace/|\.env$|\.log$|__pycache__|\.db$'; then echo "FORBIDDEN FILES FOUND IN RELEASE ARCHIVE"; exit 1; fi` + success echo. Frontend job gains "Typecheck (strict, no emit)" (`bunx tsc --noEmit`) BEFORE lint. Header comment updated to match reality (typecheck now actually runs) + commented-out `# - run: bun run build  # full build gates merge later` note. YAML validated.
+- Local dry-run of the new CI steps: release-archive leak assertion passes (package_release.py → 60 files, script's own guard clean, tar grep finds nothing → "Archive clean"); `bunx tsc --noEmit` clean.
+- Version alignment: package.json 0.2.1 → 0.3.1; mini-services/color-duel-studio/package.json 0.1.0 → 0.3.1. studio/app.py version constant intentionally left to the main agent.
+- Committed as a single commit after reviewing `git status --short` (4 modified files + 210 staged index-deletions only): ede18c2 "chore: untrack runtime artifacts, harden CI leak assertion + typecheck, align versions to 0.3.1" (214 files changed, +23/−37374 — all deletions are index-level untracks). Working tree clean afterwards.
+
+Stage Summary:
+- Repo no longer tracks runtime state or secrets: workspace/, __pycache__, tool-results/, download/, .env, db/custom.db all removed from the index and permanently ignored via .gitignore; every file remains on disk (studio service untouched, 3 projects intact).
+- CI now enforces real gates: the release-archive step FAILS when workspace/env/log/db/pycache entries appear in the tarball (previously inverted logic that could pass on leaks), and the frontend job typechecks with `tsc --noEmit` before lint; both verified green locally.
+- Monorepo versions aligned at 0.3.1 (root package.json + studio backend package.json), matching the studio version constant being set by the main agent.
