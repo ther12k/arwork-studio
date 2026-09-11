@@ -1409,3 +1409,10 @@ Work Log:
 Stage Summary:
 - The repo no longer documents the pre-P0 contracts anywhere an agent or developer would read first: root README stays the authoritative overview; the backend README now covers standalone setup plus the two AI deployment modes; in-product error strings teach the carve semantics instead of the old empty-canvas rule.
 - Next up per the review roadmap (not started here): semantic object model + per-object region budgets, two-entry AI UX (Create with AI / Create from Image with Reference-vs-Convert), source artwork node editing, real-device benchmark.
+
+Follow-up (same round): first CI run for the doc-alignment commit failed in "Release archive
+hygiene" — package_release.py's safety net matched '/.env' as a substring, so the newly committed
+.env.example template refused the archive. Fixed the guard to allow *.env.example templates
+(real .env/.env.local/.env.production stay excluded + refused), verified packaging locally
+(62 files, template included, CI tar-grep clean), pushed 03bcb7e — run green, both jobs pass,
+0 annotations (checkout v5 / setup-python v6 cleared the Node 20 warnings).
