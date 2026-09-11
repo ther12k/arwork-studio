@@ -942,3 +942,107 @@ def test_object_edit_preserves_ink_and_shading_shapes(tmp_path):
     assert qa_after['objects']['orphanShapes'] == 0
     assert not any('orphan' in w.lower() for w in qa_after['warnings'])
 
+
+# ---------------------------------------------------------------------------
+# Task 26 — Difficulty Optimization engine (gameplay-only moves)
+# ---------------------------------------------------------------------------
+
+def _grid_bundle(cols=16, rows=16, cell=16, split_at=8, min_px=35):
+    """Synthetic raster bundle: cols x rows exact pixel cells; the left cell
+    columns belong to obj-a, the right ones to obj-b. Deterministic, exactly
+    watertight, and QA-valid — the optimizer fixture."""
+    W, H = cols * cell, rows * cell
+    regions = []
+    rid = 0
+    for cx in range(cols):
+        for cy in range(rows):
+            rid += 1
+            oid = 'obj-a' if cx < split_at else 'obj-b'
+            pid = 1 if cx < split_at else 2
+            poly = Polygon([(cx * cell, cy * cell), ((cx + 1) * cell, cy * cell),
+                            ((cx + 1) * cell, (cy + 1) * cell), (cx * cell, (cy + 1) * cell)])
+            regions.append(pack_region(poly, f'r-{rid:05d}', pid, oid,
+                                       label=make_label(poly, pid), fit=False, fit_tolerance=0.0))
+    geometry = {'schemaVersion': 2, 'geometrySchema': GEOMETRY_SCHEMA, 'source': 'raster',
+                'artworkId': 'art-opt', 'artworkVersion': '0.1.0', 'viewBox': [0, 0, W, H],
+                'fillRule': 'evenodd', 'stroke': INK, 'strokeWidth': .65,
+                'backend': 'spline-local', 'flattenTolerance': FLATTEN_TOLERANCE,
+                'curveFitTolerance': None, 'partitionTolerance': 0.0,
+                'regions': regions, 'decorations': [], 'detailPaths': []}
+    manifest = {'schemaVersion': 1, 'format': SCHEMA, 'id': 'art-opt', 'version': '0.1.0',
+                'title': 'Optimizer fixture', 'viewBox': [0, 0, W, H],
+                'regionCount': len(regions), 'paletteCount': 2, 'objectGroups': [],
+                'difficulty': {'rating': 'easy', 'score': 10.0, 'metrics': {}},
+                'generation': {'settings': {'min_region_pixels': min_px, 'curve_tolerance': 1.0,
+                                            'corner_angle_deg': 60.0, 'min_label_radius': 3.0,
+                                            'palette_colors': 8, 'backend': 'spline-local',
+                                            'max_edge': 256}}}
+    palette = [{'id': 1, 'hex': '#4A6B82', 'name': 'a'}, {'id': 2, 'hex': '#C8A24B', 'name': 'b'}]
+    paint = {'schemaVersion': 2, 'artworkId': 'art-opt', 'viewBox': [0, 0, W, H],
+             'paths': [{'shapeId': 'rc-a-0001', 'objectId': 'obj-a', 'fill': '#4A6B82',
+                        'd': f'M 0 0 L {W // 2} 0 L {W // 2} {H} L 0 {H} Z'},
+                        {'shapeId': 'rc-b-0001', 'objectId': 'obj-b', 'fill': '#C8A24B',
+                         'd': f'M {W // 2} 0 L {W} 0 L {W} {H} L {W // 2} {H} Z'}],
+             'inkPaths': [], 'sourceColorShapeCount': 2, 'notes': 'synthetic optimizer fixture'}
+    objects = [{'id': 'obj-a', 'name': 'Left', 'shapeIds': ['rc-a-0001'],
+                'subdivision': {'detailWeight': 1.0}},
+               {'id': 'obj-b', 'name': 'Right', 'shapeIds': ['rc-b-0001'],
+                'subdivision': {'detailWeight': 1.0}}]
+    assert validate_bundle({'manifest': manifest, 'geometry': geometry,
+                            'palette': palette, 'paint': paint, 'objects': objects})['passed']
+    return {'manifest': manifest, 'geometry': geometry, 'palette': palette,
+            'paint': paint, 'objects': objects}
+
+
+def test_optimize_merge_down_never_crosses_objects():
+    """Easy target on a dense two-object board merges WITHIN objects only:
+    each object's total footprint is preserved (a cross-object merge would
+    shrink one object's area), the artwork layers stay byte-identical, and
+    the merged board still passes geometry QA."""
+    from studio.difficulty import optimize_gameplay_difficulty
+    bundle = _grid_bundle()
+    before_paint = [(p['shapeId'], p['d']) for p in bundle['paint']['paths']]
+    areas0 = {oid: sum(r['area'] for r in bundle['geometry']['regions'] if r['objectId'] == oid)
+              for oid in ('obj-a', 'obj-b')}
+    bundle, report = optimize_gameplay_difficulty(bundle, 'easy', target_regions=40)
+    regs = bundle['geometry']['regions']
+    assert report['merges'] > 0 and len(regs) <= 48
+    assert {r['objectId'] for r in regs} == {'obj-a', 'obj-b'}
+    for oid in ('obj-a', 'obj-b'):
+        assert sum(r['area'] for r in regs if r['objectId'] == oid) == pytest.approx(areas0[oid], rel=0.01)
+    assert [(p['shapeId'], p['d']) for p in bundle['paint']['paths']] == before_paint
+    assert bundle['objects'][0]['shapeIds'] == ['rc-a-0001']
+    assert validate_bundle(bundle)['passed']
+
+
+def test_optimize_split_up_keeps_floor_and_is_deterministic():
+    """Master target splits via the semantic budgets; every produced piece
+    stays at/above the tiny floor (no microscopic targets), QA passes, and
+    the same bundle + target reproduce the exact same regions."""
+    from studio.difficulty import optimize_gameplay_difficulty
+    b1, rep1 = optimize_gameplay_difficulty(_grid_bundle(), 'master', target_regions=600)
+    b2, rep2 = optimize_gameplay_difficulty(_grid_bundle(), 'master', target_regions=600)
+    regs = b1['geometry']['regions']
+    assert rep1['splits'] > 0 and len(regs) > 500
+    assert min(r['area'] for r in regs) >= 69.0
+    assert validate_bundle(b1)['passed']
+    assert ([(r['id'], r['d']) for r in regs]
+            == [(r['id'], r['d']) for r in b2['geometry']['regions']])
+    # object budgets recorded per object in the report and stamped onto records
+    assert set(rep1['budgets']) == {'obj-a', 'obj-b'}
+    assert rep1['budgets']['obj-a'] + rep1['budgets']['obj-b'] >= 500
+
+
+def test_optimize_safety_ceiling_reports_reasons():
+    """An unreachable tier stops within the iteration cap, keeps the board
+    healthy, and reports WHY — it never shreds regions to chase the number."""
+    from studio.difficulty import optimize_gameplay_difficulty
+    bundle = _grid_bundle(cols=4, rows=4, cell=16)
+    bundle, report = optimize_gameplay_difficulty(bundle, 'master', target_regions=650)
+    assert report['outcome'] in ('safe-ceiling', 'best-safe-result')
+    assert 1 <= len(report['iterations']) <= 3
+    assert len(bundle['geometry']['regions']) < 650
+    assert report['reasons']
+    assert validate_bundle(bundle)['passed']
+    # artwork invariants held throughout
+    assert [p['shapeId'] for p in bundle['paint']['paths']] == ['rc-a-0001', 'rc-b-0001']

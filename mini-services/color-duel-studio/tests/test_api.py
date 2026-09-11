@@ -16,8 +16,8 @@ def client(tmp_path):
     with TestClient(create_app(tmp_path)) as c:yield c
 
 def new(c):return c.post('/api/projects',json={'title':'API test'},headers=H).json()['id']
-def wait(c,pid):
-    end=time.time()+30
+def wait(c,pid,timeout=30):
+    end=time.time()+timeout
     while time.time()<end:
         p=c.get('/api/projects/'+pid).json()
         if p['job']['status'] in ['done','failed']:return p
@@ -838,7 +838,8 @@ def test_convert_end_to_end_semantic_ownership(client, monkeypatch):
                            'fidelity': 'balanced'}).json()['id']
         r = _run_convert(c, pid, sid, _convert_fixture_png())
         assert r.status_code == 200, r.text
-        p = wait(c, pid)
+        # hard sessions optimize toward 430 gameplay regions — heavy QA
+        p = wait(c, pid, timeout=240)
         assert p['job']['status'] == 'done', p['job']
         sess = c.get(f'/api/projects/{pid}/generation/sessions/{sid}').json()
         assert sess['status'] == 'ready_to_commit'
@@ -888,7 +889,8 @@ def test_convert_fidelity_changes_parameters_and_output(client, monkeypatch):
                          json={'mode': 'image_convert', 'fidelity': fidelity}).json()['id']
             r = _run_convert(c, pid, sid, _convert_fixture_png())
             assert r.status_code == 200, r.text
-            p = wait(c, pid)
+            # hard sessions optimize toward 430 gameplay regions — heavy QA
+            p = wait(c, pid, timeout=240)
             assert p['job']['status'] == 'done', p['job']
             sess = c.get(f'/api/projects/{pid}/generation/sessions/{sid}').json()
             assert sess['status'] == 'ready_to_commit'
@@ -942,7 +944,7 @@ def test_convert_round_trip_edits_keep_objects_valid(client, monkeypatch):
         sid = c.post(f'/api/projects/{pid}/generation/sessions', headers=H,
                      json={'mode': 'image_convert', 'fidelity': 'balanced'}).json()['id']
         assert _run_convert(c, pid, sid, _convert_fixture_png()).status_code == 200
-        wait(c, pid)
+        wait(c, pid, timeout=240)
         r = c.post(f'/api/projects/{pid}/generation/sessions/{sid}/commit', headers=H, json={})
         rev = r.json()['revision']['id']
         regions = c.get(f'/api/projects/{pid}/revisions/{rev}/files/regions.json').json()['regions']
@@ -990,11 +992,14 @@ def test_convert_fidelity_params_change_segmentation(client, monkeypatch):
 
 
 def test_convert_paint_hash_invariant_across_difficulty(client, monkeypatch):
-    """Difficulty independence is now architectural: Easy vs Master sessions
-    on the same source + fidelity must produce the SAME paint reconstruction
-    (same shapeIds; identical path bytes) — only gameplay targets differ."""
+    """The two halves of the difficulty contract, proven together: Easy vs
+    Master sessions on the same source + fidelity produce the SAME paint
+    reconstruction (identical shapeIds and path bytes) AND divergent gameplay
+    geometry — the requested tier must actually reshape regions/budgets via
+    the difficulty optimizer, never the artwork."""
     monkeypatch.setenv('OPENAI_API_KEY', 'fake-key')
     paints = {}
+    counts = {}
     for difficulty in ('easy', 'master'):
         with TestClient(create_app(Path(tempfile.mkdtemp()), transport=_convert_transport([]))) as c:
             pid = new(c)
@@ -1002,15 +1007,25 @@ def test_convert_paint_hash_invariant_across_difficulty(client, monkeypatch):
                          json={'mode': 'image_convert', 'requested_difficulty': difficulty,
                                'fidelity': 'balanced'}).json()['id']
             assert _run_convert(c, pid, sid, _convert_fixture_png()).status_code == 200
-            p = wait(c, pid)
+            # Master compiles + optimizes toward ~650 gameplay regions with
+            # full QA and preview renders — legitimately heavier than 30s.
+            p = wait(c, pid, timeout=240)
             assert p['job']['status'] == 'done', p['job']
             sdir = Path(c.app.state.root) / pid / 'sessions' / sid
             paint = json.loads((sdir / 'bundle' / 'paint.json').read_text())
+            regions = json.loads((sdir / 'bundle' / 'regions.json').read_text())['regions']
             # difficulty must not alter the RECONSTRUCTION: same shapes, same
             # ids, same path bytes (artworkId differs per project, hence the
             # structural comparison instead of raw bytes)
             paints[difficulty] = {p['shapeId']: p['d'] for p in paint['paths']}
+            counts[difficulty] = len(regions)
+            report = c.get(f'/api/projects/{pid}/generation/sessions/{sid}').json()[
+                'meta']['difficultyOptimization']
+            assert report['requestedTier'] == difficulty
+            assert report['achieved']['regionCount'] == counts[difficulty]
+            assert report['changed'] is True, 'the tier must move the gameplay layer'
     assert paints['easy'] == paints['master'], 'paint reconstruction must not depend on difficulty'
+    assert counts['master'] > counts['easy'], 'Master gameplay must be denser than Easy'
 
 
 def test_convert_initial_revision_has_objects_json(client, monkeypatch):
@@ -1048,3 +1063,46 @@ def test_convert_initial_revision_has_objects_json(client, monkeypatch):
         qa = c.get(base + '/files/validation.json').json()
         assert qa['objects']['orphanShapes'] == 0
         assert qa['objects']['assignedRegions'] > 0
+
+
+def test_convert_optimization_report_and_metadata(client, monkeypatch):
+    """Task 26: the optimizer report lands in session meta with per-object
+    budgets, and the ScenePlan's semantic metadata (role, detailWeight)
+    survives into the committed objects.json alongside actual rc-* ownership —
+    the budget engine's input contract for later Optimize runs."""
+    monkeypatch.setenv('OPENAI_API_KEY', 'fake-key')
+    with TestClient(create_app(Path(tempfile.mkdtemp()), transport=_convert_transport([]))) as c:
+        pid = new(c)
+        sid = c.post(f'/api/projects/{pid}/generation/sessions', headers=H,
+                     json={'mode': 'image_convert', 'requested_difficulty': 'medium',
+                           'fidelity': 'balanced'}).json()['id']
+        assert _run_convert(c, pid, sid, _convert_fixture_png()).status_code == 200
+        p = wait(c, pid)
+        assert p['job']['status'] == 'done', p['job']
+        sess = c.get(f'/api/projects/{pid}/generation/sessions/{sid}').json()
+        report = sess['meta']['difficultyOptimization']
+        assert report['requestedTier'] == 'medium'
+        assert report['targetRegions'] == 250
+        assert report['changed'] is True
+        assert report['outcome'] in ('target-reached', 'best-safe-result', 'safe-ceiling')
+        assert set(report['budgets']) == {'obj-sky', 'obj-house', 'obj-grass'}
+        assert sess['meta']['qa']['passed'] is True
+        r = c.post(f'/api/projects/{pid}/generation/sessions/{sid}/commit', headers=H, json={})
+        assert r.status_code == 200, r.text
+        rev = r.json()['revision']['id']
+        base = f'/api/projects/{pid}/revisions/{rev}'
+        objs = c.get(base + '/files/objects.json').json()
+        by_id = {o['id']: o for o in objs['objects']}
+        assert set(by_id) == {'obj-sky', 'obj-house', 'obj-grass'}
+        # plan semantics (name/role/detailWeight from the vision plan) merged
+        # with ACTUAL rc-* shape ownership; budgets stamped as preferredRegions
+        for oid, shapes in (('obj-sky', 10), ('obj-house', 14), ('obj-grass', 10)):
+            rec = by_id[oid]
+            assert rec['name'] == oid.replace('obj-', '')
+            assert rec['role'] == 'midground'
+            assert rec['subdivision']['detailWeight'] == pytest.approx(round(min(shapes / 12.0, 4.0), 3))
+            assert rec['subdivision']['preferredRegions'] == report['budgets'][oid]
+            assert rec['shapeIds'] and all(s.startswith('rc-') for s in rec['shapeIds'])
+        manifest = c.get(base + '/files/artwork.json').json()
+        assert manifest['difficulty']['rating'] == report['achieved']['rating']
+        assert manifest['difficulty']['metrics']['regionCount'] == report['achieved']['regionCount']

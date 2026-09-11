@@ -107,6 +107,16 @@ Backend (in `mini-services/color-duel-studio/`):
   the INITIAL converted revision emits `objects.json`. Quality gates score `visualFidelity` and
   `gameReadiness` independently and reject over-vectorization; geometry QA is enforced upstream
   by `emit_bundle`.
+- Difficulty Optimization (`studio/difficulty.py`, Task 26): `optimize_gameplay_difficulty`
+  moves ONLY the gameplay layer (regions, labels, object budgets, difficulty metrics) toward a
+  requested tier — Convert runs it after reconstruction, the future Optimize button reuses it.
+  Artwork invariants are hard: paint bytes + objects.shapeIds identical, geometry QA green every
+  iteration, ≤3 deterministic iterations, merge-down never crosses objects (same objectId,
+  palette ΔE order, readable labels), split-up reuses the object-budget subdivider with a doubled
+  minimum so pieces never go microscopic. Quality outranks the tier label; unreachable targets
+  report `safe-ceiling`/`best-safe-result` with reasons. Re-exposed sub-tolerance seams are
+  absorbed via `partitionTolerance` re-measurement; the roundtrip pixel allowance scales with
+  region count.
 
 ## Conventions & hygiene
 

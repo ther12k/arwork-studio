@@ -32,12 +32,14 @@ from .pipeline import (
     OBJECTS_SCHEMA_VERSION,
     compile_image,
     compile_svg_master,
+    emit_bundle,
     load_bundle,
     normalize_objects,
     read_json,
     validate_bundle,
     write_json,
 )
+from .difficulty import optimize_gameplay_difficulty
 from .svg_master import clean_svg
 
 # ---------------------------------------------------------------------------
@@ -934,6 +936,8 @@ class GenerationSessionManager:
           → vector reconstruction (the existing raster compiler with the
             segment map — shared boundary fitting stays watertight)
           → quality scoring (visualFidelity / gameReadiness, gated)
+          → gameplay difficulty optimization (regions/labels/budgets only —
+            the reconstruction stays byte-identical across tiers)
           → ready_to_commit or a failed, revisable session.
         Healthy revisions are never touched."""
         session = self.get_session(session_id)
@@ -970,16 +974,14 @@ class GenerationSessionManager:
         # reconstruction must be byte-identical across Easy..Master; gameplay
         # density comes from per-object subdivision budgets, not from here.
         self.update_status(session_id, 'compiling')
+        # Candidate segmentation is FIDELITY-ONLY (Phase 2D.1): a fixed base
+        # density scaled by segmentDensity, never by the difficulty target —
+        # the reconstruction must be byte-identical across Easy..Master. The
+        # requested difficulty is applied AFTERWARD by the gameplay-only
+        # difficulty optimizer (Task 26), which re-subdivides/merges regions
+        # toward the tier without touching the reconstruction.
         convert_settings = BuildSettings(
             target_regions=CONVERT_CANDIDATE_BASE,    # fidelity-only; see above
-            auto_subdivide=False,
-            curve_tolerance=float(policy['curveTolerance']),
-            min_region_pixels=max(4, int(policy['minComponentArea'])),
-            palette_colors=max(4, min(80, int(policy['paletteTarget']))),
-        )
-        # build_settings keeps the SESSION difficulty target for the record
-        settings = BuildSettings(
-            target_regions=int(session['targetRegions']),
             auto_subdivide=False,
             curve_tolerance=float(policy['curveTolerance']),
             min_region_pixels=max(4, int(policy['minComponentArea'])),
@@ -1009,6 +1011,7 @@ class GenerationSessionManager:
             result = compile_image(source_png, bundle_dir, artwork_id=self.pid,
                                    version='0.0.0-draft', title=plan['title'],
                                    settings=convert_settings, segment_object_map=label_map,
+                                   objects=plan['objects'],
                                    segment_density=float(policy['segmentDensity']),
                                    color_merge_delta_e=float(policy['colorMergeDeltaE']),
                                    provenance={'source': 'User-supplied image (Convert pipeline; semantic decomposition + deterministic segmentation)',
@@ -1041,6 +1044,47 @@ class GenerationSessionManager:
             self.update_status(session_id, 'failed',
                                error=f'Conversion quality gate rejected the result: {reasons}')
             raise ValueError(f'Conversion quality gate rejected the result: {reasons}')
+
+        # 6. Difficulty Optimization (Task 26): the artwork is FROZEN from
+        #    here on — the requested tier reshapes ONLY the gameplay layer
+        #    (regions, labels, object subdivision budgets). The optimizer
+        #    verifies the paint/objects.shapeIds invariants itself; if the
+        #    moved geometry were to break the readiness gate anyway, the
+        #    pre-optimization gameplay is restored and shipped instead.
+        tier = session.get('requestedDifficulty')
+        if tier not in DIFFICULTY_TIERS:
+            tier = 'hard'
+        progress(.84, f'Optimizing gameplay geometry toward {tier}')
+        bundle = load_bundle(bundle_dir)
+        pre = {
+            'regions': copy.deepcopy(bundle['geometry']['regions']),
+            'partitionTolerance': bundle['geometry'].get('partitionTolerance', 0.0),
+            'objects': copy.deepcopy(bundle.get('objects') or []),
+            'difficulty': copy.deepcopy(bundle['manifest'].get('difficulty')),
+            'regionCount': bundle['manifest'].get('regionCount'),
+        }
+        bundle, diff_report = optimize_gameplay_difficulty(
+            bundle, tier, target_regions=int(session['targetRegions']), progress=progress)
+        emit_bundle(bundle_dir, bundle)
+        post_scores = conversion_quality_score(
+            {'geometry': bundle['geometry'], 'paint': read_json(bundle_dir / 'paint.json'),
+             'manifest': read_json(bundle_dir / 'artwork.json')}, rgb, policy)
+        if not post_scores['passed']:
+            geometry = bundle['geometry']
+            geometry['regions'] = pre['regions']
+            geometry['partitionTolerance'] = pre['partitionTolerance']
+            bundle['objects'] = pre['objects'] or None
+            bundle['manifest']['difficulty'] = pre['difficulty']
+            bundle['manifest']['regionCount'] = pre['regionCount']
+            diff_report['reverted'] = ('post-optimization quality gate failed; '
+                                       'kept the initial gameplay geometry')
+            diff_report['regionCountAfter'] = len(pre['regions'])
+            diff_report['changed'] = False
+            emit_bundle(bundle_dir, bundle)
+            post_scores = scores
+        session['meta']['qa'] = read_json(bundle_dir / 'validation.json')
+        session['meta']['conversionScores'] = post_scores
+        session['meta']['difficultyOptimization'] = diff_report
         session['status'] = 'ready_to_commit'
         session['updatedAt'] = _now()
         write_json(sdir / 'session.json', session)

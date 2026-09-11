@@ -100,6 +100,17 @@ Raster paint reconstruction is object-aware: every paint path carries a stable `
 
 Session intermediates: `source.png` (normalized via `clean_image`), `decomposition.json`, `reconstructed-master.svg`, `bundle/`. On commit the bundle is promoted atomically to `revisions/rev-*` and the project master becomes the normalized raster source (`master-*.png`), so later edit actions rebuild from the same pixels.
 
+## Difficulty Optimization (gameplay-only engine)
+
+`optimize_gameplay_difficulty(bundle, tier)` (`studio/difficulty.py`) drives a compiled bundle's gameplay layer toward a requested tier (easy 100–180 → medium 180–320 → hard 320–550 → master 550–800; initial targets 140/250/430/650). It is the same engine for the Convert pipeline's requested tier and the future "Optimize to Master" button on existing revisions.
+
+Contract: it moves **only** regions, region labels, `objects.subdivision.preferredRegions` and the derived difficulty metrics. Every accepted iteration must keep the paint paths and `objects.shapeIds` byte-identical and pass geometry QA; any violation rolls back to the last healthy state. Two move directions:
+
+- **current > target → conservative semantic merge**: same `objectId` only (never across objects), edge-adjacent (corner-touching MultiPolygon unions are dropped, not locked), same palette group first then closest CIELAB ΔE, merged label must stay readable; merged masters are exact pixel-edge (`fit=False`) so the raster partition stays watertight.
+- **current < target → semantic split** through the existing object-budget auto-subdivider (area × detailWeight × complexity, `[minRegions, maxRegions]` clamps, per-split minimum = `max(2× build minimum, tiny floor)` so pieces never become microscopic targets; a cut is skipped when a piece would carry an unreadable label).
+
+Bounded deterministic loop (≤3 iterations: measure → move → QA → measure; same bundle + target ⇒ identical regions). Quality outranks the requested label: label-conflict regressions, below-minimum tap areas, >9× required zoom, or a tiny-region explosion reject a candidate; a `safe-ceiling`/`best-safe-result` outcome reports human-readable reasons instead of forcing the number. Split/merge re-exposed sub-tolerance seams are absorbed by re-measuring `geometry.partitionTolerance` (the same documented-band mechanism the merge/cut edit actions use), and the raster-roundtrip pixel allowance scales with board density (`max(8, regions/50)`) because sub-pixel boundary seams grow with boundary length, not with defects. The report lands in session meta (`difficultyOptimization`): requested tier, target, per-iteration measurements, merges/splits, per-object budgets, achieved rating/score and reasons.
+
 ## Difficulty profile
 
 `artwork.json` carries `manifest.difficulty = {rating, score, metrics}` computed deterministically for every revision: `rating` is easy (<25) / medium (<50) / hard (<75) / master; `score` is a 0–100 weighted sum over `regionCount, medianRegionArea, tinyRegionPct, requiredZoom` (worst-case zoom for a 44px touch target from a fit viewport), `labelClearance` (ok/tight/conflict), `paletteAmbiguity` (low/medium/high), `paletteGroups, avgNeighbors, subdivisionEdges, objectDensity`. It replaces the old `"unrated"` placeholder; `difficultyValidatedByPlaytest` stays false until a real playtest.

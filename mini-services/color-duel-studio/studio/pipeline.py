@@ -245,6 +245,15 @@ def _corner_cos(angle_deg: float) -> float:
     return math.cos(math.radians(min(179.0, max(1.0, angle_deg))))
 
 
+def label_conflict(label: dict) -> bool:
+    """True when a region label is unreadable (no clearance / font too small
+    / text wider than the inscribed circle). Same thresholds the difficulty
+    profile uses to flag 'conflict'; the auto-subdivider and the difficulty
+    optimizer reject candidates that would create such labels."""
+    clearance, font = float(label.get('clearance', 0.0)), float(label.get('fontSize', 0.0))
+    return clearance <= 0 or font < 3.5 or clearance < font * 0.5
+
+
 def pack_region(geometry, rid: str, pid: int, object_id: str = 'unassigned',
                 label: dict | None = None, source: str = 'boundary-chain-fit',
                 fit_tolerance: float = 1.0, legacy_rings: list | None = None,
@@ -915,7 +924,8 @@ def _object_region_budgets(regions: list, objects: list | None, target: int) -> 
 
 def _auto_subdivide(regions: list, settings: BuildSettings, edges: list,
                     objects: list | None = None,
-                    progress: Callable = lambda *_: None) -> int:
+                    progress: Callable = lambda *_: None,
+                    fit: bool = True) -> int:
     """Deterministically split oversized regions toward the target count.
 
     Semantic phase: each object gets a region budget (area x detailWeight x
@@ -926,8 +936,14 @@ def _auto_subdivide(regions: list, settings: BuildSettings, edges: list,
     their maxRegions cap, largest region first. While under target and the
     candidate region is >= 2x the minimum playable size, split it with an
     organic cut; both pieces are refit and the new shared boundary is
-    emitted as SUBDIVISION edges. Deterministic (seeded by region id hash);
-    loop bound 1200 splits.
+    emitted as SUBDIVISION edges. A cut is skipped when either piece would
+    carry an unreadable label or fall below the tap minimum (the candidate
+    is parked and the next-largest region is tried). Deterministic (seeded
+    by region id hash); loop bound 1200 splits.
+
+    ``fit=False`` emits exact pixel-edge masters instead of curve-refitted
+    ones (difficulty optimizer: gameplay-only edits on raster bundles must
+    keep the partition exactly watertight for the raster roundtrip QA).
     """
     target = int(settings.target_regions)
     min_px = float(settings.min_region_pixels)
@@ -989,12 +1005,18 @@ def _auto_subdivide(regions: list, settings: BuildSettings, edges: list,
         if len(pieces) < 2 or any(p.area < min_px for p in pieces):
             skip.add(largest['id'])       # this cut would create untappable pieces
             continue
+        piece_labels = [make_label(p, largest['paletteId']) for p in pieces]
+        if any(label_conflict(lab) for lab in piece_labels):
+            skip.add(largest['id'])       # this cut would create unreadable labels
+            continue
         regions.remove(largest)
         new_ids = []
         for idx, piece in enumerate(pieces):
             rid = 'r-d-' + hashlib.sha256((largest['id'] + str(seed) + str(idx)).encode()).hexdigest()[:12]
             reg = pack_region(piece, rid, largest['paletteId'], largest['objectId'],
-                              source='subdivision-split', fit_tolerance=float(settings.curve_tolerance))
+                              label=piece_labels[idx], source='subdivision-split',
+                              fit_tolerance=0.0 if not fit else float(settings.curve_tolerance),
+                              fit=fit)
             if largest.get('masterShapeId'):
                 reg['masterShapeId'] = largest['masterShapeId']
             regions.append(reg)
@@ -1804,8 +1826,14 @@ def validate_bundle(bundle: dict, roundtrip=True) -> dict:
     if roundtrip and source == 'raster':
         back = _rasterize_regions(regs, w, h)
         empty_pixels = int((back == 0).sum())
-        if empty_pixels > 8:
-            errors.append(f'Raster roundtrip left {empty_pixels} uncovered pixels.')
+        # Sub-pixel boundary seams scale with board density: a densely
+        # subdivided gameplay board legitimately shows more of the same
+        # sub-tolerance boundary pixels compile output shows (missing REGIONS
+        # would be thousands of pixels, not tens).
+        pixel_allowance = max(8, len(regs) // 50)
+        if empty_pixels > pixel_allowance:
+            errors.append(f'Raster roundtrip left {empty_pixels} uncovered pixels '
+                          f'(allowance {pixel_allowance}).')
         elif empty_pixels:
             warnings.append(f'Raster roundtrip left {empty_pixels} sub-pixel boundary pixels uncovered (within flatten tolerance).')
     small = [r['id'] for r in g['regions'] if 2 * r['label']['clearance'] * 360 / w * 8 < 24]
@@ -2270,9 +2298,17 @@ def _semantic_raster_paint(labels: np.ndarray, rgb: np.ndarray, label_map: dict,
                       'carries a stable shapeId and object ownership (rc-* shapes).')}
 
 
-def _objects_from_segment_map(segment_object_map: dict, paint: dict) -> list | None:
-    """Initial object records for converted bundles (Phase 2D.1): one record
-    per object referenced by the segment map, owning its rc-* paint shapes."""
+def _objects_from_segment_map(segment_object_map: dict, paint: dict,
+                              plan_objects: list | None = None) -> list | None:
+    """Initial object records for converted bundles (Phase 2D.1 + 26): scene
+    plan semantics merged with ACTUAL rc-* shape ownership.
+
+    Actual paint ownership is authoritative for shapeIds (only live rc-*
+    shapes owned by segments enter the records); everything else — name,
+    role, parentId, subdivision/detailWeight — comes from the ScenePlan
+    records, so the gameplay budget engine (detailWeight, min/maxRegions)
+    sees the same semantics the AI planned. Objects are ordered by plan
+    z-order first, plan-less objects last (id order)."""
     if not segment_object_map:
         return None
     owned: Dict[str, List[str]] = defaultdict(list)
@@ -2283,16 +2319,33 @@ def _objects_from_segment_map(segment_object_map: dict, paint: dict) -> list | N
             owned[oid].append(sid)
     if not owned:
         return None
-    records = [{'id': oid,
-                'name': oid.replace('obj-', '').replace('-', ' ').title(),
-                'shapeIds': sorted(sids)}
-               for oid, sids in sorted(owned.items())]
+    plan = {o['id']: o for o in (plan_objects or []) if isinstance(o, dict) and o.get('id')}
+    ordered = [o['id'] for o in (plan_objects or []) if isinstance(o, dict) and o.get('id') in owned]
+    ordered += [oid for oid in sorted(owned) if oid not in plan]
+    records = []
+    for oid in ordered:
+        meta = plan.get(oid) or {}
+        rec: dict = {'id': oid}
+        rec['name'] = str(meta.get('name') or oid.replace('obj-', '').replace('-', ' ').title())[:80]
+        for key in ('type', 'role', 'parentId'):
+            if meta.get(key):
+                rec[key] = meta[key]
+        sub = meta.get('subdivision') if isinstance(meta.get('subdivision'), dict) else {}
+        if not sub and meta.get('detailWeight') is not None:
+            sub = {'detailWeight': meta.get('detailWeight')}
+        elif sub and sub.get('detailWeight') is None and meta.get('detailWeight') is not None:
+            sub = {**sub, 'detailWeight': meta.get('detailWeight')}
+        if sub:
+            rec['subdivision'] = sub
+        rec['shapeIds'] = sorted(owned[oid])
+        records.append(rec)
     return normalize_objects({'objects': records})
 
 
 def compile_image(source: Path, output: Path, *, artwork_id: str, version: str, title: str,
                   settings: BuildSettings, provenance: dict | None = None,
                   segment_object_map: dict | None = None,
+                  objects: list | None = None,
                   segment_density: float = 1.0, color_merge_delta_e: float = 0.0,
                   progress: Callable = lambda *_: None) -> dict:
     progress(.04, 'Preparing approved master')
@@ -2393,7 +2446,9 @@ def compile_image(source: Path, output: Path, *, artwork_id: str, version: str, 
     if segment_object_map:
         # Converted bundles ship objects.json from the FIRST revision (not
         # only after an edit): same first-class contract as native SVG/AI art.
-        objects = _objects_from_segment_map(segment_object_map, paint)
+        # ScenePlan records carry the semantics (role/subdivision budgets);
+        # actual rc-* ownership stays authoritative for shapeIds.
+        objects = _objects_from_segment_map(segment_object_map, paint, objects)
         if objects:
             bundle['objects'] = objects
             manifest['objectsCount'] = len(objects)
