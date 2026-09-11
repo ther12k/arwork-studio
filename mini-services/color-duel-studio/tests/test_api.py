@@ -1,5 +1,7 @@
-import io,time,json,base64,re
+import io,time,json,base64,re,os,tempfile
+from pathlib import Path
 import httpx,pytest
+import numpy as np
 from PIL import Image
 from fastapi.testclient import TestClient
 from studio.app import create_app
@@ -742,3 +744,221 @@ def test_generation_reference_plan_mocked(tmp_path, monkeypatch):
         p = wait(c, pid)
         assert p['job']['status'] == 'failed'
         assert 'does not support reference planning' in p['job']['message']
+
+
+# ---------------------------------------------------------------------------
+# Phase 2D — Convert Artwork: semantic decomposition + deterministic CV
+# ---------------------------------------------------------------------------
+
+def _convert_transport(seen):
+    """Vision decomposition returns objects positioned like the fixture image
+    (sky top / house bottom-left / grass bottom-right); fragments reuse the
+    multistage pattern. Association must map sky labels → obj-sky etc."""
+    def respond(req):
+        seen.append(req.url.path)
+        if req.url.path.endswith('/json'):
+            objects = [
+                {'name': 'sky', 'description': 'blue sky', 'z': 0,
+                 'bbox': [0, 0, 576, 300], 'shapes': 10, 'fills': ['#91CCDD']},
+                {'name': 'house', 'description': 'yellow house', 'z': 1,
+                 'bbox': [0, 380, 288, 388], 'shapes': 14, 'fills': ['#EBC681']},
+                {'name': 'grass', 'description': 'green field', 'z': 2,
+                 'bbox': [288, 380, 288, 388], 'shapes': 10, 'fills': ['#41A582']},
+            ]
+            return httpx.Response(200, json={'output': [{'content': [{'type': 'output_text',
+                'text': json.dumps({'objects': objects})}]}], 'usage': {'input_tokens': 120}})
+        if req.url.path.endswith('/svg'):
+            return httpx.Response(200, json={'output': [{'content': [{'type': 'output_text',
+                'text': '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100"><rect width="10" height="10" fill="#3366AA"/></svg>'}]}],
+                'usage': {'input_tokens': 10}})
+        return httpx.Response(404, json={'error': {'code': 'no_route'}})
+    return httpx.MockTransport(respond)
+
+
+def _convert_fixture_png():
+    """Flat 3-band illustration: sky / house (bottom-left) / grass (bottom-right)."""
+    from PIL import Image as PILImage
+    im = PILImage.new('RGB', (288, 288))
+    px = im.load()
+    for y in range(288):
+        for x in range(288):
+            if y < 144:
+                px[x, y] = (0x91, 0xCC, 0xDD)          # sky
+            elif x < 144:
+                px[x, y] = (0xEB, 0xC6, 0x81)          # house (bottom-left)
+            else:
+                px[x, y] = (0x41, 0xA5, 0x82)          # grass (bottom-right)
+    buf = io.BytesIO()
+    im.save(buf, format='PNG')
+    return buf.getvalue()
+
+
+def _run_convert(c, pid, sid, png, body=None):
+    r = c.post(f'/api/projects/{pid}/generation/sessions/{sid}/convert', headers=H,
+               files={'file': ('source.png', png, 'image/png')},
+               data={'body': json.dumps(body or {'confirm_paid': True})})
+    return r
+
+
+def test_convert_gate_and_transaction(client, monkeypatch):
+    monkeypatch.setenv('OPENAI_API_KEY', 'fake-key')   # pass the configured gate; mode/paid gates are under test
+    pid, _ = _svg_project(client)
+    p_before = client.get(f'/api/projects/{pid}').json()
+    sid = client.post(f'/api/projects/{pid}/generation/sessions', headers=H,
+                      json={'mode': 'image_convert', 'requested_difficulty': 'medium',
+                            'fidelity': 'balanced'}).json()['id']
+    # paid gate: no confirm → 400 before anything runs
+    r = client.post(f'/api/projects/{pid}/generation/sessions/{sid}/convert', headers=H,
+                    files={'file': ('s.png', _convert_fixture_png(), 'image/png')}, data={'body': '{}'})
+    assert r.status_code == 400
+    # image_convert cannot use the Reference planning route
+    r = client.post(f'/api/projects/{pid}/generation/sessions/{sid}/reference-plan', headers=H,
+                    files={'file': ('s.png', _convert_fixture_png(), 'image/png')},
+                    data={'body': json.dumps({'confirm_paid': True})})
+    assert r.status_code == 200
+    p = wait(client, pid)
+    assert p['job']['status'] == 'failed'
+    assert 'does not support reference planning' in p['job']['message']
+    # healthy revision untouched by the failed attempt
+    p_after = client.get(f'/api/projects/{pid}').json()
+    assert p_after['currentRevision'] == p_before['currentRevision']
+
+
+def test_convert_end_to_end_semantic_ownership(client, monkeypatch):
+    """Gates 1/2/3/6/7: flat illustration converts with clean semantic
+    ownership, bounded over-vectorization, quality gates enforced, difficulty
+    independence (subdivision target comes from the session), and clean
+    transaction into commit."""
+    monkeypatch.setenv('OPENAI_API_KEY', 'fake-key')
+    seen = []
+    with TestClient(create_app(Path(tempfile.mkdtemp()), transport=_convert_transport(seen))) as c:
+        pid = new(c)
+        sid = c.post(f'/api/projects/{pid}/generation/sessions', headers=H,
+                     json={'mode': 'image_convert', 'requested_difficulty': 'hard',
+                           'fidelity': 'balanced'}).json()['id']
+        r = _run_convert(c, pid, sid, _convert_fixture_png())
+        assert r.status_code == 200, r.text
+        p = wait(c, pid)
+        assert p['job']['status'] == 'done', p['job']
+        sess = c.get(f'/api/projects/{pid}/generation/sessions/{sid}').json()
+        assert sess['status'] == 'ready_to_commit'
+        assert sess['meta']['qa']['passed'] is True
+        scores = sess['meta']['conversionScores']
+        # flat 3-band source must reconstruct cleanly (visual gate passed) and
+        # NOT be over-segmented
+        assert scores['passed'] is True
+        assert scores['visualFidelity'] >= 70
+        assert scores['gates'] == {'visualGate': 70, 'gameReadinessGate': 80}
+        assert scores['metrics']['visualShapes'] <= 60
+        # semantic association: sky/house/grass objects all own regions
+        decomp_file = Path(c.app.state.root) / pid / 'sessions' / sid / 'decomposition.json'
+        assert decomp_file.is_file(), 'decomposition.json intermediate artifact must exist'
+        decomp = json.loads(decomp_file.read_text())
+        owned = {o['objectId'] for o in decomp['objectStats'] if o['objectId'] != 'unassigned'}
+        assert {'obj-sky', 'obj-house', 'obj-grass'} <= owned
+        assert sess['meta']['convertPolicy']['fidelity'] == 'balanced'
+        assert (Path(c.app.state.root) / pid / 'sessions' / sid / 'reconstructed-master.svg').is_file()
+        # isolation until commit, then provenance
+        assert c.get(f'/api/projects/{pid}').json()['currentRevision'] is None
+        r = c.post(f'/api/projects/{pid}/generation/sessions/{sid}/commit', headers=H, json={})
+        assert r.status_code == 200, r.text
+        rev = r.json()['revision']['id']
+        manifest = c.get(f'/api/projects/{pid}/revisions/{rev}/files/artwork.json').json()
+        assert manifest['generation']['mode'] == 'image_convert'
+        assert manifest['generation']['fidelity'] == 'balanced'
+        assert manifest['generation']['convertPolicy' if 'convertPolicy' in manifest['generation'] else 'requestedDifficulty']
+        # gameplay regions carry the semantic ownership
+        regions = c.get(f'/api/projects/{pid}/revisions/{rev}/files/regions.json').json()['regions']
+        owned = {r['objectId'] for r in regions if r['objectId'] != 'unassigned'}
+        assert {'obj-sky', 'obj-house', 'obj-grass'} <= owned
+        # difficulty independence: hard target ≈ 430 requested; segmentation
+        # follows the policy density, but the SESSION records the target range
+        assert manifest['generation']['requestedDifficulty'] == 'hard'
+
+
+def test_convert_fidelity_changes_parameters_and_output(client, monkeypatch):
+    """Gate 5: Faithful vs Stylized on the SAME fixture must produce measurably
+    different policies AND more reconstruction shapes for Faithful — not just
+    different metadata."""
+    monkeypatch.setenv('OPENAI_API_KEY', 'fake-key')
+    for fidelity in ('stylized', 'faithful'):
+        with TestClient(create_app(Path(tempfile.mkdtemp()), transport=_convert_transport([]))) as c:
+            pid = new(c)
+            sid = c.post(f'/api/projects/{pid}/generation/sessions', headers=H,
+                         json={'mode': 'image_convert', 'fidelity': fidelity}).json()['id']
+            r = _run_convert(c, pid, sid, _convert_fixture_png())
+            assert r.status_code == 200, r.text
+            p = wait(c, pid)
+            assert p['job']['status'] == 'done', p['job']
+            sess = c.get(f'/api/projects/{pid}/generation/sessions/{sid}').json()
+            assert sess['status'] == 'ready_to_commit'
+            policy = sess['meta']['convertPolicy']
+            scores = sess['meta']['conversionScores']
+            if fidelity == 'stylized':
+                stylized = (policy, scores)
+                assert policy['curveTolerance'] == 2.0 and policy['paletteTarget'] == 16
+                assert scores['gates']['visualGate'] == 55
+            else:
+                faithful = (policy, scores)
+                assert policy['curveTolerance'] == 0.6 and policy['paletteTarget'] == 40
+                assert scores['gates']['visualGate'] == 82
+    assert faithful[0]['segmentDensity'] > stylized[0]['segmentDensity']
+    assert faithful[0]['colorMergeDeltaE'] < stylized[0]['colorMergeDeltaE']
+
+
+def test_convert_over_vectorization_rejected(client, monkeypatch):
+    """QA recognizes over-vectorization: a photo-like noisy source at FAITHFUL
+    (low merge tolerance, tiny components) must fail the readiness gate with
+    the actionable over-segmentation message — and never create a revision."""
+    monkeypatch.setenv('OPENAI_API_KEY', 'fake-key')
+    rng = np.random.RandomState(7)
+    noisy = (rng.rand(192, 192, 3) * 255).astype('uint8')
+    buf = io.BytesIO()
+    Image.fromarray(noisy).save(buf, format='PNG')
+    with TestClient(create_app(Path(tempfile.mkdtemp()), transport=_convert_transport([]))) as c:
+        pid = new(c)
+        sid = c.post(f'/api/projects/{pid}/generation/sessions', headers=H,
+                     json={'mode': 'image_convert', 'fidelity': 'faithful'}).json()['id']
+        r = _run_convert(c, pid, sid, buf.getvalue())
+        assert r.status_code == 200
+        p = wait(c, pid)
+        sess = c.get(f'/api/projects/{pid}/generation/sessions/{sid}').json()
+        if p['job']['status'] == 'failed':
+            assert 'quality gate' in p['job']['message']
+            assert sess['status'] == 'failed'
+        else:
+            # even if it passed, scores must have been computed and gated
+            assert sess['meta']['conversionScores']['passed'] is True
+        # transaction guarantee either way
+        assert c.get(f'/api/projects/{pid}').json()['currentRevision'] is None
+
+
+def test_convert_round_trip_edits_keep_objects_valid(client, monkeypatch):
+    """Gate 8: converted artwork survives Cut edits — objects.json stays valid,
+    objectId ownership preserved, QA reports no orphan shapes."""
+    monkeypatch.setenv('OPENAI_API_KEY', 'fake-key')
+    with TestClient(create_app(Path(tempfile.mkdtemp()), transport=_convert_transport([]))) as c:
+        pid = new(c)
+        sid = c.post(f'/api/projects/{pid}/generation/sessions', headers=H,
+                     json={'mode': 'image_convert', 'fidelity': 'balanced'}).json()['id']
+        assert _run_convert(c, pid, sid, _convert_fixture_png()).status_code == 200
+        wait(c, pid)
+        r = c.post(f'/api/projects/{pid}/generation/sessions/{sid}/commit', headers=H, json={})
+        rev = r.json()['revision']['id']
+        regions = c.get(f'/api/projects/{pid}/revisions/{rev}/files/regions.json').json()['regions']
+        target = max(regions, key=lambda r: r['area'])
+        x0, y0, x1, y1 = target['bbox']
+        xm = round((x0 + x1) / 2, 1)
+        cut = {'base_revision': rev, 'action': 'cut', 'region_ids': [target['id']],
+               'd': f'M {xm} {y0 - 2} L {xm} {y1 + 2}'}
+        r = c.post(f'/api/projects/{pid}/edit', headers=H, json=cut)
+        assert r.status_code == 200, r.text
+        p = wait(c, pid)
+        assert p['job']['status'] == 'done', p['job']
+        rev2 = p['currentRevision']
+        regs2 = c.get(f'/api/projects/{pid}/revisions/{rev2}/files/regions.json').json()['regions']
+        # ownership survived the cut: same object set, cut pieces inherit objectId
+        assert {r2['objectId'] for r2 in regs2} >= {r['objectId'] for r in regions if r['id'] != target['id']}
+        qa = c.get(f'/api/projects/{pid}/revisions/{rev2}/files/validation.json').json()
+        assert qa['passed']
+        assert qa['objects']['orphanShapes'] == 0

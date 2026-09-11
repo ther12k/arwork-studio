@@ -556,9 +556,13 @@ def create_app(workspace: Path|None=None, transport=None):
             p['revisions'].append(res['revision'])
             p['currentRevision'] = res['revision']['id']
 
-            # If session produced a master SVG, promote it to project master
+            # If the session produced a master, promote it to project master:
+            # SVG sessions (ai_chat / image_reference) promote the sanitized
+            # master SVG; convert sessions promote the normalized raster source
+            # (rebuildable via the raster compiler).
             sdir = sm.session_path(sid)
             draft_svg = sdir / 'source-master.svg'
+            draft_png = sdir / 'source.png'
             if draft_svg.is_file():
                 dest_name = f'master-{ident()}.svg'
                 shutil.copy2(draft_svg, folder(pid) / dest_name)
@@ -568,6 +572,16 @@ def create_app(workspace: Path|None=None, transport=None):
                     **im,
                     'source': f"AI-generated ({res['manifest']['generation']['mode']})",
                     'rightsConfirmed': False,
+                    'createdAt': now(),
+                }
+            elif draft_png.is_file():
+                dest_name = f'master-{ident()}.png'
+                im = clean_image(draft_png.read_bytes(), folder(pid) / dest_name)
+                p['master'] = {
+                    'file': dest_name,
+                    **im,
+                    'source': f"Converted image ({res['manifest']['generation']['mode']}; normalized raster master)",
+                    'rightsConfirmed': True,
                     'createdAt': now(),
                 }
             save(p)
@@ -671,6 +685,37 @@ def create_app(workspace: Path|None=None, transport=None):
             return {'session': session, 'usage': {'kind': 'reference-scene-plan', 'at': now(), **usage}}
 
         return start(pid, 'reference scene planning', run)
+
+    @app.post('/api/projects/{pid}/generation/sessions/{sid}/convert')
+    async def convert_session_route(pid: str, sid: str, file: UploadFile = File(...), body: str = Form('{}')):
+        # Phase 2D — Convert Artwork (paid): clean_image() is the entrance gate
+        # (format/size/EXIF/animation checks, normalized PNG), then vision
+        # semantics + deterministic CV run inside the session sandbox.
+        with lock:
+            p = project(pid)
+            editable(p)
+            req = json.loads(body or '{}')
+            if not req.get('confirm_paid'):
+                raise HTTPException(400, 'Confirm the paid provider request first: this sends the image to the AI provider for semantic decomposition and may incur charges.')
+            if not provider.config()['configured']:
+                raise HTTPException(503, 'AI not configured. Add OPENAI_API_KEY to .env. Upload-to-vector works without it.')
+            sm = GenerationSessionManager(folder(pid), pid)
+            sdir = sm.session_path(sid)
+            raw = await file.read(12 * 1024 * 1024 + 1)
+            source_png = sdir / 'source.png'
+            try:
+                clean_image(raw, source_png)     # entrance gate + normalized pixels
+            except ValueError as exc:
+                raise HTTPException(400, str(exc))
+
+        def run(tick):
+            session = sm.convert_session_image(sid, provider, source_png,
+                                               policy_overrides=req.get('policy') or None,
+                                               instructions=str(req.get('instructions') or ''),
+                                               progress=tick)
+            return {'session': session, 'usage': {'kind': 'image-convert', 'at': now()}}
+
+        return start(pid, 'image conversion', run)
 
     app.mount('/static',StaticFiles(directory=BASE/'web'),name='static')
     @app.get('/')

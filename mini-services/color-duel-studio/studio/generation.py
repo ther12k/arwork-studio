@@ -18,15 +18,19 @@ from datetime import datetime, timezone
 import hashlib
 import json
 import math
+from collections import defaultdict
 from pathlib import Path
 import re
 import shutil
 import uuid
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
+import numpy as np
+
 from .models import BuildSettings
 from .pipeline import (
     OBJECTS_SCHEMA_VERSION,
+    compile_image,
     compile_svg_master,
     load_bundle,
     normalize_objects,
@@ -408,6 +412,234 @@ def replace_object_shapes(master_text: str, object_id: str, fragment_text: str,
     return emit_master_svg(combined)
 
 
+# ---------------------------------------------------------------------------
+# Phase 2D — Convert Artwork: fidelity policies as real algorithm parameters
+# ---------------------------------------------------------------------------
+# Principle: AI decides WHAT the objects are; deterministic CV decides WHERE
+# the pixel boundaries are. Vision never traces pixels; SLIC never decides
+# semantics — association joins the two.
+
+CONVERT_POLICIES: Dict[str, Dict[str, Any]] = {
+    'stylized': {
+        'segmentDensity': 0.6,        # SLIC candidate density multiplier
+        'colorMergeDeltaE': 14.0,     # high color merge tolerance
+        'curveTolerance': 2.0,        # heavy Bézier simplification
+        'minComponentArea': 120,      # aggressive tiny-component removal
+        'paletteTarget': 16,          # aggressive palette quantization
+        'assocConfidence': 0.30,      # below: segment stays unassigned
+        'visualGate': 55,
+        'gameReadinessGate': 80,
+    },
+    'balanced': {
+        'segmentDensity': 1.0,
+        'colorMergeDeltaE': 9.0,
+        'curveTolerance': 1.1,
+        'minComponentArea': 42,
+        'paletteTarget': 24,
+        'assocConfidence': 0.35,
+        'visualGate': 70,
+        'gameReadinessGate': 80,
+    },
+    'faithful': {
+        'segmentDensity': 1.8,
+        'colorMergeDeltaE': 5.0,      # low merge tolerance
+        'curveTolerance': 0.6,        # low simplification
+        'minComponentArea': 18,       # conservative tiny removal
+        'paletteTarget': 40,
+        'assocConfidence': 0.40,
+        'visualGate': 82,
+        'gameReadinessGate': 80,
+    },
+}
+
+
+def resolve_convert_policy(fidelity: str, overrides: dict | None = None) -> dict:
+    """Resolved, reproducible convert policy stored in the session."""
+    base = dict(CONVERT_POLICIES.get(fidelity, CONVERT_POLICIES['balanced']))
+    for key, val in (overrides or {}).items():
+        if key in base and val is not None:
+            base[key] = val
+    base['fidelity'] = fidelity if fidelity in CONVERT_POLICIES else 'balanced'
+    return base
+
+
+def _rgb_hex(c) -> str:
+    return '#' + ''.join(f'{int(round(v)):02X}' for v in np.clip(c, 0, 255))
+
+
+def _hex_rgb(hx: str) -> np.ndarray:
+    hx = (hx or '#808080').lstrip('#')
+    return np.array([int(hx[i:i + 2], 16) for i in (0, 2, 4)], dtype=float)
+
+
+def associate_segments_to_objects(rgb: np.ndarray, labels: np.ndarray, objects: list,
+                                  policy: dict) -> Tuple[Dict[int, str], List[dict], List[dict]]:
+    """Score-based assignment of deterministic CV segments to AI-decided
+    semantic objects (Phase 2D association layer).
+
+    segment → object score = bbox-overlap prior + semantic color
+    compatibility + neighborhood consistency (one smoothing pass). Low-
+    confidence segments stay 'unassigned' — bad guesses are never forced.
+    Returns (label→objectId map, per-segment records for decomposition.json,
+    per-object region stats)."""
+    h, w = labels.shape
+    values = [int(v) for v in np.unique(labels) if int(v) != 0]
+    if not objects:
+        return {}, [], []
+    # ---- per-label stats ----
+    stats: Dict[int, dict] = {}
+    flat = labels.ravel()
+    for v in values:
+        mask = flat == v
+        area = int(mask.sum())
+        ys, xs = np.divmod(np.nonzero(mask)[0], w)
+        stats[v] = {'bbox': (float(xs.min()), float(ys.min()), float(xs.max()), float(ys.max())),
+                    'centroid': (float(xs.mean()), float(ys.mean())),
+                    'area': area, 'neighbors': set()}
+        stats[v]['color'] = rgb[labels == v].mean(0)
+    # ---- adjacency (4-neighborhood) ----
+    for a, b in ((labels[:, :-1], labels[:, 1:]), (labels[:-1, :], labels[1:, :])):
+        edge = (a != b)
+        for la, lb in zip(a[edge], b[edge]):
+            la, lb = int(la), int(lb)
+            if la and lb and la in stats and lb in stats:
+                stats[la]['neighbors'].add(lb)
+                stats[lb]['neighbors'].add(la)
+    # ---- independent scoring pass ----
+    obj_bboxes = [o['bbox'] for o in objects]
+    obj_rgbs = [np.mean([_hex_rgb(f) for f in (o.get('fills') or ['#808080'])], axis=0) for o in objects]
+
+    def bbox_score(bb, ob):
+        ix = max(0.0, min(bb[2], ob[0] + ob[2]) - max(bb[0], ob[0]))
+        iy = max(0.0, min(bb[3], ob[1] + ob[3]) - max(bb[1], ob[1]))
+        inter = ix * iy
+        union = (bb[2] - bb[0]) * (bb[3] - bb[1]) + ob[2] * ob[3] - inter
+        return inter / union if union > 0 else 0.0
+
+    scores: Dict[int, Dict[str, float]] = {}
+    for v in values:
+        st = stats[v]
+        row = {}
+        for o, ob, orgb in zip(objects, obj_bboxes, obj_rgbs):
+            overlap = bbox_score(st['bbox'], ob)
+            dist = float(np.abs(st['color'] - orgb).mean())
+            color = max(0.0, 1.0 - dist / 128.0)
+            row[o['id']] = 0.6 * overlap + 0.4 * color
+        scores[v] = row
+    # ---- one neighbor-consistency smoothing pass ----
+    smoothed: Dict[int, str] = {}
+    for v in values:
+        row = scores[v]
+        best_oid = max(row, key=lambda k: row[k])
+        best = row[best_oid]
+        if st_neighbors := stats[v]['neighbors']:
+            votes: Dict[str, float] = defaultdict(float)
+            for n in st_neighbors:
+                if n in smoothed:
+                    votes[smoothed[n]] += 1.0
+                else:
+                    nrow = scores[n]
+                    votes[max(nrow, key=lambda k: nrow[k])] += 0.5
+            if votes:
+                nb_oid, nb_votes = max(votes.items(), key=lambda kv: kv[1])
+                share = nb_votes / len(st_neighbors)
+                # neighbor consensus can rescue a close call, never override a strong one
+                if best < 0.45 and share >= 0.5 and row[nb_oid] >= 0.6 * best:
+                    best_oid = nb_oid
+                    best = max(best, 0.45)
+        smoothed[v] = best_oid if best >= float(policy.get('assocConfidence', 0.35)) else 'unassigned'
+    # ---- records for decomposition.json ----
+    by_oid: Dict[str, dict] = defaultdict(lambda: {'area': 0, 'segments': 0})
+    segments = []
+    for v in values:
+        st = stats[v]
+        oid = smoothed[v]
+        row = scores[v]
+        segments.append({'id': f'seg-{v:04d}', 'objectId': oid,
+                         'confidence': round(min(1.0, row.get(oid, 0.0)), 3),
+                         'meanColor': _rgb_hex(st['color']), 'area': st['area'],
+                         'bbox': [round(c, 1) for c in st['bbox']]})
+        rec = by_oid[oid]
+        rec['area'] += st['area']
+        rec['segments'] += 1
+    object_stats = [{'objectId': oid, 'segmentCount': rec['segments'], 'area': rec['area'],
+                     'areaPercent': round(100 * rec['area'] / float(h * w), 2)}
+                    for oid, rec in sorted(by_oid.items())]
+    label_map = {v: oid for v, oid in smoothed.items() if oid != 'unassigned'}
+    return label_map, segments, object_stats
+
+
+def _path_command_count(d: str) -> int:
+    return sum(1 for ch in d if ch.upper() in 'MLCQZ')
+
+
+def conversion_quality_score(bundle: dict, source_rgb: np.ndarray, policy: dict) -> dict:
+    """Two INDEPENDENT scores for Convert (never blindly averaged):
+    visualFidelity — how close the vector reconstruction looks to the source;
+    gameReadiness — playability/structure health incl. over-vectorization.
+    Gate: fidelity >= preset minimum AND readiness >= 80 AND geometry QA passed."""
+    g = bundle['geometry']
+    paint = bundle['paint']
+    h, w = source_rgb.shape[:2]
+    # ---- visual fidelity: render the reconstruction, compare to source ----
+    fidelity = 0.0
+    try:
+        import cairosvg
+        from io import BytesIO
+        from PIL import Image as _PILImage
+        from .pipeline import svg_open, svg_paint
+        final = svg_open(w, h) + svg_paint(paint) + '</svg>'
+        raw = cairosvg.svg2png(bytestring=final.encode(), output_width=w, output_height=h)
+        render = np.asarray(_PILImage.open(BytesIO(raw)).convert('RGB'), dtype=float)
+        src = np.asarray(_PILImage.fromarray(source_rgb).resize((w, h)), dtype=float)
+        diff = float(np.abs(render - src).mean())
+        fidelity = max(0.0, min(100.0, 100.0 * (1.0 - diff / 96.0)))
+    except Exception:
+        fidelity = 0.0
+    # ---- game readiness + over-vectorization metrics ----
+    paths = paint.get('paths') or []
+    command_counts = [_path_command_count(p.get('d', '')) for p in paths]
+    total_commands = sum(command_counts)
+    nodes_per_shape = round(total_commands / len(paths), 2) if paths else 0.0
+    areas = [r['area'] for r in g['regions']]
+    min_area = 35.0
+    tiny_regions = sum(1 for a in areas if a < 2 * min_area)
+    tiny_ratio = round(tiny_regions / len(areas), 4) if areas else 1.0
+    megapixel = max(1e-6, (w * h) / 1_000_000)
+    shapes_per_megapixel = round(len(paths) / megapixel, 1)
+    short_edges = sum(1 for c in command_counts if c > 400)
+    readiness = 100.0
+    readiness -= min(30.0, nodes_per_shape * 0.08)          # anchor bloat
+    readiness -= min(25.0, tiny_ratio * 100 * 0.9)          # microscopic fragments
+    readiness -= min(20.0, max(0.0, shapes_per_megapixel - 120) * 0.15)  # fragment storm
+    readiness -= min(15.0, short_edges * 1.5)               # traced-bitmap signatures
+    qa = bundle.get('manifest', {}).get('qa') or {}
+    readiness = max(0.0, min(100.0, readiness))
+    unassigned = sum(1 for r in g['regions'] if (r.get('objectId') or 'unassigned') == 'unassigned')
+    unassigned_pct = round(100 * unassigned / len(g['regions']), 1) if g['regions'] else 100.0
+    notes = []
+    if readiness < float(policy.get('gameReadinessGate', 80)) and (nodes_per_shape > 220 or shapes_per_megapixel > 260):
+        notes.append('Artwork is over-segmented: too many vector fragments/anchors for the source. '
+                     'Try Balanced or Stylized fidelity.')
+    if unassigned_pct > 40:
+        notes.append(f'{unassigned_pct}% of regions have no semantic object '
+                     '(the scene plan did not cover the image well).')
+    return {
+        'visualFidelity': round(fidelity, 1),
+        'gameReadiness': round(readiness, 1),
+        'gates': {'visualGate': policy['visualGate'],
+                  'gameReadinessGate': policy['gameReadinessGate']},
+        'passed': bool(fidelity >= float(policy['visualGate'])
+                       and readiness >= float(policy['gameReadinessGate'])),
+        'metrics': {'nodesPerVisualShape': nodes_per_shape,
+                    'tinyRegionRatio': tiny_ratio,
+                    'visualShapes': len(paths),
+                    'visualShapesPerMegapixel': shapes_per_megapixel,
+                    'unassignedRegionPercent': unassigned_pct},
+        'notes': notes,
+    }
+
+
 class GenerationSessionManager:
     """Manages transactional generation sessions for a project."""
 
@@ -635,12 +867,13 @@ class GenerationSessionManager:
                                 instructions: str = '',
                                 progress: Callable = lambda *_: None) -> Tuple[dict, dict]:
         """Phase 2C — Use as Reference: vision understanding of an uploaded
-        image becomes a NEW semantic ScenePlan (subject/composition/mood),
-        and the artwork itself is generated as native vectors afterwards.
-        The source is never traced: this answers 'what is in the image and
-        what makes the composition recognizable', not 'where are the pixel
-        color boundaries'. Image-reference sessions REUSE the Create-with-AI
-        machinery — only the initial plan input differs."""
+        image becomes a NEW semantic ScenePlan, and the artwork itself is
+        generated as native vectors afterwards. Per the provider contract the
+        plan reuses only the image's broad mood, palette and subject
+        categories — never its composition: this answers 'what is in the
+        image and what makes the composition recognizable', not 'where are
+        the pixel color boundaries'. Image-reference sessions REUSE the
+        Create-with-AI machinery — only the initial plan input differs."""
         session = self.get_session(session_id)
         if session['status'] not in ('draft_plan', 'failed'):
             raise ValueError(f"Cannot plan while session is '{session['status']}'.")
@@ -669,6 +902,119 @@ class GenerationSessionManager:
         sdir = self.session_path(session_id)
         write_json(sdir / 'session.json', session)
         return session, usage
+
+    def convert_session_image(self, session_id: str, provider, source_png: Path,
+                              policy_overrides: dict | None = None,
+                              instructions: str = '',
+                              progress: Callable = lambda *_: None) -> dict:
+        """Phase 2D — Convert Artwork, end to end inside the session sandbox.
+
+        understand (vision semantic decomposition, composition=True)
+          → candidate segmentation (SLIC via the compiler's own label step)
+          → semantic association (score-based segment→objectId)
+          → vector reconstruction (the existing raster compiler with the
+            segment map — shared boundary fitting stays watertight)
+          → quality scoring (visualFidelity / gameReadiness, gated)
+          → ready_to_commit or a failed, revisable session.
+        Healthy revisions are never touched."""
+        session = self.get_session(session_id)
+        if session['status'] == 'committed':
+            raise ValueError('This session is already committed.')
+        if session['mode'] != 'image_convert':
+            raise ValueError('Conversion requires a session with mode image_convert.')
+        if not source_png.is_file():
+            raise ValueError('Upload the source image first.')
+        policy = resolve_convert_policy(session.get('fidelity') or 'balanced', policy_overrides)
+        plan = session['scenePlan']
+
+        # 1. semantic decomposition: AI decides WHAT the objects are
+        prompt = session.get('prompt', '') or 'Convert this image into structured Color Duel artwork.'
+        if instructions:
+            prompt += '\nConversion instructions: ' + instructions
+        progress(.08, 'Understanding the image (semantic decomposition)')
+        raw, usage = provider.scene_plan(prompt, plan['aspect'], source_png,
+                                         plan['targetRegions'], composition=True)
+        vw, vh = plan['viewBox'][2], plan['viewBox'][3]
+        plan['objects'] = _plan_objects_from_provider(raw, vw, vh)
+        if not plan['objects']:
+            raise ValueError('The vision decomposition found no usable objects. '
+                             'The session is unchanged; retry explicitly to spend again.')
+        session['scenePlan'] = plan
+        session.setdefault('meta', {})['planUsage'] = usage
+        session['meta']['convertPolicy'] = {k: v for k, v in policy.items()}
+        sdir = self.session_path(session_id)
+        write_json(sdir / 'session.json', session)
+
+        # 2+3. candidate segmentation + semantic association (deterministic CV)
+        self.update_status(session_id, 'compiling')
+        settings = BuildSettings(
+            target_regions=int(session['targetRegions']),
+            auto_subdivide=False,          # convert subdivides via object budgets later, not here
+            curve_tolerance=float(policy['curveTolerance']),
+            min_region_pixels=max(4, int(policy['minComponentArea'])),
+            palette_colors=max(4, min(80, int(policy['paletteTarget']))),
+        )
+        progress(.30, 'Segmenting the image (candidate regions)')
+        from .pipeline import _image_labels
+        rgb, labels, original, (w, h) = _image_labels(source_png, settings)
+        progress(.42, 'Associating segments with semantic objects')
+        label_map, segments, object_stats = associate_segments_to_objects(rgb, labels, plan['objects'], policy)
+        decomposition = {'schemaVersion': 1, 'policy': {k: v for k, v in policy.items()},
+                         'objects': plan['objects'], 'objectStats': object_stats,
+                         'segments': segments,
+                         'unassignedSegments': sum(1 for s in segments if s['objectId'] == 'unassigned')}
+        write_json(sdir / 'decomposition.json', decomposition)
+
+        # 4. vector reconstruction + gameplay compilation via the EXISTING
+        #    raster compiler (shared-boundary fitting stays watertight)
+        bundle_dir = sdir / 'bundle'
+        if bundle_dir.exists():
+            shutil.rmtree(bundle_dir, ignore_errors=True)
+        try:
+            result = compile_image(source_png, bundle_dir, artwork_id=self.pid,
+                                   version='0.0.0-draft', title=plan['title'],
+                                   settings=settings, segment_object_map=label_map,
+                                   provenance={'source': 'User-supplied image (Convert pipeline; semantic decomposition + deterministic segmentation)',
+                                               'rightsConfirmedByUser': True,
+                                               'legalClearanceVerified': False},
+                                   progress=progress)
+        except Exception as exc:
+            self.update_status(session_id, 'failed', error=str(exc))
+            raise
+
+        # 5. quality scoring gate (visualFidelity + gameReadiness, never averaged)
+        scores = conversion_quality_score(
+            {'geometry': result.get('geometry') or load_bundle(bundle_dir)['geometry'],
+             'paint': read_json(bundle_dir / 'paint.json'),
+             'manifest': read_json(bundle_dir / 'artwork.json')},
+            rgb, policy)
+        session = self.get_session(session_id)
+        session['meta']['qa'] = result.get('validation') or read_json(bundle_dir / 'validation.json')
+        session['meta']['conversionScores'] = scores
+        session['meta']['decompositionSummary'] = {
+            'objects': len(plan['objects']), 'segments': len(segments),
+            'unassignedSegments': decomposition['unassignedSegments'],
+            'objectStats': object_stats}
+        session.setdefault('meta', {})['generationStages'] = {'convert': {'calls': 1, 'segments': len(segments)}}
+        if not scores['passed']:
+            reasons = '; '.join(scores['notes'] or [
+                f"visualFidelity {scores['visualFidelity']} < gate {scores['gates']['visualGate']}"
+                if scores['visualFidelity'] < scores['gates']['visualGate']
+                else f"gameReadiness {scores['gameReadiness']} < gate {scores['gates']['gameReadinessGate']}"])
+            self.update_status(session_id, 'failed',
+                               error=f'Conversion quality gate rejected the result: {reasons}')
+            raise ValueError(f'Conversion quality gate rejected the result: {reasons}')
+        session['status'] = 'ready_to_commit'
+        session['updatedAt'] = _now()
+        write_json(sdir / 'session.json', session)
+        # reconstructed-master.svg audit artifact (paint layer of the bundle)
+        try:
+            from .pipeline import svg_open, svg_paint as _sp
+            (sdir / 'reconstructed-master.svg').write_text(
+                svg_open(w, h) + _sp(read_json(bundle_dir / 'paint.json')) + '</svg>', encoding='utf-8')
+        except Exception:
+            pass
+        return session
 
     def cancel_session(self, session_id: str) -> dict:
         """Cancel an in-progress or draft session and clean up temp assets."""

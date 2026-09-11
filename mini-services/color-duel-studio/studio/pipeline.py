@@ -2124,16 +2124,26 @@ def emit_bundle(folder: Path, bundle: dict, previews=True) -> dict:
 # Compilation: raster masters
 # ---------------------------------------------------------------------------
 
-def compile_image(source: Path, output: Path, *, artwork_id: str, version: str, title: str,
-                  settings: BuildSettings, provenance: dict | None = None, progress: Callable = lambda *_: None) -> dict:
-    progress(.04, 'Preparing approved master')
+def _image_labels(source: Path, settings: BuildSettings):
+    """Shared SLIC + tiny-merge step for raster compilation (Phase 2D entry).
+
+    Returns (rgb, labels, original_size, working_size) so semantic converters
+    can analyze the EXACT same labels the region compiler will consume."""
     im = Image.open(source).convert('RGB'); original = im.size
     im.thumbnail((settings.max_edge, settings.max_edge), Image.Resampling.LANCZOS)
     rgb = np.array(im); h, w = rgb.shape[:2]
-    progress(.12, 'Finding image-aware draft regions')
     labels = slic(rgb, n_segments=settings.target_regions, compactness=settings.compactness,
                   sigma=.8, start_label=1, enforce_connectivity=True, min_size_factor=.25, channel_axis=-1)
     labels = merge_tiny(labels, rgb, settings.min_region_pixels)
+    return rgb, labels, original, (w, h)
+
+
+def compile_image(source: Path, output: Path, *, artwork_id: str, version: str, title: str,
+                  settings: BuildSettings, provenance: dict | None = None,
+                  segment_object_map: dict | None = None,
+                  progress: Callable = lambda *_: None) -> dict:
+    progress(.04, 'Preparing approved master')
+    rgb, labels, original, (w, h) = _image_labels(source, settings)
     curved = settings.backend == 'spline-local'
     corner_cos = _corner_cos(settings.corner_angle_deg)
     progress(.24, 'Fitting shared boundary chains into curved masters' if curved else 'Extracting pixel-edge polygons (legacy)')
@@ -2160,7 +2170,8 @@ def compile_image(source: Path, output: Path, *, artwork_id: str, version: str, 
                     continue
                 poly = Polygon(flat[0], flat[1:]) if len(flat) > 1 else Polygon(flat[0])
                 label = make_label(poly, pid)
-                reg = pack_region(comp['master'], f'r-{rid:05d}', pid, label=label,
+                object_id = (segment_object_map or {}).get(int(value), 'unassigned')
+                reg = pack_region(comp['master'], f'r-{rid:05d}', pid, object_id, label=label,
                                   source='boundary-chain-fit', fit_tolerance=settings.curve_tolerance,
                                   legacy_rings=comp['legacyRings'])
                 if label['clearance'] < settings.min_label_radius or label['fontSize'] < 3.5:
@@ -2170,20 +2181,22 @@ def compile_image(source: Path, output: Path, *, artwork_id: str, version: str, 
     else:
         from rasterio.features import shapes
         progress(.28, 'Building closed, non-overlapping region polygons (legacy)')
-        polys = []; means = []; masks = []; origins = []
-        for geom, _ in shapes(labels.astype(np.int32), connectivity=4):
+        polys = []; means = []; masks = []; origins = []; label_values = []
+        for geom, val in shapes(labels.astype(np.int32), connectivity=4):
             poly = shape(geom)
             for poly in polygon_parts(make_valid(poly)):
                 x0, y0, x1, y1 = map(int, poly.bounds)
                 local = _rasterize_mask(poly, x0, y0, x1, y1)
                 if not local.any():
                     continue
-                polys.append(poly); means.append(rgb[y0:y1, x0:x1][local].mean(0)); masks.append(local); origins.append((x0, y0))
+                polys.append(poly); means.append(rgb[y0:y1, x0:x1][local].mean(0))
+                masks.append(local); origins.append((x0, y0)); label_values.append(int(val))
         progress(.38, 'Grouping palette colors and positioning labels')
         palette, assignments = palette_for_regions(np.array(means), settings.palette_colors)
-        for i, (poly, pid, mask, origin) in enumerate(zip(polys, assignments, masks, origins), 1):
+        for i, (poly, pid, mask, origin, value) in enumerate(zip(polys, assignments, masks, origins, label_values), 1):
             label = make_label(poly, int(pid), mask, origin)
-            reg = pack_region(poly, f'r-{i:05d}', int(pid), label=label, source='legacy-polygon', fit=False)
+            object_id = (segment_object_map or {}).get(int(value), 'unassigned')
+            reg = pack_region(poly, f'r-{i:05d}', int(pid), object_id, label=label, source='legacy-polygon', fit=False)
             if label['clearance'] < settings.min_label_radius or label['fontSize'] < 3.5:
                 decorations.append(reg)
             else:

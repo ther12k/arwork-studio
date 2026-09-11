@@ -194,17 +194,28 @@ class Provider:
         vb=ASPECT_VIEWBOX.get(aspect,'0 0 576 768').split()
         return float(vb[2]), float(vb[3])
 
-    def scene_plan(self, prompt: str, aspect: str, reference: Path|None=None, target_regions: int=300):
+    def scene_plan(self, prompt: str, aspect: str, reference: Path|None=None, target_regions: int=300,
+                   composition: bool=False):
         """Stage 1: strict-JSON scene plan (objects, bboxes, z order, fills).
 
-        Routed through the bridge's generic /v1/json strict-JSON endpoint."""
+        Routed through the bridge's generic /v1/json strict-JSON endpoint.
+        composition=False (Reference): reuse only the image's broad mood,
+        palette and subject categories — never its composition.
+        composition=True (Convert): DECOMPOSE this image into its semantic
+        objects with approximate locations — the composition IS the target."""
         vw,vh=self._viewbox_size(aspect)
         instructions=SCENE_DIRECTION+f'\nCanvas viewBox: "0 0 {int(vw)} {int(vh)}". '
         instructions+=f'After deterministic subdivision the scene should support roughly {int(target_regions)} gameplay regions.'
         content=[{'type':'input_text','text':'ARTWORK REQUEST:\n'+prompt}]
         if reference:
             content.append({'type':'input_image','image_url':self.data_url(reference)})
-            instructions+=' A reference image is attached: reuse only its broad mood, palette and subject categories, not its composition.'
+            if composition:
+                instructions+=(' A source image is attached: DECOMPOSE it into its semantic objects '
+                               '(house, roof, tree, water, ...). Each planned object must describe one '
+                               'thing in the image, with an accurate approximate bbox of where it sits '
+                               'and its dominant fills. Preserve the original composition and layout.')
+            else:
+                instructions+=' A reference image is attached: reuse only its broad mood, palette and subject categories, not its composition.'
         schema={'type':'object','properties':{'objects':{'type':'array','items':{'type':'object','properties':{
             'name':{'type':'string'},'description':{'type':'string'},'z':{'type':'integer'},
             'bbox':{'type':'array','items':{'type':'number'},'minItems':4,'maxItems':4},
