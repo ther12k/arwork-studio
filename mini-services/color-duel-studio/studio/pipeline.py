@@ -1280,13 +1280,13 @@ def _paint_element(p) -> str:
 def svg_paint(paint):
     """Colored appearance layer: gradients + paths + ink in drawing order."""
     defs = _gradient_defs(paint.get('gradients'))
-    body = '<g>' + ''.join(_paint_element(p) for p in _ordered_paint_entries(paint)) + '</g>'
+    body = '<g data-layer="paint">' + ''.join(_paint_element(p) for p in _ordered_paint_entries(paint)) + '</g>'
     return defs + body
 
 
 def svg_ink(paint):
     parts = [_paint_element(p) for p in (paint.get('inkPaths') or [])]
-    return '<g>' + ''.join(parts) + '</g>'
+    return '<g data-layer="ink">' + ''.join(parts) + '</g>'
 
 
 def _edges_overlay(g: dict) -> str:
@@ -1460,6 +1460,13 @@ def validate_bundle(bundle: dict, roundtrip=True) -> dict:
                         'visible-region geometry should own every tap surface - inspect the affected shapes.')
     if paint.get('sourceColorShapeCount', 0) > 15000:
         warnings.append('Detailed vector painting is heavy. Cache/rasterize its static layer in the game and test real devices.')
+    # P0.2 answer-key integrity: each playable region's number-group swatch
+    # must match the painted appearance of its source shape. Pen / recolor /
+    # AI edits can silently break this; QA surfaces it explicitly.
+    color_checked, color_conflicts = _color_answer_conflicts(bundle)
+    if color_conflicts:
+        warnings.append(f'Color-answer consistency: {len(color_conflicts)} region(s) painted a color their '
+                        f'number group does not show (pen/recolor edits): ' + ', '.join(color_conflicts[:5]))
     warnings.append('Automatic regions are drafts, not guaranteed to follow semantic object boundaries. Human visual review is required.')
     fixed = sum(r['area'] for r in g.get('decorations', []))
     report = {
@@ -1470,6 +1477,9 @@ def validate_bundle(bundle: dict, roundtrip=True) -> dict:
         'area': total_area, 'canvasArea': w * h, 'overlapArea': overlap, 'missingArea': missing,
         'roundtripEmptyPixels': empty_pixels, 'smallTargetCount': len(small),
         'precoloredAreaPercent': round(100 * fixed / (w * h), 3), 'humanReviewed': False,
+        'colorAnswerConsistency': {'checked': color_checked, 'conflictCount': len(color_conflicts),
+                                   'conflictRegionIds': color_conflicts[:20],
+                                   'note': 'regions whose number-group swatch matches their painted appearance (answer-key integrity)'},
         'geometry': {
             'schema': g.get('geometrySchema', 1),
             'masterAuthority': 'regions[*].master.d (curved SVG path commands)',
@@ -1497,7 +1507,7 @@ def validate_bundle(bundle: dict, roundtrip=True) -> dict:
             ],
         },
         'checkScope': 'IDs, palette refs, versions, closed curved paths, master/flat consistency, polygon validity, bounds, label interiors, '
-                      'partition union/overlap at flatten tolerance, raster coverage, hit-test probe alignment, curve statistics. '
+                      'partition union/overlap at flatten tolerance, raster coverage, hit-test probe alignment, curve statistics, color-answer consistency. '
                       'Not semantic/artistic quality.',
     }
     return report
@@ -1684,11 +1694,14 @@ def emit_bundle(folder: Path, bundle: dict, previews=True) -> dict:
     # outline-per-region style.
     edges_svg = _edges_overlay(g)
     if edges_svg:
-        outlines = edges_svg
+        # Runtime parity (the board stacks paint -> regions -> ink -> EDGES ->
+        # labels): the exported linework draws the semantic overlay ABOVE the
+        # ink layer, so exports and runtime agree on layer order too.
+        (folder / 'linework.svg').write_text(vb + svg_ink(paint) + edges_svg + '</svg>')
     else:
         outlines = '<g fill="none" stroke="' + INK + '" stroke-width="0.65" stroke-linejoin="round">' + \
             ''.join(f'<path d="{r["d"]}"/>' for r in g['regions']) + '</g>'
-    (folder / 'linework.svg').write_text(vb + outlines + svg_ink(paint) + '</svg>')
+        (folder / 'linework.svg').write_text(vb + outlines + svg_ink(paint) + '</svg>')
     (folder / 'ink.svg').write_text(vb + svg_ink(paint) + '</svg>')
 
     def numbered(selected=False):
@@ -1704,7 +1717,11 @@ def emit_bundle(folder: Path, bundle: dict, previews=True) -> dict:
         labels = '<g font-family="sans-serif" text-anchor="middle" dominant-baseline="central" fill="' + INK + '">' + ''.join(
             f'<text x="{r["label"]["x"]}" y="{r["label"]["y"]}" font-size="{r["label"]["fontSize"]}">{r["paletteId"]}</text>' for r in g['regions']) + '</g>'
         paint_under = {'gradients': paint.get('gradients'), 'paths': paint['paths'], 'inkPaths': []}
-        return vb + defs + svg_paint(paint_under) + masks + edges_svg + svg_ink(paint) + labels + '</svg>'
+        if edges_svg:
+            # Runtime parity: ink renders BELOW the semantic edges overlay,
+            # labels stay on top (paint -> masks -> ink -> edges -> labels).
+            return vb + defs + svg_paint(paint_under) + masks + svg_ink(paint) + edges_svg + labels + '</svg>'
+        return vb + defs + svg_paint(paint_under) + masks + svg_ink(paint) + labels + '</svg>'
 
     (folder / 'numbered.svg').write_text(numbered())
     (folder / 'selected-preview.svg').write_text(numbered(True))
@@ -2172,6 +2189,64 @@ def _tint_gradient(gradient: dict, target_hex: str) -> None:
         s['color'] = '#' + ''.join(f'{v:02X}' for v in rgb)
 
 
+def _palette_entry_for_color(bundle: dict, color: str) -> dict:
+    """Palette identity helper (P0.2): a number group's answer color is its
+    identity. Return the existing group whose swatch IS ``color`` (hex,
+    case-insensitive) or append a new one - never mutate a shared swatch, so
+    regions outside this edit keep a truthful answer key."""
+    for entry in bundle['palette']:
+        if str(entry.get('hex', '')).upper() == str(color).upper():
+            return entry
+    new_id = max((int(e['id']) for e in bundle['palette']), default=0) + 1
+    entry = {'id': new_id, 'number': new_id, 'name': f'Tone {new_id:02d}', 'hex': color,
+             'paint': {'type': 'linearGradient',
+                       'stops': [{'offset': 0, 'color': color}, {'offset': 1, 'color': color}]}}
+    bundle['palette'].append(entry)
+    return entry
+
+
+def _appearance_colors(paint: dict, shape_id: str) -> List[str]:
+    """Solid fill (or the gradient stop colors) of one paint path, upper-case."""
+    path = next((p for p in (paint.get('paths') or []) if p.get('shapeId') == shape_id), None)
+    if path is None:
+        return []
+    fill = str(path.get('fill', ''))
+    if fill.startswith('url(#'):
+        grad = next((gr for gr in (paint.get('gradients') or []) if gr.get('id') == fill[5:-1]), None)
+        return [str(s.get('color', '')).upper() for s in (grad or {}).get('stops', []) if s.get('color')]
+    return [fill.upper()] if SAFE_HEX.match(fill) else []
+
+
+def _color_answer_conflicts(bundle: dict, threshold: float = 100.0) -> tuple:
+    """Answer-key integrity (P0.2 QA check): every playable region's
+    number-group swatch must match the painted appearance of its source
+    shape. Pen / recolor / AI edits can silently break this.
+
+    Returns ``(checked, [conflicting region ids])``. Regions without a
+    paintable source shape (gameplay-only pen targets) have no appearance and
+    cannot conflict; gradient-tinted appearances pass when any stop is near
+    the swatch (shading spread is preserved by design).
+    """
+    paint = bundle['paint']
+    swatch = {}
+    for e in bundle['palette']:
+        hexv = str(e.get('hex', ''))
+        swatch[int(e['id'])] = _hex_rgb(hexv) if SAFE_HEX.match(hexv) else None
+    checked, conflicts = 0, []
+    for r in bundle['geometry'].get('regions', []):
+        sid = r.get('masterShapeId')
+        target = swatch.get(int(r.get('paletteId', -1)))
+        if not sid or target is None:
+            continue
+        looks = [_hex_rgb(c) for c in _appearance_colors(paint, sid) if SAFE_HEX.match(c)]
+        if not looks:
+            continue
+        checked += 1
+        if min(math.sqrt(sum((x - y) ** 2 for x, y in zip(c, target))) for c in looks) > threshold:
+            conflicts.append(r['id'])
+    return checked, conflicts
+
+
 def _recolor_bundle(bundle: dict, chosen, color: str, preserve_shading: bool) -> None:
     """Recolor the *visible appearance* of the chosen regions' source shapes.
 
@@ -2199,13 +2274,17 @@ def _recolor_bundle(bundle: dict, chosen, color: str, preserve_shading: bool) ->
         for gradient in (paint.get('gradients') or []):
             if gradient.get('id') in grad_ids:
                 _tint_gradient(gradient, color)
-    # keep the palette swatch in sync with the new appearance
-    pids = {r['paletteId'] for r in chosen}
-    for entry in bundle['palette']:
-        if entry['id'] in pids:
-            entry['hex'] = color
-            entry['paint'] = {'type': 'linearGradient',
-                              'stops': [{'offset': 0, 'color': color}, {'offset': 1, 'color': color}]}
+    # P0.2 palette identity: NEVER mutate a shared swatch - every OTHER region
+    # in that group would silently get a wrong answer color. The chosen
+    # regions move to the palette group whose answer color IS the new
+    # appearance (reused when it exists, created otherwise). Repainting a
+    # whole group stays a separate, intentional operation.
+    entry = _palette_entry_for_color(bundle, color)
+    pid = int(entry['id'])
+    for r in chosen:
+        if r['paletteId'] != pid:
+            r['paletteId'] = pid
+            r['label'] = make_label(region_polygon(r), pid)
 
 
 
@@ -2214,6 +2293,7 @@ def edit_bundle(source: Path, output: Path, request, version: str):
     settings = read_json(source / 'build-settings.json') if (source / 'build-settings.json').is_file() else {}
     fit_tolerance = float(settings.get('curve_tolerance', 1.0))
     min_px = float(settings.get('min_region_pixels', 35))
+    pen_warning: str | None = None
     regs = {r['id']: r for r in g['regions']}
     chosen_ids = list(dict.fromkeys(request.region_ids))
     if any(rid not in regs for rid in chosen_ids) and request.action != 'draw':
@@ -2333,15 +2413,36 @@ def edit_bundle(source: Path, output: Path, request, version: str):
         existing = [region_polygon(r) for r in g['regions'] + g.get('decorations', [])]
         existing = [p for p in existing if not p.is_empty and p.area > 0]
         cover = _safe_union(existing) if existing else Polygon()
-        try:
-            visible = make_valid(poly.difference(cover))
-        except Exception:
-            visible = Polygon()
-        parts = _polys(visible)
-        usable = [p for p in parts if p.area >= min_px]
-        if not usable:
-            raise ValueError('The drawn shape overlaps fully with existing regions; '
-                             'draw over empty canvas instead.')
+        # P0.1 artwork pen ABOVE the art: the drawn shape is painted on top,
+        # so its FULL geometry is the tap surface. The gameplay regions
+        # underneath are carved (A := A - P) and rebuilt, which keeps the
+        # studio invariant - gameplay regions never overlap - working on
+        # fully covered canvases (normal finished Color Duel artwork)
+        # instead of only over empty canvas. z_behind and the gameplay
+        # region pen keep the visible-surface semantics (poly - coverage).
+        carve = bool(request.paint) and not request.z_behind
+        if carve:
+            usable = [p for p in _polys(make_valid(poly)) if p.area >= min_px]
+            if not usable:
+                raise ValueError(f'Every piece of the drawn shape is below the {min_px:.0f} px² tap minimum.')
+        else:
+            try:
+                visible = make_valid(poly.difference(cover))
+            except Exception:
+                visible = Polygon()
+            parts = _polys(visible)
+            usable = [p for p in parts if p.area >= min_px]
+            if not usable:
+                if request.paint:
+                    raise ValueError('The shape would be completely hidden behind the existing artwork; '
+                                     'place it above the art or draw over empty canvas.')
+                raise ValueError('The drawn shape overlaps fully with existing regions; '
+                                 'draw over empty canvas instead.')
+            if request.paint and request.z_behind and poly.area > 0:
+                ratio = sum(p.area for p in usable) / float(poly.area)
+                if ratio < 0.25:
+                    pen_warning = (f'The pen shape is only {ratio * 100:.0f}% visible behind the existing '
+                                   f'artwork (placed below the art); most of its tap surface is occluded.')
         drawn_ref = [LineString(ring) for ring in rings]
         # Artwork pen (P0 contract): the drawn shape also becomes finished
         # artwork - a paint.json path with a stable shapeId (sp-*), fill,
@@ -2356,6 +2457,12 @@ def edit_bundle(source: Path, output: Path, request, version: str):
             fill = request.color.upper()
             if not SAFE_HEX.match(fill):
                 raise ValueError('Choose a #RRGGBB fill color for the artwork shape.')
+            # P0.2 palette identity: a custom fill NEVER mutates the chosen
+            # group's shared swatch (other regions' answer key would rot).
+            # The pen regions join the palette group whose answer color IS
+            # the fill - reused when it exists, created otherwise.
+            if str((palette_entry or {}).get('hex', '')).upper() != fill:
+                pid = int(_palette_entry_for_color(bundle, fill)['id'])
         else:
             fill = (palette_entry or {}).get('hex', '#808080')
         zs = [float(entry.get('z', 0) or 0)
@@ -2367,6 +2474,59 @@ def edit_bundle(source: Path, output: Path, request, version: str):
         else:
             z_order = int(math.floor(max(zs))) + 1
         stroke_w = round(float(request.stroke_width or 0.0), 3)
+        # P0.1 carve pass: every region/decoration the pen shape covers loses
+        # that area and is rebuilt, keeping its palette group, object id and
+        # master shape link. Carved pieces are emitted with EXACT polygonal
+        # masters (fit=False) so they tile exactly against their neighbours'
+        # stored flat rings - a curve re-fit would drift the shared boundaries
+        # and break the raster partition invariant. Remainder pieces below the
+        # tap minimum become DECORATIONS (the compiler's own semantics for
+        # sub-minimum surfaces): non-interactive, but still part of the
+        # partition, so the tiling never develops holes.
+        deco_ids = {d['id'] for d in g.get('decorations', [])}
+        carved: List[tuple] = []
+        if carve:
+            for r in g['regions'] + g.get('decorations', []):
+                rp = region_polygon(r)
+                if rp.is_empty or rp.area <= 0 or not rp.intersects(poly):
+                    continue
+                try:
+                    remainder = make_valid(rp.difference(poly))
+                except Exception:
+                    continue
+                if remainder.is_empty or remainder.area <= 1e-9:
+                    carved.append((r, []))       # fully covered by the new art
+                else:
+                    carved.append((r, _polys(remainder)))
+            if carved:
+                removed = {r['id'] for r, _pieces in carved}
+                g['regions'] = [r for r in g['regions'] if r['id'] not in removed]
+                g['decorations'] = [d for d in g.get('decorations', []) if d['id'] not in removed]
+                _prune_edges(g, removed)
+        carved_regions = []
+        for r, pieces in carved:
+            for idx, piece in enumerate(pieces):
+                carve_id = 'r-v-' + hashlib.sha256((r['id'] + version + str(idx)).encode()).hexdigest()[:12]
+                reg = pack_region(piece, carve_id, r['paletteId'], r['objectId'],
+                                  source='pen-carved', fit_tolerance=fit_tolerance, fit=False)
+                if r.get('masterShapeId'):
+                    reg['masterShapeId'] = r['masterShapeId']
+                if piece.area < min_px or r['id'] in deco_ids:
+                    g.setdefault('decorations', []).append(reg)
+                else:
+                    g['regions'].append(reg)
+                    carved_regions.append((reg, piece))
+        if carve and carved:
+            # Document the true partition band introduced by this edit: the
+            # symmetric difference between the pre-edit surface union and the
+            # rebuilt one (same precedent as merge/cut refit deviations).
+            try:
+                after_polys = [region_polygon(x) for x in g['regions'] + g.get('decorations', [])]
+                after_union = unary_union([make_valid(p) for p in after_polys if not p.is_empty])
+                drift = cover.symmetric_difference(after_union).area if not cover.is_empty else 0.0
+            except Exception:
+                drift = 0.0
+            g['partitionTolerance'] = round(float(g.get('partitionTolerance', 0.0)) + float(drift) + 0.01, 3)
         new_regions = []
         for idx, piece in enumerate(usable):
             pen_id = 'r-p-' + hashlib.sha256((request.d + version + str(idx)).encode()).hexdigest()[:12]
@@ -2386,15 +2546,18 @@ def edit_bundle(source: Path, output: Path, request, version: str):
                 reg['masterShapeId'] = shape_id
             g['regions'].append(reg)
             new_regions.append(reg)
-        if request.paint and palette_entry is not None and str(palette_entry.get('hex', '')).upper() != fill:
-            # Keep the palette swatch (= the answer-key color of the number
-            # group) in sync with the painted appearance, mirroring recolor.
-            palette_entry['hex'] = fill
-            palette_entry['paint'] = {'type': 'linearGradient',
-                                      'stops': [{'offset': 0, 'color': fill}, {'offset': 1, 'color': fill}]}
+        # (P0.2) No palette mutation here: a diverging custom fill already
+        # reassigned the pen regions to the matching group above, and the
+        # default fill IS the chosen group's swatch - the answer key stays
+        # truthful either way.
         g.setdefault('edges', [])
         g.setdefault('boundaryStyle', BOUNDARY_STYLE_DEFAULT)
         index = _RegionIndex(g['regions'])
+        # Carved pieces first: boundary segments hugging the pen outline are
+        # artwork (the outline IS master art now); the rest stays subdivision.
+        for reg, piece in carved_regions:
+            _emit_classified_edges(g['edges'], piece, drawn_ref, 'artwork', 'subdivision', index,
+                                   self_id=reg['id'])
         for reg, piece in zip(new_regions, usable):
             # Outline segments near the drawn path are artwork; the subtraction
             # segments bordering existing regions are subdivision.
@@ -2544,6 +2707,9 @@ def edit_bundle(source: Path, output: Path, request, version: str):
     for f in {master_name, 'build-settings.json'}:
         if (source / f).is_file(): shutil.copy2(source / f, output / f)
     qa = emit_bundle(output, bundle)
+    if pen_warning:
+        qa.setdefault('warnings', []).append(pen_warning)
+        write_json(output / 'validation.json', qa)
     return {'manifest': m, 'validation': qa}
 
 

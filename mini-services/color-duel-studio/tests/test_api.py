@@ -100,13 +100,13 @@ def test_provider_no_auto_retry(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# Stage-2: cut/draw edit routes, multistage SVG generation, config 0.3.0
+# Stage-2: cut/draw edit routes, multistage SVG generation, config version
 # ---------------------------------------------------------------------------
 
 def test_config_version_and_new_backends(client):
     r=client.get('/api/config');assert r.status_code==200
     body=r.json()
-    assert body['version']=='0.3.0'
+    assert body['version']=='0.3.1'
     backends={b['id']:b for b in body['backends']}
     for bid,kind in [('pen-cut-tools','region-topology-editing'),('auto-subdivide','deterministic-subdivision'),
                      ('difficulty-analyzer','qa'),('provider-svg-multistage','vector-generation')]:
@@ -290,10 +290,11 @@ def test_playtest_record_updates_difficulty(client,tmp_path):
     pid,rev=_svg_project(client)
     base=f'/api/projects/{pid}/revisions/{rev}'
     revdir=tmp_path/pid/'revisions'/rev
+    region_count=json.loads((revdir/'artwork.json').read_text())['regionCount']
     before=json.loads((revdir/'artwork.json').read_text())
     assert 'playtestCount' not in before['difficulty']['metrics']
     r=client.post(base+'/playtest',headers=H,
-                  json={'seconds':240.0,'filled':2,'total':2,'mistakes':3,'mode':'number'})
+                  json={'seconds':240.0,'filled':region_count,'total':region_count,'mistakes':3,'mode':'number'})
     assert r.status_code==200,r.text
     out=r.json()
     assert out['playtestCount']==1 and out['medianSeconds']==240.0
@@ -301,7 +302,7 @@ def test_playtest_record_updates_difficulty(client,tmp_path):
     metrics=out['manifest']['difficulty']['metrics']
     for key in ('playtestCount','playtestMedianSeconds','playtestSecondsPerRegion','playtestMistakesPerRegion'):
         assert key in metrics
-    # score blend: 240s for 2 regions saturates the pace term (min(1, 6))
+    # score blend: 240s saturates the pace term (min(1, 6))
     assert out['manifest']['difficulty']['score']==round(0.9*before['difficulty']['score']+10.0,1)
     entries=json.loads((revdir/'playtests.json').read_text())
     assert len(entries)==1 and entries[0]['mode']=='number' and 'recordedAt' in entries[0]
@@ -313,17 +314,32 @@ def test_playtest_record_updates_difficulty(client,tmp_path):
     assert after['assets']==before['assets'] and after['version']==before['version']
     # a second run keeps both entries and refreshes the median
     r=client.post(base+'/playtest',headers=H,
-                  json={'seconds':60.0,'filled':2,'total':2,'mistakes':0,'mode':'memory'})
+                  json={'seconds':60.0,'filled':region_count,'total':region_count,'mistakes':0,'mode':'memory'})
     assert r.status_code==200
     assert r.json()['playtestCount']==2 and r.json()['medianSeconds']==150.0
 
 def test_playtest_invalid_body_and_unknown_ids(client):
     pid,rev=_svg_project(client)
     base=f'/api/projects/{pid}/revisions/{rev}'
-    good={'seconds':60.0,'filled':2,'total':2,'mistakes':0,'mode':'number'}
+    total=client.get(base+'/files/artwork.json').json()['regionCount']
+    good={'seconds':60.0,'filled':total,'total':total,'mistakes':0,'mode':'number'}
     assert client.post(base+'/playtest',headers=H,json={**good,'seconds':5}).status_code==422
     assert client.post(base+'/playtest',headers=H,json={**good,'mode':'turbo'}).status_code==422
     assert client.post(base+'/playtest',headers=H,json={**good,'filled':0}).status_code==422
     assert client.post(base+'/playtest',headers=H,json={'seconds':60}).status_code==422
     assert client.post(f'/api/projects/{pid}/revisions/rev-nope/playtest',headers=H,json=good).status_code==404
     assert client.post(f'/api/projects/{pid}-missing/revisions/{rev}/playtest',headers=H,json=good).status_code==404
+
+def test_playtest_payload_hardening(client):
+    """A malformed playtest payload must never distort difficulty: filled
+    cannot exceed total, and total must equal the revision's actual playable
+    region count."""
+    pid,rev=_svg_project(client)
+    base=f'/api/projects/{pid}/revisions/{rev}'
+    region_count=client.get(base+'/files/artwork.json').json()['regionCount']
+    good={'seconds':60.0,'filled':region_count,'total':region_count,'mistakes':0,'mode':'number'}
+    assert client.post(base+'/playtest',headers=H,json={**good,'filled':region_count+3}).status_code==400
+    assert client.post(base+'/playtest',headers=H,json={**good,'total':region_count+7}).status_code==400
+    assert 'region count' in client.post(base+'/playtest',headers=H,json={**good,'total':region_count+7}).json()['detail']
+    # the well-formed shape still records normally
+    assert client.post(base+'/playtest',headers=H,json=good).status_code==200

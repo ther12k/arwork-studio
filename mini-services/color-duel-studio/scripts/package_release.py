@@ -32,10 +32,16 @@ EXCLUDE_SUFFIXES = ('.log', '.pyc', '.db')
 
 
 def version() -> str:
-    text = (ROOT / 'studio' / 'app.py').read_text(encoding='utf-8')
-    match = re.search(r"['\"]version['\"]\s*:\s*['\"]([^'\"]+)['\"]", text)
+    # Authoritative source: studio/__init__.py STUDIO_VERSION (one constant,
+    # everything derives from it). app.py's FastAPI(version=...) stays a
+    # fallback for older checkouts.
+    text = (ROOT / 'studio' / '__init__.py').read_text(encoding='utf-8')
+    match = re.search(r"STUDIO_VERSION\s*=\s*['\"]([^'\"]+)['\"]", text)
     if not match:
-        match = re.search(r"version=['\"]([^'\"]+)['\"]", text)
+        text = (ROOT / 'studio' / 'app.py').read_text(encoding='utf-8')
+        match = re.search(r"['\"]version['\"]\s*:\s*['\"]([^'\"]+)['\"]", text)
+        if not match:
+            match = re.search(r"version=['\"]([^'\"]+)['\"]", text)
     return match.group(1) if match else '0.0.0'
 
 

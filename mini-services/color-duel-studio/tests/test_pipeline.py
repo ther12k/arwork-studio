@@ -133,6 +133,11 @@ SMALL_SVG='''<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 200 200">
 PEN_SVG='''<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 200 200">
 <rect x="50" y="50" width="100" height="100" fill="#3366AA"/>
 </svg>'''
+INK_SVG='''<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 200 200">
+<rect x="0" y="0" width="200" height="200" fill="#A9DBEF"/>
+<rect x="60" y="60" width="80" height="80" fill="#3366AA"/>
+<path d="M 20 20 L 180 20 L 180 40" fill="none" stroke="#22333B" stroke-width="2"/>
+</svg>'''
 
 @pytest.fixture(scope='module')
 def svg_asset(tmp_path_factory):
@@ -233,8 +238,13 @@ def test_pen_artwork_paints_and_recolors(pen_asset,tmp_path):
     after2=load_bundle(tmp_path/'recolor')
     entry2=next(p for p in after2['paint']['paths'] if p.get('shapeId')==sid)
     assert entry2['fill']=='#FF7348'
-    # palette swatch stays in sync with the new appearance (answer key)
-    assert next(e['hex'] for e in after2['palette'] if e['id']==1)=='#FF7348'
+    # P0.2 palette identity: the pen region MOVES to the palette group whose
+    # answer color IS #FF7348; the original group's swatch is never mutated.
+    orange=next(e for e in after2['palette'] if e['hex'].upper()=='#FF7348')
+    pen2=next(r for r in after2['geometry']['regions'] if r['id']==pen['id'])
+    assert pen2['paletteId']==orange['id'] and orange['id']!=1
+    assert next(e['hex'] for e in after2['palette'] if e['id']==1)==group_hex
+    assert validate_bundle(after2)['colorAnswerConsistency']['conflictCount']==0
 
 def test_pen_artwork_custom_fill_stroke_and_layer(pen_asset,tmp_path):
     before=load_bundle(pen_asset/'bundle')
@@ -248,9 +258,13 @@ def test_pen_artwork_custom_fill_stroke_and_layer(pen_asset,tmp_path):
     entry=next(p for p in after['paint']['paths'] if p.get('shapeId')==pen['masterShapeId'])
     assert entry['fill']=='#21B6C7' and entry['stroke']=='#29383E' and entry['strokeWidth']==1.5
     assert entry['z']<min_z                    # behind the existing art
-    # custom fill keeps the number-group swatch in sync (recolor semantics)
-    assert next(e['hex'] for e in after['palette'] if e['id']==1)=='#21B6C7'
+    # P0.2 palette identity: a custom fill creates/reuses the matching group;
+    # group 1's shared swatch is NEVER mutated (answer key stays truthful).
+    assert next(e['hex'] for e in after['palette'] if e['id']==1)=='#3366AA'
+    cyan=next(e for e in after['palette'] if e['hex'].upper()=='#21B6C7')
+    assert cyan['id']!=1 and pen['paletteId']==cyan['id']
     assert validate_bundle(after)['passed']
+    assert validate_bundle(after)['colorAnswerConsistency']['conflictCount']==0
     # the exported runtime contract still accepts the pen paint path
     assert make_export(tmp_path/'penfill')  # does not raise
 
@@ -258,6 +272,124 @@ def test_pen_full_overlap_rejected(pen_asset,tmp_path):
     with pytest.raises(ValueError,match='overlaps fully'):
         edit_bundle(pen_asset/'bundle',tmp_path/'bad',EditRequest(base_revision='x',action='draw',
             region_ids=[],d='M 60,60 L 90,60 L 90,90 L 60,90 Z',palette_id=1),'0.2.0')
+
+def test_pen_artwork_carves_full_coverage(svg_asset,tmp_path):
+    """P0.1: on normal finished artwork (regions cover ~100% of the canvas)
+    the artwork pen draws OVER the art: the covered gameplay surfaces are
+    carved and rebuilt (A := A - P) so masks never overlap - instead of the
+    old 'overlaps fully' dead end."""
+    before=load_bundle(svg_asset/'bundle')
+    before_area=sum(r['area'] for r in before['geometry']['regions'])
+    before_paths=len(before['paint']['paths'])
+    assert before_area>=40000-1.0            # full coverage: the pre-fix failing case
+    # full coverage: the pre-fix failing case. (Palette is lightness-ordered:
+    # the darker rect fill ranks as group 1, the light background as group 2.)
+    rect_before=next(r for r in before['geometry']['regions'] if r['area']<10000)
+    result=edit_bundle(svg_asset/'bundle',tmp_path/'carve',
+        EditRequest(base_revision='x',action='draw',region_ids=[],
+                    d='M 80,80 L 120,80 L 120,120 L 80,120 Z',
+                    palette_id=rect_before['paletteId'],paint=True,color='#D8E4A0'),'0.2.0')
+    assert result['validation']['passed']
+    after=load_bundle(tmp_path/'carve');g=after['geometry']
+    pen=[r for r in g['regions'] if r['id'].startswith('r-p-')]
+    assert len(pen)==1
+    assert abs(pen[0]['area']-1600.0)<2.0     # full drawn geometry is the tap surface
+    assert pen[0]['paletteId']==next(e['id'] for e in after['palette'] if e['hex']=='#D8E4A0')
+    assert pen[0]['masterShapeId'].startswith('sp-')
+    # the covered rect region was carved around the pen shape and keeps its links
+    carved=[r for r in g['regions'] if r['id'].startswith('r-v-')]
+    assert len(carved)==1
+    assert abs(carved[0]['area']-4800.0)<3.0
+    assert carved[0]['paletteId']==rect_before['paletteId'] and carved[0].get('masterShapeId')==rect_before.get('masterShapeId')
+    # gameplay masks still never overlap and the playable surface is conserved
+    assert result['validation']['overlapArea']<1.0
+    assert abs(sum(r['area'] for r in g['regions'])-before_area)<4.0
+    # the paint layer grew by exactly the pen artwork path (above the art)
+    assert len(after['paint']['paths'])==before_paths+1
+    pen_z=next(p['z'] for p in after['paint']['paths'] if p.get('shapeId')==pen[0]['masterShapeId'])
+    assert pen_z>max(p['z'] for p in before['paint']['paths'])
+    # carved boundary segments exist for both the pen region and the carved piece
+    edges=g.get('edges') or []
+    live={r['id'] for r in g['regions']}
+    assert all((e.get('leftRegion') is None or e['leftRegion'] in live) and
+               (e.get('rightRegion') is None or e['rightRegion'] in live) for e in edges)
+    assert any(e.get('leftRegion')==carved[0]['id'] or e.get('rightRegion')==carved[0]['id'] for e in edges)
+    # answer-key integrity holds on the fresh edit
+    assert validate_bundle(after)['colorAnswerConsistency']['conflictCount']==0
+
+def test_recolor_palette_identity(svg_asset,tmp_path):
+    """P0.2: recolor moves the chosen regions to the palette group whose
+    answer color IS the new appearance. The old group keeps its truthful
+    swatch (its other regions stay correct), and recoloring back REUSES the
+    existing group instead of growing the palette."""
+    b=load_bundle(svg_asset/'bundle')
+    by_fill={}
+    for r in b['geometry']['regions']:
+        path=next((p for p in b['paint']['paths'] if p.get('shapeId')==r.get('masterShapeId')),None)
+        if path: by_fill[str(path['fill']).upper()]=r
+    rect=by_fill['#3366AA']
+    result=edit_bundle(svg_asset/'bundle',tmp_path/'re1',
+        EditRequest(base_revision='x',action='recolor',region_ids=[rect['id']],color='#FF7348'),'0.2.0')
+    assert result['validation']['passed']
+    a=load_bundle(tmp_path/'re1')
+    orange=next(e for e in a['palette'] if e['hex'].upper()=='#FF7348')
+    blue=next(e for e in a['palette'] if e['hex'].upper()=='#3366AA')
+    rect2=next(r for r in a['geometry']['regions'] if r['id']==rect['id'])
+    assert rect2['paletteId']==orange['id'] and orange['id']!=blue['id']
+    path=next(p for p in a['paint']['paths'] if p.get('shapeId')==rect['masterShapeId'])
+    assert path['fill']=='#FF7348'
+    assert validate_bundle(a)['colorAnswerConsistency']['conflictCount']==0
+    # recoloring BACK reuses the blue group (palette does not grow)
+    result2=edit_bundle(tmp_path/'re1',tmp_path/'re2',
+        EditRequest(base_revision='x',action='recolor',region_ids=[rect['id']],color='#3366AA'),'0.3.0')
+    assert result2['validation']['passed']
+    a2=load_bundle(tmp_path/'re2')
+    rect3=next(r for r in a2['geometry']['regions'] if r['id']==rect['id'])
+    assert rect3['paletteId']==blue['id']
+    assert len(a2['palette'])==len(a['palette'])
+
+def test_color_answer_consistency_qa(svg_asset):
+    """QA surfaces answer-key drift (region swatch vs painted appearance)
+    instead of silently passing corrupted bundles."""
+    b=load_bundle(svg_asset/'bundle')
+    clean=validate_bundle(b)
+    assert clean['passed'] and clean['colorAnswerConsistency']['conflictCount']==0
+    assert clean['colorAnswerConsistency']['checked']>=2
+    # corrupt: assign the blue rect region to the light-blue group
+    rect=next(r for r in b['geometry']['regions'] if r['paletteId']==2)
+    rect['paletteId']=1
+    drifted=validate_bundle(b)
+    assert drifted['colorAnswerConsistency']['conflictCount']==1
+    assert rect['id'] in drifted['colorAnswerConsistency']['conflictRegionIds']
+    assert any('Color-answer consistency' in w for w in drifted['warnings'])
+
+@pytest.fixture(scope='module')
+def ink_asset(tmp_path_factory):
+    root=tmp_path_factory.mktemp('ink')
+    (root/'master.svg').write_text(INK_SVG)
+    compile_svg_master(root/'master.svg',root/'bundle',artwork_id='ink-test',version='0.1.0',title='Ink fixture',
+        settings=BuildSettings(target_regions=30,palette_colors=8,paint_colors=16,max_edge=256,
+                               min_region_pixels=4,min_label_radius=1.0))
+    return root
+
+def test_export_layer_order_matches_runtime(ink_asset):
+    """numbered.svg / linework.svg stack ink BELOW the semantic edges overlay
+    with labels last - the same paint -> masks -> ink -> edges -> labels DOM
+    order the runtime board renders (parity, not just dash attributes)."""
+    b=load_bundle(ink_asset/'bundle')
+    assert b['paint'].get('inkPaths'), 'fixture needs a stroke-only ink path'
+    numbered=(ink_asset/'bundle'/'numbered.svg').read_text()
+    linework=(ink_asset/'bundle'/'linework.svg').read_text()
+    for name,text in (('numbered.svg',numbered),('linework.svg',linework)):
+        ink=text.index('data-layer="ink"')
+        edges=text.index('data-layer="edges"')
+        assert ink<edges,f'{name}: ink must render below the edges overlay'
+        labels=text.find('<text')
+        if labels!=-1:
+            assert edges<labels,f'{name}: labels must render last'
+    paint=numbered.index('data-layer="paint"')
+    masks=numbered.index('fill="white"')
+    assert paint<masks<numbered.index('data-layer="ink"')<numbered.index('data-layer="edges"')
 
 def test_pen_requires_palette(pen_asset,tmp_path):
     with pytest.raises(ValueError,match='number group'):

@@ -92,6 +92,9 @@ export interface StudioApi {
    *  paint=true (artwork pen) the shape also becomes finished artwork — a
    *  paint.json path with a stable shapeId, fill, optional ink outline and
    *  z-order; the region references it via masterShapeId so recolor works.
+   *  Drawn ABOVE the art it carves the covered regions (surfaces never
+   *  overlap); a custom color joins/creates the palette group with that
+   *  answer color (P0.2: shared swatches are never mutated).
    *  paint=false (region pen) stays a gameplay-only white tap target. */
   drawRegion: (
     d: string,

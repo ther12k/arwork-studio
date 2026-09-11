@@ -10,6 +10,7 @@ from fastapi import FastAPI,UploadFile,File,Form,HTTPException,Request
 from fastapi.responses import FileResponse,JSONResponse,Response
 from fastapi.staticfiles import StaticFiles
 from .models import *
+from . import STUDIO_VERSION
 from .pipeline import (BACKENDS, clean_image, compile_image, compile_svg_master,
                         difficulty_profile, edit_bundle, read_json, write_json, make_export,
                         load_bundle, validate_bundle, legacy_geometry)
@@ -41,7 +42,7 @@ def create_app(workspace: Path|None=None, transport=None):
     async def lifespan(app):
         yield
         pool.shutdown(wait=True,cancel_futures=False)
-    app=FastAPI(title='Color Duel Art Studio',version='0.1.0',lifespan=lifespan)
+    app=FastAPI(title='Color Duel Art Studio',version=STUDIO_VERSION,lifespan=lifespan)
     app.state.root=root
     def folder(pid):
         if not SAFE.fullmatch(pid): raise HTTPException(400,'Invalid project ID.')
@@ -119,7 +120,7 @@ def create_app(workspace: Path|None=None, transport=None):
                 backend['available'] = bool(ai['configured'])
             if backend['id'] == 'provider-vectorizer':
                 backend['available'] = bool(os.getenv('VECTORIZER_API_KEY'))
-        return {'ai': ai, 'localOnly': True, 'version': '0.3.0', 'supportedFormat': 'color-duel-detailed-vector-1',
+        return {'ai': ai, 'localOnly': True, 'version': STUDIO_VERSION, 'supportedFormat': 'color-duel-detailed-vector-1',
                 'geometrySchema': 2, 'maxUploadMB': 12, 'backends': BACKENDS}
     @app.get('/api/projects')
     def list_projects():
@@ -370,6 +371,14 @@ def create_app(workspace: Path|None=None, transport=None):
         with lock:
             p = project(pid); editable(p)
             d = revision_dir(pid, revision)
+            # Payload hardening: a malformed playtest must not distort the
+            # difficulty calibration (filled can never exceed total, and total
+            # must be this revision's actual playable region count).
+            region_count = read_json(d / 'artwork.json').get('regionCount')
+            if body.filled > body.total:
+                raise HTTPException(400, 'filled cannot exceed total.')
+            if region_count is not None and body.total != int(region_count):
+                raise HTTPException(400, f"total must equal this revision's region count ({region_count}).")
             entries = []
             pt = d / 'playtests.json'
             if pt.is_file():

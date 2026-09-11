@@ -365,7 +365,8 @@ export function CanvasWorkspace() {
    *  target. Default = artwork — Pen is primarily an artwork tool. */
   const [penMode, setPenMode] = useState<"artwork" | "region">("artwork");
   /** Fill of the new artwork path — defaults to the number group's swatch;
-   *  a custom fill syncs the group swatch (answer key) like recolor. */
+   *  a custom fill makes the shape join (or create) the palette group whose
+   *  answer color IS that fill — the shared swatch is never mutated (P0.2). */
   const [penFill, setPenFill] = useState("");
   const [penOutline, setPenOutline] = useState(false);
   const [penStrokeWidth, setPenStrokeWidth] = useState("1.5");
@@ -1110,7 +1111,7 @@ export function CanvasWorkspace() {
             <p className="mt-0.5 text-[10px] leading-relaxed text-[#657671]">
               Closes a {pendingDraw ? Math.round(pendingDraw.area).toLocaleString("en-US") : "…"} px² surface.{" "}
               {penMode === "artwork"
-                ? "The shape becomes finished artwork (a paint layer path with fill, outline and z-order) plus the playable tap region — recolor works like any imported shape."
+                ? "The shape becomes finished artwork (a paint layer path with fill, outline and z-order) plus the playable tap region — drawn over existing art, the regions underneath are carved so surfaces never overlap; recolor works like any imported shape."
                 : "It becomes a white tap target (gameplay-only — the artist paints it later)."}
             </p>
             {/* Pen mode: artwork (paints + region) vs region-only */}
@@ -1217,6 +1218,11 @@ export function CanvasWorkspace() {
                   {!penFill && (
                     <span className="text-[9px] leading-snug text-[#778481]">
                       matches the number-group color
+                    </span>
+                  )}
+                  {penFill && FREE_HEX_RE.test(penFill) && penFillHex !== penGroupHex && (
+                    <span className="text-[9px] leading-snug text-[#778481]">
+                      joins the palette group with this color (created if missing — the selected group keeps its swatch)
                     </span>
                   )}
                 </div>
