@@ -79,6 +79,12 @@ Backend (in `mini-services/color-duel-studio/`):
   `test_export_layer_order_matches_runtime`).
 - The exported game bundle (format `color-duel-detailed-vector-1`) is self-contained; `regions.json`
   is mandatory for gameplay. Game runtime does not need the Python backend.
+- Semantic object model: `objects.json` is an authoring layer (never in the lean runtime export,
+  outside `contentHash`). Ownership is one-directional — objects own `shapeIds`, regions carry
+  `objectId`; never store regionIds in object records. Object identity lives in the master SVG as
+  `<g data-cd-object>` groups and is stamped by the AI scene planner before generation; edit
+  actions preserve it via `_sync_objects_from_regions`. Auto-subdivide consumes per-object budgets
+  (area × detailWeight × complexity, clamped, normalized); QA reports object issues as warnings.
 
 ## Conventions & hygiene
 

@@ -307,6 +307,202 @@ def pack_region(geometry, rid: str, pid: int, object_id: str = 'unassigned',
 
 
 # ---------------------------------------------------------------------------
+# Semantic object model (authoring layer, objects.json)
+# ---------------------------------------------------------------------------
+# One-way ownership contract: objects.json owns masterShapeIds; every region
+# carries objectId. objects.json NEVER stores regionIds (regions are derived
+# state that changes on every edit; shape ownership is the stable truth).
+
+OBJECTS_SCHEMA_VERSION = 1
+_OBJECT_ID_RE = _re.compile(r'^[a-z][a-z0-9_-]{0,63}$')
+_OBJECT_STR_RE = _re.compile(r'^[^\x00-\x1f<>]{0,120}$')
+
+
+def normalize_objects(raw) -> List[dict] | None:
+    """Validate/normalize a parsed objects.json payload into record dicts.
+
+    Lenient by design: unknown fields are dropped, records that are not
+    dicts or lack a valid id are skipped, ids are de-duplicated. Returns
+    None when there is nothing usable.
+    """
+    if not isinstance(raw, dict):
+        return None
+    items = raw.get('objects')
+    if not isinstance(items, list):
+        return None
+    out: List[dict] = []
+    seen = set()
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        oid = str(item.get('id') or '').strip()
+        if not _OBJECT_ID_RE.match(oid) or oid in seen:
+            continue
+        seen.add(oid)
+        rec: dict = {'id': oid}
+        name = str(item.get('name') or '').strip()
+        if name:
+            rec['name'] = name[:80]
+        for key in ('type', 'role'):
+            val = str(item.get(key) or '').strip()
+            if val:
+                rec[key] = val[:40]
+        parent = str(item.get('parentId') or '').strip()
+        if parent:
+            rec['parentId'] = parent[:64]
+        shape_ids = [str(s) for s in (item.get('shapeIds') or [])
+                     if isinstance(s, str) and s.strip()]
+        if shape_ids:
+            rec['shapeIds'] = list(dict.fromkeys(shape_ids))[:400]
+        sub = item.get('subdivision')
+        if isinstance(sub, dict):
+            clean: dict = {}
+            if sub.get('detailWeight') is not None:
+                try:
+                    w = float(sub['detailWeight'])
+                    if 0 < w <= 20:
+                        clean['detailWeight'] = round(w, 3)
+                except (TypeError, ValueError):
+                    pass
+            for key in ('minRegions', 'preferredRegions', 'maxRegions'):
+                if sub.get(key) is not None:
+                    try:
+                        clean[key] = max(0, int(sub[key]))
+                    except (TypeError, ValueError):
+                        pass
+            if 'preserveSilhouette' in sub:
+                clean['preserveSilhouette'] = bool(sub['preserveSilhouette'])
+            if clean:
+                rec['subdivision'] = clean
+        gen = item.get('generation')
+        if isinstance(gen, dict):
+            g = {k: gen[k] for k in ('prompt', 'provider') if isinstance(gen.get(k), str)}
+            g['locked'] = bool(gen.get('locked', False))
+            rec['generation'] = g
+        out.append(rec)
+    return out or None
+
+
+def _objects_from_shapes(shapes: list) -> List[dict] | None:
+    """Build object records from sanitized master shapes carrying objectRef
+    (data-cd-object groups). Nested groups record the enclosing object as
+    parentId. Shapes hidden behind opaque art are excluded consistently with
+    the paint layer, so edit-time ownership sync stays stable. Returns None
+    when the master has no object groups."""
+    grouped: dict = {}
+    for s in shapes:
+        if s.get('hidden'):
+            continue
+        ref = s.get('objectRef')
+        if not ref:
+            continue
+        rec = grouped.setdefault(ref, {'id': ref, 'shapeIds': [], 'name': None, 'parent': None})
+        rec['shapeIds'].append(s['id'])
+        if not rec['name'] and s.get('objectName'):
+            rec['name'] = s['objectName']
+        if not rec['parent'] and s.get('objectParent'):
+            rec['parent'] = s['objectParent']
+    if not grouped:
+        return None
+    records = []
+    for oid in sorted(grouped):
+        rec = grouped[oid]
+        out: dict = {'id': oid, 'name': rec['name'] or oid.replace('-', ' ').title(),
+                     'shapeIds': sorted(rec['shapeIds'])}
+        if rec['parent'] and rec['parent'] != oid and rec['parent'] in grouped:
+            out['parentId'] = rec['parent']
+        records.append(out)
+    return normalize_objects({'objects': records})
+
+
+def _sync_objects_from_regions(bundle: dict) -> List[dict] | None:
+    """Reconcile object records with region truth after an edit.
+
+    Regions (objectId + masterShapeId) define membership; records keep the
+    authoring metadata (name/type/parentId/subdivision/generation). Objects
+    whose regions are all gone are dropped; objects referenced by regions
+    but missing a record are created. Returns None for fully unassigned art.
+    """
+    regions = bundle['geometry']['regions']
+    existing = {o['id']: o for o in (bundle.get('objects') or [])}
+    pending_names = bundle.pop('_pending_object_names', None) or {}
+    by_obj: dict = {}
+    for r in regions:
+        oid = r.get('objectId') or 'unassigned'
+        if oid == 'unassigned':
+            continue
+        by_obj.setdefault(oid, []).append(r)
+    if not by_obj:
+        return None
+    out = []
+    for oid in sorted(by_obj):
+        rec = dict(existing.get(oid) or {})
+        rec['id'] = oid
+        rec['name'] = pending_names.get(oid) or rec.get('name') or oid.replace('-', ' ').title()
+        sids = sorted({r['masterShapeId'] for r in by_obj[oid] if r.get('masterShapeId')})
+        if sids:
+            rec['shapeIds'] = sids
+        else:
+            rec.setdefault('shapeIds', [])
+        out.append(rec)
+    return out
+
+
+def _object_qa(bundle: dict) -> tuple:
+    """Semantic object checks (authoring layer): returns (issues, summary).
+
+    Non-fatal by contract: object metadata problems never fail geometry
+    validation, but every one of these conditions is REPORTED so orphaned
+    semantics cannot rot silently.
+    """
+    objects = bundle.get('objects') or []
+    g = bundle['geometry']
+    paint = bundle['paint']
+    shape_ids = {p['shapeId'] for p in (paint.get('paths') or []) + (paint.get('inkPaths') or [])
+                 if p.get('shapeId')}
+    regions_by_obj: dict = {}
+    for r in g['regions']:
+        regions_by_obj.setdefault(r.get('objectId') or 'unassigned', []).append(r)
+    known = {o['id'] for o in objects}
+    issues: list = []
+    for o in objects:
+        missing = [s for s in (o.get('shapeIds') or []) if s not in shape_ids]
+        if missing:
+            issues.append(f'Object {o["id"]} references missing shapes: ' + ', '.join(missing[:3])
+                          + ('…' if len(missing) > 3 else ''))
+        parent = o.get('parentId')
+        if parent and parent not in known:
+            issues.append(f'Object {o["id"]} references invalid parent {parent}.')
+        if parent == o['id']:
+            issues.append(f'Object {o["id"]} is its own parent.')
+        count = len(regions_by_obj.get(o['id'], []))
+        sub = o.get('subdivision') or {}
+        wanted = int(sub.get('minRegions') or 0)
+        if wanted and count < wanted:
+            issues.append(f'Object {o["id"]} budget impossible: {count} regions < minRegions {wanted} '
+                          '(the object is too small for its requested region budget).')
+        if not count and not o.get('shapeIds'):
+            issues.append(f'Object {o["id"]} has zero geometry (no regions, no shapes).')
+    assigned = sum(len(v) for k, v in regions_by_obj.items() if k != 'unassigned')
+    unassigned = len(regions_by_obj.get('unassigned', []))
+    for oid in sorted(regions_by_obj):
+        if oid != 'unassigned' and oid not in known:
+            issues.append(f'{len(regions_by_obj[oid])} regions reference missing object record {oid}.')
+    owned = {s for o in objects for s in (o.get('shapeIds') or [])}
+    orphan = sorted(shape_ids - owned)
+    if unassigned:
+        issues.append(f'{unassigned} playable regions have no object (unassigned).')
+    if orphan:
+        issues.append(f'{len(orphan)} paint shapes belong to no object.')
+    summary = {'schemaVersion': OBJECTS_SCHEMA_VERSION, 'count': len(objects),
+               'assignedRegions': assigned, 'unassignedRegions': unassigned,
+               'orphanShapes': len(orphan), 'issues': issues,
+               'note': 'objects.json is authoring metadata: objects own shapeIds, regions carry objectId. '
+                       'The runtime export ignores it; authoring exports include it.'}
+    return issues, summary
+
+
+# ---------------------------------------------------------------------------
 # Cut / pen geometry engine (stage-2 region topology tools)
 # ---------------------------------------------------------------------------
 
@@ -595,24 +791,139 @@ def _organic_cut_line(poly: Polygon, seed: int) -> List[Tuple[float, float]]:
     return pts
 
 
+def _object_region_budgets(regions: list, objects: list | None, target: int) -> dict:
+    """Per-object region budgets for semantic subdivision.
+
+    raw budget = area share x detailWeight x shape-complexity share, then
+    clamped to [minRegions, maxRegions] and largest-remainder normalized so
+    budgets sum to the target exactly (or as close as the clamps allow).
+    Regions without a record share the 'unassigned' pseudo-object with
+    weight 1 and a [0, target] clamp band. Deterministic.
+    """
+    by_obj: dict = defaultdict(float)
+    for r in regions:
+        by_obj[r.get('objectId') or 'unassigned'] += max(0.0, float(r.get('area', 0.0)))
+    ids = sorted(by_obj)
+    if not objects and len(ids) == 1:
+        return {ids[0]: target}
+    recs = {o['id']: o for o in (objects or [])}
+    total_area = sum(by_obj.values()) or 1.0
+    total_shapes = 0
+    shape_counts: dict = {}
+    for oid in ids:
+        rec = recs.get(oid) or {}
+        count = len(rec.get('shapeIds') or [])
+        shape_counts[oid] = count
+        total_shapes += max(1, count)
+    raw: dict = {}
+    lo: dict = {}
+    hi: dict = {}
+    frac: dict = {}
+    for oid in ids:
+        rec = recs.get(oid) or {}
+        sub = rec.get('subdivision') or {}
+        weight = float(sub.get('detailWeight') or 1.0)
+        # mean-preserving complexity share: an object with the average shape
+        # count gets factor 1; more planned shapes => more detail regions.
+        complexity = (max(1, shape_counts[oid]) / max(1, total_shapes)) * len(ids)
+        area_share = by_obj[oid] / total_area
+        raw[oid] = max(0.0, area_share * weight * complexity)
+        lo[oid] = max(0, int(sub.get('minRegions') or 0))
+        # A contradictory pair (minRegions > maxRegions) intentionally honours
+        # maxRegions for allocation and leaves minRegions as the QA threshold:
+        # the budget then reports 'impossible' instead of exploding the object
+        # into microscopic regions.
+        hi[oid] = max(1, min(int(sub.get('maxRegions') or target), target))
+        frac[oid] = raw[oid]
+    raw_sum = sum(raw.values()) or 1.0
+    budgets = {}
+    for oid in ids:
+        want = frac[oid] / raw_sum * target
+        budgets[oid] = int(min(max(math.floor(want), lo[oid]), hi[oid]))
+    # largest-remainder redistribution toward the exact target, honouring clamps
+    order = sorted(ids, key=lambda o: (-(frac[o] / raw_sum * target - math.floor(frac[o] / raw_sum * target)), o))
+    delta = target - sum(budgets.values())
+    while delta > 0:
+        progressed = False
+        for oid in order:
+            if delta <= 0:
+                break
+            if budgets[oid] < hi[oid]:
+                budgets[oid] += 1
+                delta -= 1
+                progressed = True
+        if not progressed:
+            break
+    while delta < 0:
+        progressed = False
+        for oid in reversed(order):
+            if delta >= 0:
+                break
+            if budgets[oid] > max(1, lo[oid]):
+                budgets[oid] -= 1
+                delta += 1
+                progressed = True
+        if not progressed:
+            break
+    return budgets
+
+
 def _auto_subdivide(regions: list, settings: BuildSettings, edges: list,
+                    objects: list | None = None,
                     progress: Callable = lambda *_: None) -> int:
     """Deterministically split oversized regions toward the target count.
 
-    While under target and the largest region is >= 2x the minimum playable
-    size, split it with an organic cut; both pieces are refit and the new
-    shared boundary is emitted as SUBDIVISION edges. Deterministic (seeded
-    by region id hash); loop bound 1200 splits.
+    Semantic phase: each object gets a region budget (area x detailWeight x
+    complexity, clamped to [minRegions, maxRegions], normalized to the
+    target). Splits are spent on objects still under their budget first
+    (largest slack first, largest region within it), then — when every
+    budget is met but the global target is not — on eligible objects below
+    their maxRegions cap, largest region first. While under target and the
+    candidate region is >= 2x the minimum playable size, split it with an
+    organic cut; both pieces are refit and the new shared boundary is
+    emitted as SUBDIVISION edges. Deterministic (seeded by region id hash);
+    loop bound 1200 splits.
     """
     target = int(settings.target_regions)
     min_px = float(settings.min_region_pixels)
+    budgets = _object_region_budgets(regions, objects, target)
     skip: set = set()
     splits = 0
     while len(regions) < target and splits < 1200:
         pool = [r for r in regions if r['id'] not in skip]
         if not pool:
             break
-        largest = max(pool, key=lambda r: r['area'])
+        counts: dict = defaultdict(int)
+        for r in pool:
+            counts[r.get('objectId') or 'unassigned'] += 1
+        largest = None
+        # 1) objects still under their semantic budget: largest slack first
+        for oid in sorted(budgets, key=lambda o: (-(budgets[o] - counts.get(o, 0)), o)):
+            if counts.get(oid, 0) >= budgets[oid]:
+                continue
+            members = [r for r in pool if (r.get('objectId') or 'unassigned') == oid]
+            if not members:
+                continue
+            cand = max(members, key=lambda r: r['area'])
+            if cand['area'] >= 2 * min_px:
+                largest = cand
+                break
+        # 2) budgets met but target not reached: grow objects below their
+        #    maxRegions cap (leftover redistribution), largest region first.
+        if largest is None:
+            recs = {o['id']: o for o in (objects or [])}
+            eligible = []
+            for oid in sorted(budgets):
+                if counts.get(oid, 0) >= budgets[oid] and counts.get(oid, 0) > 0:
+                    hi = max(1, min(int((recs.get(oid) or {}).get('subdivision', {}).get('maxRegions') or target), target))
+                    if counts[oid] >= hi:
+                        continue
+                members = [r for r in pool if (r.get('objectId') or 'unassigned') == oid]
+                if members:
+                    eligible.append(max(members, key=lambda r: r['area']))
+            if not eligible:
+                break
+            largest = max(eligible, key=lambda r: r['area'])
         if largest['area'] < 2 * min_px:
             break
         seed = int(hashlib.sha256(largest['id'].encode()).hexdigest()[:8], 16)
@@ -1470,6 +1781,8 @@ def validate_bundle(bundle: dict, roundtrip=True) -> dict:
     if color_conflicts:
         warnings.append(f'Color-answer consistency: {len(color_conflicts)} region(s) painted a color their '
                         f'number group does not show (pen/recolor edits): ' + ', '.join(color_conflicts[:5]))
+    object_issues, object_summary = _object_qa(bundle)
+    warnings.extend(object_issues)
     warnings.append('Automatic regions are drafts, not guaranteed to follow semantic object boundaries. Human visual review is required.')
     fixed = sum(r['area'] for r in g.get('decorations', []))
     report = {
@@ -1483,6 +1796,7 @@ def validate_bundle(bundle: dict, roundtrip=True) -> dict:
         'colorAnswerConsistency': {'checked': color_checked, 'conflictCount': len(color_conflicts),
                                    'conflictRegionIds': color_conflicts[:20],
                                    'note': 'regions whose number-group swatch matches their painted appearance (answer-key integrity)'},
+        'objects': object_summary,
         'geometry': {
             'schema': g.get('geometrySchema', 1),
             'masterAuthority': 'regions[*].master.d (curved SVG path commands)',
@@ -1510,7 +1824,8 @@ def validate_bundle(bundle: dict, roundtrip=True) -> dict:
             ],
         },
         'checkScope': 'IDs, palette refs, versions, closed curved paths, master/flat consistency, polygon validity, bounds, label interiors, '
-                      'partition union/overlap at flatten tolerance, raster coverage, hit-test probe alignment, curve statistics, color-answer consistency. '
+                      'partition union/overlap at flatten tolerance, raster coverage, hit-test probe alignment, curve statistics, color-answer consistency, '
+                      'semantic object integrity (orphan shapes/regions, missing shapeIds, invalid parents, zero-geometry objects, impossible budgets). '
                       'Not semantic/artistic quality.',
     }
     return report
@@ -1688,6 +2003,15 @@ def emit_bundle(folder: Path, bundle: dict, previews=True) -> dict:
     m['difficultyValidatedByPlaytest'] = bool(completed)
     w, h = map(int, g['viewBox'][2:]); vb = svg_open(w, h)
     write_json(folder / 'regions.json', g); write_json(folder / 'palette.json', p); write_json(folder / 'paint.json', paint)
+    # Authoring layer: objects.json ships next to the runtime files (revision
+    # folders + authoring exports). It is deliberately OUTSIDE the content
+    # hash — the hash covers the runtime contract (regions/palette/paint).
+    objects = bundle.get('objects')
+    if objects:
+        write_json(folder / 'objects.json', {'schemaVersion': OBJECTS_SCHEMA_VERSION, 'objects': objects})
+    else:
+        (folder / 'objects.json').unlink(missing_ok=True)
+    m['objectsCount'] = len(objects or [])
     m['contentHash'] = hashlib.sha256(b''.join((folder / f).read_bytes() for f in ['regions.json', 'palette.json', 'paint.json'])).hexdigest()
     final = vb + svg_paint(paint) + '</svg>'
     (folder / 'colored.svg').write_text(final)
@@ -1906,6 +2230,7 @@ def _split_disconnected_master(cmds: List[Command], fit_tolerance: float):
 
 def compile_svg_master(source: Path, output: Path, *, artwork_id: str, version: str, title: str,
                         settings: BuildSettings, provenance: dict | None = None,
+                        objects: list | None = None,
                         progress: Callable = lambda *_: None) -> dict:
     """Compile a sanitized SVG master into the detailed-vector bundle.
 
@@ -2018,12 +2343,13 @@ def compile_svg_master(source: Path, output: Path, *, artwork_id: str, version: 
         if poly is None:
             poly = Polygon(cand['rings'][0], cand['rings'][1:]) if len(cand['rings']) > 1 else Polygon(cand['rings'][0])
         label = make_label(poly, pid)
+        object_id = cand['shape'].get('objectRef') or 'unassigned'
         if cand['verbatim']:
-            reg = pack_region(cand['cmds'], f'r-{idx:05d}', pid, label=label,
+            reg = pack_region(cand['cmds'], f'r-{idx:05d}', pid, object_id, label=label,
                               source='svg-master-import', fit_tolerance=0.0,
                               fill_rule=cand['fillRule'])
         else:
-            reg = pack_region(cand['poly'], f'r-{idx:05d}', pid, label=label,
+            reg = pack_region(cand['poly'], f'r-{idx:05d}', pid, object_id, label=label,
                               source='visible-surface-refit', fit_tolerance=settings.curve_tolerance,
                               fill_rule='evenodd')
         reg['masterShapeId'] = cand['shape']['id']
@@ -2036,10 +2362,31 @@ def compile_svg_master(source: Path, output: Path, *, artwork_id: str, version: 
         raise ValueError('No playable regions in the SVG master; shapes are too small.')
     # Stage-2 deterministic auto-subdivide (contract 6): close the gap between
     # authored shape count and a rich gameplay region count, true-vector only.
+    # Semantic phase: object records (from data-cd-object master groups) drive
+    # per-object region budgets instead of global largest-first. Authoring
+    # metadata supplied by the caller (scene plan / UI) merges in by object id:
+    # the master's groups own the shapeIds, the provided records may carry
+    # subdivision budgets, type/role, parentId and generation info.
+    derived = _objects_from_shapes(list(doc.shapes) + list(doc.ink_shapes))
+    if provided_objects := normalize_objects({'objects': objects or []}):
+        derived = derived or []
+        derived_by_id = {o['id']: o for o in derived}
+        merged = list(derived)
+        for rec in provided_objects:
+            target_rec = derived_by_id.get(rec['id'])
+            if target_rec is None:
+                merged.append(rec)
+                continue
+            for key, val in rec.items():
+                if key != 'shapeIds' and (key != 'name' or not target_rec.get('name')):
+                    target_rec[key] = val
+        objects = normalize_objects({'objects': merged})
+    else:
+        objects = derived
     edges: List[dict] = []
     if settings.auto_subdivide:
         progress(.58, f'Subdividing large regions toward ~{settings.target_regions} tap targets')
-        _auto_subdivide(regions, settings, edges, progress)
+        _auto_subdivide(regions, settings, edges, objects=objects, progress=progress)
     progress(.66, 'Classifying artwork boundaries vs subdivision edges')
     _emit_master_edges(regions, doc, edges)
     progress(.70, 'Emitting the detailed paint layer (order, strokes and gradients preserved)')
@@ -2115,7 +2462,8 @@ def compile_svg_master(source: Path, output: Path, *, artwork_id: str, version: 
                                             'fully hidden shapes excluded; shading and transparent shapes are appearance, not gameplay.',
                                'rasterizedMaster': False},
                 'provenance': provenance or {'source': 'User-supplied SVG; rights not independently verified'}}
-    bundle = {'manifest': manifest, 'geometry': geometry, 'palette': palette, 'paint': paint}
+    bundle = {'manifest': manifest, 'geometry': geometry, 'palette': palette, 'paint': paint,
+              'objects': objects}
     output.mkdir(parents=True, exist_ok=True)
     shutil.copy2(source, output / 'source-master.svg')
     progress(.86, 'Checking topology, labels and runtime exports')
@@ -2146,8 +2494,18 @@ def load_bundle(folder):
         geometry.setdefault('source', 'raster')
         geometry.setdefault('backend', 'legacy-polygon')
         geometry.setdefault('flattenTolerance', 0.0)
+    # Semantic object model (authoring layer): optional objects.json next to
+    # the runtime files. Corrupt/unknown payloads degrade to None (unassigned),
+    # never to a failed load.
+    objects = None
+    if (folder / 'objects.json').is_file():
+        try:
+            objects = normalize_objects(read_json(folder / 'objects.json'))
+        except Exception:
+            objects = None
     return {'manifest': read_json(folder / 'artwork.json'), 'geometry': geometry,
-            'palette': read_json(folder / 'palette.json'), 'paint': read_json(folder / 'paint.json')}
+            'palette': read_json(folder / 'palette.json'), 'paint': read_json(folder / 'paint.json'),
+            'objects': objects}
 
 
 def legacy_geometry(geometry: dict) -> dict:
@@ -2548,6 +2906,12 @@ def edit_bundle(source: Path, output: Path, request, version: str):
                 paint['paths'].append(entry)
                 paint['sourceColorShapeCount'] = int(paint.get('sourceColorShapeCount', 0) or 0) + 1
                 reg['masterShapeId'] = shape_id
+                # Semantic object model: an artwork pen stroke is a first-class
+                # object owning its paint shape(s); the sync before emit merges
+                # all pieces of this stroke into one object record.
+                reg['objectId'] = 'obj-' + hashlib.sha256((pen_id + 'object').encode()).hexdigest()[:12]
+                bundle.setdefault('_pending_object_names', {})[reg['objectId']] = \
+                    'Pen artwork ' + str(len(new_regions) + 1)
             g['regions'].append(reg)
             new_regions.append(reg)
         # (P0.2) No palette mutation here: a diverging custom fill already
@@ -2703,6 +3067,10 @@ def edit_bundle(source: Path, output: Path, request, version: str):
         if r['objectId'] != 'unassigned':
             groups[r['objectId']].append(r['id'])
     m['objectGroups'] = [{'id': key, 'title': key.replace('-', ' ').title(), 'regionIds': ids} for key, ids in sorted(groups.items())]
+    # Semantic object model: regions are the membership truth; records carry
+    # the authoring metadata. This keeps objects.json alive through every
+    # edit (merge/split/cut/pen/node inherit objectId via pack_region).
+    bundle['objects'] = _sync_objects_from_regions(bundle)
     m['version'] = version; g['artworkVersion'] = version
     m.pop('review', None)
     m['provenance']['lastEdit'] = request.action
@@ -2868,6 +3236,8 @@ def make_export(folder: Path, include_authoring=False):
         names = ['artwork.json', 'regions.json', 'palette.json', 'paint.json', 'colored.svg', 'numbered.svg',
                  'linework.svg', 'ink.svg', 'selected-preview.svg', 'thumbnail.webp', 'validation.json',
                  master_name, 'build-settings.json', 'colored-preview.png', 'numbered-preview.png']
+        if (folder / 'objects.json').is_file():
+            names.append('objects.json')
         bundle_kind = 'authoring'
     else:
         g_out = _runtime_geometry(g)

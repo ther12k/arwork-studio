@@ -154,7 +154,8 @@ def _style_dict(style: str | None) -> Dict[str, str]:
 
 
 class _Context:
-    __slots__ = ('matrix', 'opacity', 'fill', 'fill_opacity', 'fill_rule', 'stroke', 'stroke_width')
+    __slots__ = ('matrix', 'opacity', 'fill', 'fill_opacity', 'fill_rule', 'stroke', 'stroke_width',
+                 'object_ref', 'object_name', 'object_parent')
 
     def __init__(self) -> None:
         self.matrix: Mat = mat_identity()
@@ -164,6 +165,13 @@ class _Context:
         self.fill_rule = 'nonzero'
         self.stroke: Optional[str] = None
         self.stroke_width = 1.0
+        # Semantic object context (data-cd-object / data-cd-name on any <g>):
+        # inherited by descendant shapes; this is how object identity survives
+        # the master -> compile boundary (the objects.json authoring layer).
+        # A nested data-cd-object group records the enclosing object as parent.
+        self.object_ref: Optional[str] = None
+        self.object_name: Optional[str] = None
+        self.object_parent: Optional[str] = None
 
     def child(self, attrs: Dict[str, str]) -> '_Context':
         style = _style_dict(attrs.get('style'))
@@ -183,6 +191,16 @@ class _Context:
         ctx.stroke = _parse_color(merged.get('stroke')) if 'stroke' in merged else self.stroke
         sw = merged.get('stroke-width')
         ctx.stroke_width = self.stroke_width if sw is None else max(0.0, _num(sw, 1.0))
+        obj = (merged.get('data-cd-object') or '').strip()
+        if obj:
+            ctx.object_ref = obj[:64]
+            nm = (merged.get('data-cd-name') or '').strip()
+            ctx.object_name = nm[:80] or None
+            ctx.object_parent = self.object_ref if self.object_ref and self.object_ref != obj else self.object_parent
+        else:
+            ctx.object_ref = self.object_ref
+            ctx.object_name = self.object_name
+            ctx.object_parent = self.object_parent
         return ctx
 
     def fill_ref(self, attrs: Dict[str, str]) -> Optional[str]:
@@ -574,6 +592,8 @@ def import_master(text: str) -> MasterDoc:
             'order': ordn, 'id': shape_id, 'sourceId': source_id,
             'kind': 'ink' if (stroke_only or role == 'ink') else 'shape',
             'role': role, 'element': tag,
+            'objectRef': ctx.object_ref, 'objectName': ctx.object_name,
+            'objectParent': ctx.object_parent,
             'commands': cmds, 'd': format_path(cmds),
             'fillRule': 'evenodd' if sctx.fill_rule == 'evenodd' else 'nonzero',
             'bbox': bbox, 'rings': flat, 'opacity': round(sctx.opacity, 4),
@@ -702,17 +722,22 @@ def emit_master_svg(doc: MasterDoc) -> str:
                     stop['stop-opacity'] = fmt_num(s['opacity'], 3)
                 ET.SubElement(node, 'stop', stop)
     # One ordered stream: shapes and ink interleaved by document order.
-    for s in sorted(doc.shapes + doc.ink_shapes, key=lambda t: t['order']):
-        if s.get('hidden'):
-            continue
+    # Shapes carrying the same objectRef are wrapped in <g data-cd-object>
+    # runs (document order is preserved — fragments never interleave), so
+    # object identity survives the sanitize round-trip and any later rebuild
+    # of this master reconstructs the same objects.json.
+    stream = [s for s in sorted(doc.shapes + doc.ink_shapes, key=lambda t: t['order'])
+              if not s.get('hidden')]
+
+    def shape_node(parent: ET.Element, s: dict) -> None:
         if s.get('kind') == 'ink':
-            ET.SubElement(root, 'path', {
+            ET.SubElement(parent, 'path', {
                 'id': s['id'], 'fill': 'none',
                 'stroke': s.get('stroke') or '#29383E',
                 'stroke-width': fmt_num(s.get('strokeWidth', 1.5)),
                 'stroke-linecap': 'round', 'stroke-linejoin': 'round',
                 'd': s['d']})
-            continue
+            return
         fill = s.get('fill') or '#000000'
         if s.get('gradient'):
             fill = f'url(#{s["gradient"]["id"]})'
@@ -725,7 +750,29 @@ def emit_master_svg(doc: MasterDoc) -> str:
             attrs['stroke'] = s['stroke']
             attrs['stroke-width'] = fmt_num(s['strokeWidth'])
             attrs['stroke-linejoin'] = 'round'
-        ET.SubElement(root, 'path', attrs)
+        ET.SubElement(parent, 'path', attrs)
+
+    i = 0
+    while i < len(stream):
+        s = stream[i]
+        ref = s.get('objectRef')
+        if not ref:
+            shape_node(root, s)
+            i += 1
+            continue
+        run = [s]
+        j = i + 1
+        while j < len(stream) and stream[j].get('objectRef') == ref:
+            run.append(stream[j])
+            j += 1
+        gattrs = {'data-cd-object': ref}
+        name = next((t.get('objectName') for t in run if t.get('objectName')), None)
+        if name:
+            gattrs['data-cd-name'] = name
+        gnode = ET.SubElement(root, 'g', gattrs)
+        for t in run:
+            shape_node(gnode, t)
+        i = j
     return ET.tostring(root, encoding='unicode')
 
 

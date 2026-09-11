@@ -333,9 +333,17 @@ class Provider:
                 raise ValueError(f'Fragment for "{obj["name"]}" was drawn outside its planned bbox. '
                                  'No partial master was saved; retry explicitly if you want to spend again.')
             prefix=f'o{i}-'
+            # Semantic object identity is born HERE, before any SVG exists in
+            # the final master: every shape of this fragment is stamped with
+            # the planned object id. emit_master_svg wraps the run in
+            # <g data-cd-object>, so any later rebuild reconstructs
+            # objects.json with the same ownership (compiler never guesses).
+            obj_id=f'obj-{i}-' + (re.sub(r'[^a-z0-9]+','-',obj['name'].lower()).strip('-')[:32] or f'object{i}')
             for s in doc.shapes+doc.ink_shapes:
                 entry=dict(s)
                 entry['id']=prefix+s['id']
+                entry['objectRef']=obj_id
+                entry['objectName']=obj['name']
                 entry['order']=order; order+=1
                 grad=entry.get('gradient')
                 if grad and grad.get('id','').startswith('g-'):

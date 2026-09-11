@@ -6,6 +6,7 @@ from PIL import Image,ImageDraw
 from shapely.geometry import Polygon,Point
 from studio.pipeline import *
 from studio.models import BuildSettings,EditRequest
+from studio.pipeline import _object_region_budgets  # phase-gate engine (underscore = not star-exported)
 
 @pytest.fixture(scope='module')
 def asset(tmp_path_factory):
@@ -667,3 +668,230 @@ def test_exports_render_semantic_edges(svg_asset,tmp_path):
     # legacy bundles without edges keep the outline-per-region fallback
     line_svg_asset=(svg_asset/'bundle'/'linework.svg').read_text()
     assert 'data-layer="edges"' in line_svg_asset  # svg masters always carry edges
+
+# ---------------------------------------------------------------------------
+# Semantic object model (objects.json): fixtures A/B/C + phase gates
+# ---------------------------------------------------------------------------
+
+def _compile_master(tmp_path, name, inner, settings, objects=None):
+    svg = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">' + inner + '</svg>'
+    src = tmp_path / (name + '.svg')
+    src.write_text(svg)
+    return compile_svg_master(src, tmp_path / (name + '-bundle'), artwork_id=name, version='0.1.0',
+                              title=name, settings=settings, objects=objects)
+
+
+def _counts(regions):
+    out = {}
+    for r in regions:
+        out[r['objectId']] = out.get(r['objectId'], 0) + 1
+    return out
+
+
+_FIXTURE_A_INNER = (
+    '<g data-cd-object="obj-sky" data-cd-name="Sky">'
+    '<rect x="0" y="0" width="512" height="300" fill="#8fc7e8"/></g>'
+    '<g data-cd-object="obj-ground" data-cd-name="Ground">'
+    '<rect x="0" y="300" width="512" height="212" fill="#7aa86b"/></g>'
+    '<g data-cd-object="obj-tree" data-cd-name="Tree">'
+    '<rect x="40" y="330" width="34" height="130" fill="#6b4a2f"/>'
+    '<circle cx="58" cy="300" r="46" fill="#3e7c4f"/>'
+    '<circle cx="96" cy="335" r="38" fill="#4a8f5c"/></g>'
+    '<g data-cd-object="obj-house" data-cd-name="House">'
+    '<rect x="300" y="335" width="150" height="115" fill="#c9b28a"/>'
+    '<polygon points="290,340 375,262 460,340" fill="#a4553d"/>'
+    '<rect x="360" y="395" width="42" height="55" fill="#5b4632"/></g>'
+)
+
+_FIXTURE_A_OBJECTS = [
+    {'id': 'obj-sky', 'subdivision': {'detailWeight': 0.1}},
+    {'id': 'obj-ground', 'subdivision': {'detailWeight': 0.5}},
+    {'id': 'obj-tree', 'subdivision': {'detailWeight': 1.0}},
+    {'id': 'obj-house', 'subdivision': {'detailWeight': 1.0}},
+]
+
+
+def _build_fixture_a(tmp_path):
+    settings = BuildSettings(target_regions=300, auto_subdivide=True, max_edge=512)
+    result = _compile_master(tmp_path, 'fixture-a', _FIXTURE_A_INNER, settings, objects=_FIXTURE_A_OBJECTS)
+    return result, tmp_path / 'fixture-a-bundle'
+
+
+def test_normalize_objects_lenient():
+    raw = {'objects': [
+        {'id': 'obj-ok', 'name': 'Tree', 'type': 'tree', 'parentId': 'obj-root', 'role': 'foreground',
+         'shapeIds': ['s1', 's1', 's2'],
+         'subdivision': {'detailWeight': 2.5, 'minRegions': 10, 'maxRegions': 30, 'preserveSilhouette': True},
+         'generation': {'prompt': 'a tree', 'provider': 'test', 'locked': True}},
+        {'id': 'BAD ID', 'name': 'nope'},
+        {'id': 'obj-ok'},
+        {'nope': True},
+    ]}
+    out = normalize_objects(raw)
+    assert [o['id'] for o in out] == ['obj-ok']
+    o = out[0]
+    assert o['shapeIds'] == ['s1', 's2'] and o['subdivision']['detailWeight'] == 2.5
+    assert o['subdivision']['preserveSilhouette'] is True
+    assert o['generation']['locked'] is True and o['parentId'] == 'obj-root' and o['role'] == 'foreground'
+    assert normalize_objects({'objects': []}) is None
+    assert normalize_objects(None) is None
+    assert normalize_objects({'objects': 'nope'}) is None
+
+
+def test_object_budget_allocation_sums_to_target():
+    regions = [{'objectId': 'a', 'area': 500.0}, {'objectId': 'b', 'area': 300.0},
+               {'objectId': 'c', 'area': 200.0}]
+    objects = [
+        {'id': 'a', 'shapeIds': ['s1'], 'subdivision': {'detailWeight': 0.2}},
+        {'id': 'b', 'shapeIds': ['s2', 's3', 's4'], 'subdivision': {'detailWeight': 1.0, 'minRegions': 40}},
+        {'id': 'c', 'shapeIds': ['s5'], 'subdivision': {'detailWeight': 1.0, 'maxRegions': 50}},
+    ]
+    budgets = _object_region_budgets(regions, objects, 100)
+    assert sum(budgets.values()) == 100
+    assert budgets['b'] >= 40
+    assert budgets['c'] <= 50
+    # no records: area-share allocation per objectId, still summing to the target
+    budgets = _object_region_budgets(regions, None, 100)
+    assert sum(budgets.values()) == 100 and budgets['a'] == 50 and budgets['c'] == 20
+    # single unassigned pool (raster builds): legacy global behavior
+    assert _object_region_budgets([{'objectId': 'unassigned', 'area': 1.0}], None, 100) == {'unassigned': 100}
+    # contradictory clamps: maxRegions wins allocation, minRegions stays the QA threshold
+    contradictions = [{'objectId': 'x', 'area': 100.0}]
+    tiny = [{'id': 'x', 'shapeIds': ['s1'], 'subdivision': {'minRegions': 250, 'maxRegions': 30}}]
+    budgets = _object_region_budgets(contradictions, tiny, 100)
+    assert budgets['x'] == 30
+
+
+def test_object_fixture_a_obvious_composition(tmp_path):
+    result, folder = _build_fixture_a(tmp_path)
+    assert result['manifest']['objectsCount'] == 4
+    objects_file = json.loads((folder / 'objects.json').read_text())
+    assert objects_file['schemaVersion'] == 1
+    recs = {o['id']: o for o in objects_file['objects']}
+    assert set(recs) == {'obj-sky', 'obj-ground', 'obj-tree', 'obj-house'}
+    assert recs['obj-sky']['subdivision']['detailWeight'] == 0.1
+    for o in objects_file['objects']:
+        assert o['shapeIds'], o['id'] + ' owns no shapes'
+    bundle = load_bundle(folder)
+    counts = _counts(bundle['geometry']['regions'])
+    assert set(counts) == {'obj-sky', 'obj-ground', 'obj-tree', 'obj-house'}
+    assert counts['obj-sky'] < counts['obj-tree']
+    assert counts['obj-sky'] < counts['obj-house']
+    assert abs(len(bundle['geometry']['regions']) - 300) <= 5
+    qa = result['validation']
+    assert qa['objects']['unassignedRegions'] == 0
+    assert qa['objects']['assignedRegions'] == len(bundle['geometry']['regions'])
+    # authoring export carries objects.json; lean runtime export must not
+    z = zipfile.ZipFile(io.BytesIO(make_export(folder, True)))
+    assert 'artworks/fixture-a/objects.json' in z.namelist()
+    zr = zipfile.ZipFile(io.BytesIO(make_export(folder)))
+    assert not any('objects.json' in n for n in zr.namelist())
+
+
+def test_object_fixture_b_tiny_high_detail(tmp_path):
+    inner = (
+        '<g data-cd-object="obj-sky" data-cd-name="Sky">'
+        '<rect x="0" y="0" width="512" height="410" fill="#8fc7e8"/></g>'
+        '<g data-cd-object="obj-ground" data-cd-name="Ground">'
+        '<rect x="0" y="410" width="512" height="102" fill="#7aa86b"/></g>'
+        '<g data-cd-object="obj-flower" data-cd-name="Flowers">'
+        '<rect x="350" y="60" width="62" height="62" fill="#e26aa0"/>'
+        '<rect x="424" y="70" width="50" height="50" fill="#f091bd"/></g>'
+    )
+    provided = [{'id': 'obj-flower',
+                 'subdivision': {'detailWeight': 6.0, 'minRegions': 250, 'maxRegions': 30}}]
+    settings = BuildSettings(target_regions=300, auto_subdivide=True, max_edge=512)
+    result = _compile_master(tmp_path, 'fixture-b', inner, settings, objects=provided)
+    bundle = load_bundle(tmp_path / 'fixture-b-bundle')
+    g = bundle['geometry']
+    min_px = float(settings.min_region_pixels)
+    counts = _counts(g['regions'])
+    assert counts['obj-flower'] <= 30
+    assert all(r['area'] >= min_px for r in g['regions'])
+    assert counts['obj-sky'] > counts['obj-flower']
+    issues = result['validation']['objects']['issues']
+    assert any('budget impossible' in i and 'obj-flower' in i for i in issues)
+
+
+def test_object_fixture_c_nested_objects(tmp_path):
+    inner = (
+        '<g data-cd-object="obj-sky" data-cd-name="Sky">'
+        '<rect x="0" y="0" width="512" height="360" fill="#8fc7e8"/></g>'
+        '<g data-cd-object="obj-ground" data-cd-name="Ground">'
+        '<rect x="0" y="360" width="512" height="152" fill="#7aa86b"/></g>'
+        '<g data-cd-object="obj-house" data-cd-name="House">'
+        '<rect x="180" y="300" width="180" height="130" fill="#c9b28a"/>'
+        '<g data-cd-object="obj-house-roof" data-cd-name="Roof">'
+        '<polygon points="165,305 270,220 375,305" fill="#a4553d"/></g>'
+        '<g data-cd-object="obj-house-door" data-cd-name="Door">'
+        '<rect x="245" y="360" width="46" height="70" fill="#5b4632"/></g>'
+        '</g>'
+    )
+    settings = BuildSettings(target_regions=120, auto_subdivide=True, max_edge=512)
+    result = _compile_master(tmp_path, 'fixture-c', inner, settings)
+    objects_file = json.loads((tmp_path / 'fixture-c-bundle' / 'objects.json').read_text())
+    recs = {o['id']: o for o in objects_file['objects']}
+    assert {'obj-sky', 'obj-ground', 'obj-house', 'obj-house-roof', 'obj-house-door'} <= set(recs)
+    assert recs['obj-house-roof']['parentId'] == 'obj-house'
+    assert recs['obj-house-door']['parentId'] == 'obj-house'
+    assert 'parentId' not in recs['obj-house']
+    bundle = load_bundle(tmp_path / 'fixture-c-bundle')
+    door_regions = [r for r in bundle['geometry']['regions'] if r['objectId'] == 'obj-house-door']
+    assert door_regions
+    issues = result['validation']['objects']['issues']
+    assert not any('invalid parent' in i for i in issues)
+
+
+def test_object_edit_preserves_ownership(tmp_path):
+    _, folder = _build_fixture_a(tmp_path)
+    b = load_bundle(folder)
+    tree = sorted((r for r in b['geometry']['regions'] if r['objectId'] == 'obj-tree'),
+                  key=lambda r: -r['area'])
+    target = tree[0]
+    x0, y0, x1, y1 = target['bbox']
+    xm = round((x0 + x1) / 2, 1)
+    d = 'M ' + str(xm) + ' ' + str(y0 - 2) + ' L ' + str(xm) + ' ' + str(y1 + 2)
+    edit_bundle(folder, tmp_path / 'cut', EditRequest(base_revision='x', action='cut',
+                                                      region_ids=[target['id']], d=d), '0.2.0')
+    b2 = load_bundle(tmp_path / 'cut')
+    assert (tmp_path / 'cut' / 'objects.json').is_file()
+    recs = {o['id']: o for o in b2['objects']}
+    assert set(recs) == {'obj-sky', 'obj-ground', 'obj-tree', 'obj-house'}
+    pieces = [r for r in b2['geometry']['regions'] if r['objectId'] == 'obj-tree']
+    assert len(pieces) >= 2
+    assert recs['obj-tree']['shapeIds']
+    assert b2['manifest']['objectsCount'] == 4
+
+
+def test_object_pen_draw_creates_object(tmp_path):
+    _, folder = _build_fixture_a(tmp_path)
+    before = load_bundle(folder)
+    d = 'M 200 100 L 260 100 L 260 160 L 200 160 Z'
+    edit_bundle(folder, tmp_path / 'pen', EditRequest(base_revision='x', action='draw', region_ids=[],
+                                                      d=d, palette_id=1, paint=True, color='#FF7348'), '0.2.0')
+    b2 = load_bundle(tmp_path / 'pen')
+    assert (tmp_path / 'pen' / 'objects.json').is_file()
+    recs = {o['id']: o for o in (b2['objects'] or [])}
+    pen_regions = [r for r in b2['geometry']['regions'] if r['id'].startswith('r-p-')]
+    assert pen_regions and pen_regions[0]['objectId'] in recs
+    pen_rec = recs[pen_regions[0]['objectId']]
+    assert pen_regions[0]['masterShapeId'] in pen_rec['shapeIds']
+    # every pre-existing object survived the edit untouched
+    for o in before['objects']:
+        assert o['id'] in recs
+
+
+def test_object_qa_detects_orphans_and_bad_references(tmp_path):
+    _, folder = _build_fixture_a(tmp_path)
+    b = load_bundle(folder)
+    b['objects'][0]['shapeIds'] = ['sp-missing']
+    b['objects'][1]['parentId'] = 'obj-nope'
+    b['geometry']['regions'][-1]['objectId'] = 'obj-ghost'
+    q = validate_bundle(b)
+    assert q['passed']            # object metadata issues are warnings, not geometry failures
+    issues = ' | '.join(q['warnings'])
+    assert 'references missing shapes' in issues
+    assert 'references invalid parent obj-nope' in issues
+    assert 'reference missing object record obj-ghost' in issues
+    assert 'paint shapes belong to no object' in issues
+    assert q['objects']['count'] == 4 and q['objects']['orphanShapes'] >= 1

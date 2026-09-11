@@ -6,7 +6,7 @@ A runnable **single-user local artwork authoring tool**, not another mockup or a
 
 The compiler, editor, validation and export work **without any API key**. AI chat, image generation and image edits require your own server-side OpenAI key and incur provider charges. These calls never happen automatically during a build.
 
-## Stage-2 feature set (0.3.0)
+## Feature set (0.3.1)
 
 - **Cut & pen region tools**: cut one region along a drawn line (`r-c-*` pieces, subdivision edges classified by proximity) and draw new pen regions (`r-p-*`). **Artwork mode** turns the shape into real finished artwork (a paint.json path with a stable `masterShapeId`) and carves the covered regions away — it works over fully covered artwork; **region-only mode** draws gameplay-only surfaces on uncovered canvas. Masks never overlap; edges are reclassified as artwork vs subdivision.
 - **Edges + boundary style**: `geometry.edges` distinguishes true artwork boundaries (solid) from artificial subdivision boundaries (light dashed); optional `boundaryStyle` overrides. Legacy bundles render unchanged.

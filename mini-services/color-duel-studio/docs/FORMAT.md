@@ -28,6 +28,21 @@ The validator checks polygon validity, positive areas, viewBox bounds, unique ID
 
 `regions.json` may carry `geometry.edges`: boundary entries `{id, d, kind, leftRegion, rightRegion}` where `kind` is `"artwork"` (a true master boundary) or `"subdivision"` (an artificial gameplay boundary created by cuts, pen subtraction or auto-subdivide). `leftRegion`/`rightRegion` name the bordering regions or are null. When `edges` is a non-empty array, region paths render fill-only and boundaries are drawn by an edges overlay above masks/ink, below labels: artwork = solid `geometry.stroke` width 1.6; subdivision = `#7A8C94` width 0.85 dashed `3 2.2` (userSpace). `geometry.boundaryStyle` (`{artwork: {stroke, strokeWidth, dash?}, subdivision: {...}}`) overrides the defaults per kind. Absent/empty `edges` keeps the legacy region-stroke rendering. Raster compiles emit no edges in v1; the runtime export keeps both fields.
 
+## Semantic object model (authoring layer, optional)
+
+Revisions may carry `objects.json`: `{"schemaVersion": 1, "objects": [...]}`. It is **authoring metadata** — the runtime export never includes it, the authoring export does, and it sits outside `contentHash`. Ownership is strictly one-directional:
+
+- `objects.json` owns `shapeIds` (the paint/ink shape ids);
+- every region carries `objectId`; `objects.json` NEVER stores regionIds (regions are derived state that changes on every edit).
+
+Record fields: `id` (required, `obj-*` convention), `name`, `type`, `role`, `parentId` (nested objects, e.g. roof inside house), `shapeIds`, `subdivision {detailWeight, minRegions, preferredRegions, maxRegions, preserveSilhouette}` and `generation {prompt, provider, locked}`. All but `id` are optional; `preserveSilhouette` is reserved (accepted, not yet honoured by subdivision).
+
+Identity is born **in the master SVG**: `<g data-cd-object="obj-tree" data-cd-name="Tree">` groups survive sanitization, so every rebuild reconstructs the same objects.json. The AI multistage planner stamps each planned object's fragment with a `data-cd-object` group at compose time. On build, regions inherit their shape's `objectId`; the authoring records supplied to the build (scene plan) merge by id with the group-derived records and may carry subdivision budgets.
+
+Auto-subdivide consumes the budgets: `raw = areaShare × detailWeight × shapeCountShare`, clamped to `[minRegions, maxRegions]` (a contradictory `minRegions > maxRegions` honours maxRegions for allocation and leaves minRegions as the QA threshold), then largest-remainder normalized to the target with leftover redistributed to objects below their caps. Bundles without object groups keep the legacy global largest-first behavior.
+
+QA (`validation.json → objects`) reports orphan shapes/regions, missing shapeIds, invalid parents, zero-geometry objects and impossible budgets as **warnings** — they never fail geometry validation.
+
 ## Difficulty profile
 
 `artwork.json` carries `manifest.difficulty = {rating, score, metrics}` computed deterministically for every revision: `rating` is easy (<25) / medium (<50) / hard (<75) / master; `score` is a 0–100 weighted sum over `regionCount, medianRegionArea, tinyRegionPct, requiredZoom` (worst-case zoom for a 44px touch target from a fit viewport), `labelClearance` (ok/tight/conflict), `paletteAmbiguity` (low/medium/high), `paletteGroups, avgNeighbors, subdivisionEdges, objectDensity`. It replaces the old `"unrated"` placeholder; `difficultyValidatedByPlaytest` stays false until a real playtest.
