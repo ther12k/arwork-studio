@@ -30,6 +30,7 @@ import {
   promoteReference as promoteReferenceApi,
   recordPlaytest as apiRecordPlaytest,
   runEdit as apiRunEdit,
+  optimizeDifficulty as apiOptimizeDifficulty,
   sendChat as apiSendChat,
   submitReview as apiSubmitReview,
   uploadImage as apiUploadImage,
@@ -176,6 +177,9 @@ export interface StudioApi {
   generateSvg: () => Promise<void>;
   build: () => Promise<void>;
   runEdit: (action: EditAction, extra?: Partial<EditPayload>, regionIds?: string[]) => Promise<void>;
+  /** Task 27 — Optimize Difficulty: gameplay-only move toward a tier on the
+   *  current revision (new immutable revision; artwork stays untouched). */
+  optimizeDifficulty: (tier: "easy" | "medium" | "hard" | "master") => Promise<void>;
   clearSelection: () => void;
   startPlacing: () => void;
   /** Select a single region by id, switch to the board view and zoom to it (QA drill-down). */
@@ -815,6 +819,19 @@ export function StudioProvider({ children }: { children: React.ReactNode }) {
     runEditRef.current = runEdit;
   }, [runEdit]);
 
+  const optimizeDifficulty = useCallback(
+    async (tier: "easy" | "medium" | "hard" | "master") => {
+      const p = projectRef.current;
+      if (!p) throw new Error("Create a project first.");
+      if (isBusyProject(p)) throw new Error("Wait for the current job.");
+      if (!p.currentRevision) throw new Error("Build the vector regions first.");
+      await job(() => apiOptimizeDifficulty(p.id, { base_revision: p.currentRevision!, tier }));
+      selectedRef.current = new Set();
+      setSelected(new Set());
+    },
+    [job]
+  );
+
   const clearSelection = useCallback(() => {
     selectedRef.current = new Set();
     setSelected(new Set());
@@ -1116,6 +1133,7 @@ export function StudioProvider({ children }: { children: React.ReactNode }) {
     generateSvg,
     build,
     runEdit,
+    optimizeDifficulty,
     clearSelection,
     startPlacing,
     inspectRegion,

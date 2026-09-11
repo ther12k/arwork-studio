@@ -1587,3 +1587,21 @@ Work Log:
 
 Stage Summary:
 - The gameplay half of the Convert promise is now real: Easy/Medium/Hard/Master sessions on the same source + fidelity produce identical artwork (paint byte-identical, asserted) but genuinely different gameplay geometry (140/250/430/650-targeted regions, per-object budgets stamped, difficulty profile re-measured). The requested tier is no longer dead metadata — it drives the region topology through a bounded, deterministic, artwork-frozen engine that prefers a safe best result over microscopic garbage. This same engine is the future "Optimize to Master" button: point it at any committed revision's bundle and re-run with a new tier. Next: expose the optimizer as a revision-level API route + the user-facing Optimize-to-target UI (before/after difficulty card with reasons), then difficulty-profile polish.
+
+---
+Task ID: 27
+Agent: main (ZCode)
+Task: Optimize Difficulty revision action + artist-facing UI — expose the Task-26 engine on any committed revision (P0 of the Task 27-37 product roadmap: turn the strong backend into an artwork studio that feels like a production tool, not a compiler console).
+
+Work Log:
+- models.py: OptimizeRequest {base_revision, tier} (strict literal tier).
+- app.py POST /api/projects/{pid}/optimize — async job like the edit actions: validates base == currentRevision (409 otherwise), loads the bundle, runs optimize_gameplay_difficulty toward the tier, then (a) re-verifies the artwork invariant AT BYTE LEVEL (re-serialized paint dict hash == source paint.json hash; violation fails the job and creates nothing), (b) report carries artworkUnchanged + baseRevision; changed=False → honest no-op report, NO duplicate revision; changed=True → new immutable revision (source-master + build-settings copied, manifest version/provenance lastEdit 'optimize-difficulty', full report persisted as manifest.difficultyOptimization, objectGroups rebuilt) emitted through emit_bundle (geometry QA raises). start() learned the 'optimization' result key → project.lastOptimization for the UI.
+- Frontend studio-api.ts: OptimizationReport type + optimizeDifficulty() client; Project.lastOptimization.
+- use-studio.tsx: optimizeDifficulty(tier) action (job pattern, guards mirror runEdit; clears the region selection afterwards).
+- right-panel.tsx OptimizeCard under the difficulty profile: 4-tier target selector (raw region numbers deliberately hidden), 'Optimize to <Tier>' CTA with running state (job message), and the before/after report — achieved tier · score, ±regions/merges/splits/N object budgets, 'Target reached' vs amber 'Best safe result' with bulleted reasons vs 'No change needed', 'Artwork unchanged ✓', and the active new-revision note (previous revision stays available = natural undo). The report renders only while it describes the mounted revision (baseRevision/revisionId match) so it never goes stale across later edits.
+- Tests (+3, suite 102 passed / 7 skipped via Docker): downward hop on a dense 300-region board creates a new revision with paint bytes + source master byte-identical, objects.shapeIds identical, QA passed, report persisted in manifest + project, source revision immutable; second optimize on the in-band revision is a no-op (no duplicate revision, noop+changed flags honest), stale base → 409 like the edit route; upward hop on a small board raises complexity without touching paint and the engine is deterministic on the same base + tier (identical region ids + d).
+- Gates: pytest 102/7, tsc --noEmit clean, eslint clean, vite build OK, validate/adapter/release guards unchanged-green.
+- Docs: FORMAT.md Difficulty Optimization section documents the revision action contract; AGENTS.md bullet updated.
+
+Stage Summary:
+- The Optimize action is now a first-class studio workflow: pick a tier on any built artwork, get a new revision with genuinely different gameplay density and the exact same artwork, with an honest before/after card that never overclaims (safe-ceiling reasons surfaced, artwork-unchanged always stated). This closes the product-facing half of the difficulty promise and is the template for the next roadmap items (Task 28 Create Artwork entry UX, then 29/30/31) — reshaping strong backend capability into artist-facing flows.

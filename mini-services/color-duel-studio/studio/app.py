@@ -1,5 +1,6 @@
 from __future__ import annotations
-import io,json,os,re,shutil,threading,uuid
+import io,json,os,re,shutil,threading,uuid,hashlib
+from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from datetime import datetime,timezone
@@ -13,7 +14,7 @@ from .models import *
 from . import STUDIO_VERSION
 from .pipeline import (BACKENDS, clean_image, compile_image, compile_svg_master,
                         difficulty_profile, edit_bundle, read_json, write_json, make_export,
-                        load_bundle, validate_bundle, legacy_geometry)
+                        load_bundle, validate_bundle, legacy_geometry, checksum)
 from .svg_master import clean_svg
 from .ai import Provider
 from .generation import (
@@ -90,6 +91,10 @@ def create_app(workspace: Path|None=None, transport=None):
                     if result.get('chat'):
                         c=result['chat'];p['messages']+=c['messages'];p['brief']=c['brief'];p['aiUsage'].append(c['usage'])
                     if result.get('usage'): p['aiUsage'].append(result['usage'])
+                    if result.get('optimization'):
+                        # Task 27: before/after report for the Optimize action
+                        # (also persisted in the new revision's manifest).
+                        p['lastOptimization']=result['optimization']
                     if result.get('pendingBuildSettings'):
                         p['pendingBuildSettings']=result['pendingBuildSettings']
                     if result.get('consumePending'):
@@ -345,6 +350,59 @@ def create_app(workspace: Path|None=None, transport=None):
                 'sourceHash':p['master']['sha256'],'regionCount':result['manifest']['regionCount'],'qa':result['validation'],
                 'manifestUrl':f'/api/projects/{pid}/revisions/{rev}/files/artwork.json'}}
         return start(pid,'region edit',run)
+    @app.post('/api/projects/{pid}/optimize')
+    def optimize(pid:str,body:OptimizeRequest):
+        """Task 27 — Optimize Difficulty: reshape the gameplay layer of the
+        CURRENT revision toward a tier via the Task-26 engine. Artwork
+        (paint bytes, object shapeIds, source master) is verified untouched;
+        a moved geometry lands in a NEW immutable revision, an unchanged one
+        returns a no-op report without a duplicate revision."""
+        with lock:p=project(pid)
+        if p['currentRevision']!=body.base_revision:raise HTTPException(409,'Revision changed. Reload before optimizing.')
+        src=revision_dir(pid,body.base_revision)
+        def run(tick):
+            from .difficulty import optimize_gameplay_difficulty
+            from .pipeline import emit_bundle
+            bundle=load_bundle(src)
+            paint_before=checksum(src/'paint.json')
+            tick(.15,f'Optimizing gameplay toward {body.tier}')
+            bundle,report=optimize_gameplay_difficulty(bundle,body.tier,progress=tick)
+            # Hard invariant at the route level too: whatever the engine did
+            # in memory, the artwork layer must serialize to the exact same
+            # paint.json bytes as the source revision.
+            paint_bytes=json.dumps(bundle['paint'],ensure_ascii=False,separators=(',',':'),allow_nan=False).encode('utf-8')
+            if hashlib.sha256(paint_bytes).hexdigest()!=paint_before:
+                raise ValueError('Optimization would change the artwork layer. Nothing was created.')
+            report['artworkUnchanged']=True
+            report['baseRevision']=body.base_revision
+            if not report.get('changed'):
+                # No safe meaningful move: report honestly, create nothing.
+                report['noop']=True
+                return {'optimization':report}
+            rev='rev-'+ident();version=f'0.{len(p["revisions"])+1}.0'
+            m,g=bundle['manifest'],bundle['geometry']
+            m['version']=version;g['artworkVersion']=version
+            m.pop('review',None)
+            m['provenance']['lastEdit']='optimize-difficulty'
+            m['difficultyOptimization']=report
+            groups=defaultdict(list)
+            for r in g['regions']:
+                if r['objectId']!='unassigned':groups[r['objectId']].append(r['id'])
+            m['objectGroups']=[{'id':k,'title':k.replace('-',' ').title(),'regionIds':v} for k,v in sorted(groups.items())]
+            out=folder(pid)/'revisions'/rev
+            out.mkdir(parents=True,exist_ok=True)
+            master_name=m['assets'].get('sourceMaster','source-master.png')
+            for f in {master_name,'build-settings.json'}:
+                if (src/f).is_file():shutil.copy2(src/f,out/f)
+            tick(.8,'Validating the optimized geometry')
+            qa=emit_bundle(out,bundle)
+            report['revisionId']=rev
+            return {'revision':{'id':rev,'version':version,'createdAt':now(),'kind':'optimize-difficulty',
+                'sourceHash':p['master']['sha256'] if p.get('master') else None,
+                'regionCount':m['regionCount'],'qa':qa,
+                'manifestUrl':f'/api/projects/{pid}/revisions/{rev}/files/artwork.json'},
+                'optimization':report}
+        return start(pid,'difficulty optimization',run)
     @app.post('/api/projects/{pid}/activate')
     def activate(pid:str,body:ActivateRequest):
         with lock:

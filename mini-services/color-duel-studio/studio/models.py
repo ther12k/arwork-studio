@@ -102,6 +102,14 @@ class PlaytestRecord(StrictModel):
 class ActivateRequest(StrictModel):
     revision: str
 
+class OptimizeRequest(StrictModel):
+    """Task 27 — Optimize Difficulty: reshape the GAMEPLAY layer of the
+    current revision toward a tier. The artwork (paint bytes, object
+    shapeIds, source master) stays byte-identical; the engine is
+    studio.difficulty.optimize_gameplay_difficulty."""
+    base_revision: str
+    tier: Literal['easy', 'medium', 'hard', 'master']
+
 class CreateSessionRequest(StrictModel):
     mode: Literal['ai_chat', 'image_reference', 'image_convert'] = 'ai_chat'
     requested_difficulty: Literal['easy', 'medium', 'hard', 'master'] = 'hard'

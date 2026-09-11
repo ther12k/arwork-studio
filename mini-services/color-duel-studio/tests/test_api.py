@@ -1,4 +1,4 @@
-import io,time,json,base64,re,os,tempfile
+import io,time,json,base64,re,os,tempfile,hashlib
 from pathlib import Path
 import httpx,pytest
 import numpy as np
@@ -1106,3 +1106,120 @@ def test_convert_optimization_report_and_metadata(client, monkeypatch):
         manifest = c.get(base + '/files/artwork.json').json()
         assert manifest['difficulty']['rating'] == report['achieved']['rating']
         assert manifest['difficulty']['metrics']['regionCount'] == report['achieved']['regionCount']
+
+
+# ---------------------------------------------------------------------------
+# Task 27 — Optimize Difficulty revision action
+# ---------------------------------------------------------------------------
+
+def test_optimize_creates_revision_with_artwork_frozen(client):
+    """Downward hop on a dense board: Optimize to Easy creates a NEW immutable
+    revision — gameplay merged down, paint bytes identical, objects.shapeIds
+    identical, report persisted in manifest and project, source untouched."""
+    pid = new(client)
+    r = client.post(f'/api/projects/{pid}/upload-svg', headers=H,
+                    files={'file': ('m.svg', SMALL_SVG, 'image/svg+xml')}, data={'rights_confirmed': 'true'})
+    assert r.status_code == 200, r.text
+    r = client.post(f'/api/projects/{pid}/build', headers=H, json={
+        'target_regions': 300, 'palette_colors': 4, 'paint_colors': 16, 'max_edge': 256,
+        'min_region_pixels': 4, 'min_label_radius': 1.0, 'auto_subdivide': True})
+    assert r.status_code == 200
+    p = wait(client, pid, timeout=120)
+    assert p['job']['status'] == 'done', p['job']
+    rev = p['currentRevision']
+    base = f'/api/projects/{pid}/revisions/{rev}'
+    before = {
+        'paint': hashlib.sha256(client.get(base + '/files/paint.json').content).hexdigest(),
+        'regions': client.get(base + '/files/regions.json').json()['regions'],
+        'master': client.get(base + '/files/source-master.svg').content,
+    }
+    assert len(before['regions']) > 180, 'fixture must start above the easy band'
+    r = client.post(f'/api/projects/{pid}/optimize', headers=H,
+                    json={'base_revision': rev, 'tier': 'easy'})
+    assert r.status_code == 200, r.text
+    p = wait(client, pid, timeout=240)
+    assert p['job']['status'] == 'done', p['job']
+    rev2 = p['currentRevision']
+    assert rev2 and rev2 != rev
+    report = p['lastOptimization']
+    assert report['requestedTier'] == 'easy'
+    assert report['artworkUnchanged'] is True
+    assert report['changed'] is True
+    assert report['revisionId'] == rev2
+    assert report['regionCountAfter'] < report['regionCountBefore']
+    base2 = f'/api/projects/{pid}/revisions/{rev2}'
+    # artwork layer byte-identical
+    assert hashlib.sha256(client.get(base2 + '/files/paint.json').content).hexdigest() == before['paint']
+    assert client.get(base2 + '/files/source-master.svg').content == before['master']
+    # gameplay moved and QA passed
+    regions2 = client.get(base2 + '/files/regions.json').json()['regions']
+    assert len(regions2) == report['regionCountAfter']
+    qa = client.get(base2 + '/files/validation.json').json()
+    assert qa['passed'] is True
+    # report persisted in the revision manifest with before/after
+    manifest = client.get(base2 + '/files/artwork.json').json()
+    assert manifest['difficultyOptimization']['requestedTier'] == 'easy'
+    assert manifest['difficultyOptimization']['initial']['regionCount'] == len(before['regions'])
+    assert manifest['difficultyOptimization']['achieved']['regionCount'] == len(regions2)
+    assert manifest['difficultyOptimization']['artworkUnchanged'] is True
+    # objects.shapeIds unchanged (objects.json may gain preferredRegions)
+    o1 = {o['id']: o.get('shapeIds', []) for o in (client.get(base + '/files/objects.json').json().get('objects') or [])}
+    o2 = {o['id']: o.get('shapeIds', []) for o in (client.get(base2 + '/files/objects.json').json().get('objects') or [])}
+    assert o1 == o2
+    # source revision remains immutable and restorable (natural undo)
+    assert client.get(base + '/files/regions.json').json()['regions'] == before['regions']
+    assert client.get(f'/api/projects/{pid}').json()['revisions'][-1]['id'] == rev2
+    return pid, rev2
+
+
+def test_optimize_noop_does_not_create_revision(client):
+    """Optimizing a revision that already sits in the requested tier band is
+    an honest no-op: report returned, NO duplicate revision created. A stale
+    base revision is rejected like the edit route."""
+    pid, rev_easy = test_optimize_creates_revision_with_artwork_frozen(client)
+    p0 = client.get(f'/api/projects/{pid}').json()
+    n0 = len(p0['revisions'])
+    r = client.post(f'/api/projects/{pid}/optimize', headers=H,
+                    json={'base_revision': rev_easy, 'tier': 'easy'})
+    assert r.status_code == 200, r.text
+    p = wait(client, pid, timeout=120)
+    assert p['job']['status'] == 'done', p['job']
+    assert p['currentRevision'] == rev_easy, 'no-op must not create a revision'
+    assert len(p['revisions']) == n0
+    assert p['lastOptimization']['noop'] is True
+    assert p['lastOptimization']['changed'] is False
+    assert p['lastOptimization']['artworkUnchanged'] is True
+    # stale base revision is rejected like the edit route (409 conflict)
+    r = client.post(f'/api/projects/{pid}/optimize', headers=H,
+                    json={'base_revision': 'rev-nonexistent', 'tier': 'master'})
+    assert r.status_code == 409
+
+
+def test_optimize_upward_then_deterministic(client):
+    """Upward hop on a small board: Master raises gameplay complexity without
+    touching paint; the engine is deterministic on the same base + tier."""
+    pid, rev = _svg_project(client)
+    paint0 = hashlib.sha256(
+        client.get(f'/api/projects/{pid}/revisions/{rev}/files/paint.json').content).hexdigest()
+    r = client.post(f'/api/projects/{pid}/optimize', headers=H,
+                    json={'base_revision': rev, 'tier': 'master'})
+    assert r.status_code == 200
+    p = wait(client, pid, timeout=240)
+    assert p['job']['status'] == 'done', p['job']
+    master_rev = p['currentRevision']
+    assert master_rev != rev
+    report = p['lastOptimization']
+    assert report['regionCountAfter'] > report['regionCountBefore']
+    assert client.get(f'/api/projects/{pid}/revisions/{master_rev}/files/validation.json').json()['passed']
+    paint1 = hashlib.sha256(
+        client.get(f'/api/projects/{pid}/revisions/{master_rev}/files/paint.json').content).hexdigest()
+    assert paint1 == paint0
+    # determinism: same base revision + same tier -> identical region geometry
+    from studio.difficulty import optimize_gameplay_difficulty
+    from studio.pipeline import load_bundle
+    src = Path(client.app.state.root) / pid / 'revisions' / rev
+    b1, r1 = optimize_gameplay_difficulty(load_bundle(src), 'master')
+    b2, r2 = optimize_gameplay_difficulty(load_bundle(src), 'master')
+    assert [(x['id'], x['d']) for x in b1['geometry']['regions']] == \
+           [(x['id'], x['d']) for x in b2['geometry']['regions']]
+    assert r1['achieved'] == r2['achieved']

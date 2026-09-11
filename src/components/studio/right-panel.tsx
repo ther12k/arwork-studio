@@ -184,6 +184,130 @@ function DifficultyPanel({ raw, validated }: { raw: string | DifficultyProfile |
   );
 }
 
+/** Task 27 — Optimize gameplay difficulty: the artist-facing control for the
+ *  gameplay-only difficulty engine. Picks a target tier, runs the optimizer
+ *  (new immutable revision; artwork untouched), and reports the outcome —
+ *  never claiming a tier the engine did not safely reach. */
+function OptimizeCard({ currentTierKey }: { currentTierKey: string | null }) {
+  const studio = useStudioContext();
+  const { busy, project, optimizeDifficulty } = studio;
+  // Default target: one tier above the current rating (Master wraps to Easy
+  // — merging down is a legitimate easy-mode request).
+  const [tier, setTier] = useState<"easy" | "medium" | "hard" | "master">(() => {
+    const order: Array<"easy" | "medium" | "hard" | "master"> = ["easy", "medium", "hard", "master"];
+    const i = order.indexOf((currentTierKey ?? "medium") as "easy" | "medium" | "hard" | "master");
+    return order[(Math.max(0, i) + 1) % order.length];
+  });
+  const report = project?.lastOptimization;
+  // The report is only relevant while it describes the mounted revision
+  // (a later edit/optimize makes it stale).
+  const fresh =
+    report &&
+    report.baseRevision === project?.currentRevision &&
+    (report.noop || report.revisionId === project?.currentRevision);
+  const running = busy && project?.job?.kind === "difficulty optimization";
+  const tierColor = (key: string) => TIERS.find((t) => t.key === key)?.color ?? "#087f74";
+  const label = (key: string) => TIERS.find((t) => t.key === key)?.label ?? key;
+  const delta = fresh ? report!.regionCountAfter - report!.regionCountBefore : 0;
+  return (
+    <div className="rp-wide mt-3 rounded-[10px] border border-[#dfe6d8] bg-[#f6f4ec] px-3 py-2.5">
+      <div className="flex items-center gap-1.5 text-[10px] font-semibold text-[#6c7c6b]">
+        <SplitSquareHorizontal className="size-3.5" aria-hidden />
+        Optimize gameplay difficulty
+      </div>
+      <p className="mt-1 text-[10px] leading-relaxed text-[#778481]">
+        {currentTierKey
+          ? `Current ${label(currentTierKey)} · moves regions & budgets only — the artwork itself never changes.`
+          : "Moves regions & budgets only — the artwork itself never changes."}
+      </p>
+      {/* Target tier selector (raw region numbers stay hidden by design) */}
+      <div className="mt-2 grid grid-cols-4 gap-1">
+        {TIERS.map((t) => (
+          <button
+            key={t.key}
+            type="button"
+            disabled={running}
+            onClick={() => setTier(t.key)}
+            className={`rounded-md border px-1 py-1 text-[10px] font-semibold transition-colors ${
+              tier === t.key ? "text-white" : "border-[#dfe6d8] bg-white text-[#4c5b56] hover:border-[#b9c7bd]"
+            }`}
+            style={tier === t.key ? { background: t.color, borderColor: t.color } : undefined}
+          >
+            {t.label}
+          </button>
+        ))}
+      </div>
+      <Button
+        size="sm"
+        disabled={running || !project?.currentRevision}
+        onClick={() => void optimizeDifficulty(tier).catch((e: Error) => toast(e.message))}
+        className="mt-2 h-8 w-full rounded-md bg-[#0e554e] text-[11px] font-semibold text-white hover:bg-[#0a423d] disabled:opacity-60"
+      >
+        {running ? (
+          <>
+            <Loader2 className="mr-1 size-3.5 animate-spin" aria-hidden />
+            {project?.job?.message || "Optimizing…"}
+          </>
+        ) : (
+          `Optimize to ${label(tier)}`
+        )}
+      </Button>
+      {fresh && (
+        <div className="mt-2.5 rounded-[8px] border border-[#e1e5df] bg-white px-2.5 py-2">
+          <div className="flex items-center justify-between gap-2">
+            <span className="text-[11px] font-bold" style={{ color: tierColor(report!.achieved.rating) }}>
+              {label(report!.achieved.rating)} · {report!.achieved.score}
+            </span>
+            {report!.outcome === "target-reached" ? (
+              <span className="flex items-center gap-1 text-[9px] font-semibold uppercase tracking-[0.06em] text-[#087f74]">
+                <CheckCircle2 className="size-3" aria-hidden /> Target reached
+              </span>
+            ) : report!.noop ? (
+              <span className="text-[9px] font-semibold uppercase tracking-[0.06em] text-[#778481]">No change needed</span>
+            ) : (
+              <span className="flex items-center gap-1 text-[9px] font-semibold uppercase tracking-[0.06em] text-[#957242]">
+                <AlertTriangle className="size-3" aria-hidden /> Best safe result
+              </span>
+            )}
+          </div>
+          {!report!.noop && (
+            <p className="mt-1 text-[10px] text-[#4c5b56]">
+              {delta >= 0 ? "+" : "−"}
+              {Math.abs(delta).toLocaleString("en-US")} regions ·{" "}
+              {report!.merges > 0 && `${report!.merges} merges · `}
+              {report!.splits > 0 && `${report!.splits} splits · `}
+              {Object.keys(report!.budgets ?? {}).length} object budgets set
+            </p>
+          )}
+          {report!.reverted && (
+            <p className="mt-1 text-[10px] leading-snug text-[#957242]">{report!.reverted}</p>
+          )}
+          {(report!.outcome === "best-safe-result" || report!.outcome === "safe-ceiling") &&
+            report!.reasons?.length > 0 && (
+              <ul className="mt-1.5 space-y-0.5">
+                {report!.reasons.slice(0, 4).map((reason) => (
+                  <li key={reason} className="flex gap-1 text-[10px] leading-snug text-[#778481]">
+                    <span aria-hidden>•</span>
+                    {reason}
+                  </li>
+                ))}
+              </ul>
+            )}
+          <p className="mt-1.5 flex items-center gap-1 text-[10px] font-semibold text-[#087f74]">
+            <CheckCircle2 className="size-3" aria-hidden /> Artwork unchanged
+          </p>
+          {report!.revisionId && (
+            <p className="mt-1 text-[9px] text-[#8a968f]">
+              New revision {report!.revisionId} is active — the previous one stays available in the
+              revision list (natural undo).
+            </p>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
 function NumberField({
   id,
   label,
@@ -627,6 +751,11 @@ export function RightPanel() {
       {/* Difficulty profile (contract §5) — one place, no duplication:
           the review panel, fed by the mounted bundle's manifest. */}
       {bundle && <DifficultyPanel raw={bundle.manifest.difficulty} validated={bundle.manifest.difficultyValidatedByPlaytest} />}
+
+      {/* Task 27 — Optimize gameplay toward a tier (artwork untouched) */}
+      {bundle && project?.currentRevision && (
+        <OptimizeCard currentTierKey={normalizeDifficulty(bundle.manifest.difficulty)?.tier.key ?? null} />
+      )}
 
       {/* Region inspector */}
       {view === "inspect" && bundle && (

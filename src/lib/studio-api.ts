@@ -152,6 +152,34 @@ export interface Project {
   /** Set by multi-stage SVG generation: the next Build should apply these
    *  (auto-subdivide to the requested region count). */
   pendingBuildSettings?: { auto_subdivide: boolean; target_regions: number } | null;
+  /** Task 27 — report of the last Optimize Difficulty run (also persisted in
+   *  the created revision's manifest under difficultyOptimization). */
+  lastOptimization?: OptimizationReport;
+}
+
+/** Task 27 — structured before/after of one Optimize Difficulty run. The
+ *  gameplay layer (regions/labels/object budgets) moved toward the tier;
+ *  `artworkUnchanged` is always true (the engine hard-verifies it). */
+export interface OptimizationReport {
+  requestedTier: string;
+  targetRegions: number;
+  initial: { rating: string; score: number; regionCount: number };
+  achieved: { rating: string; score: number; regionCount: number };
+  merges: number;
+  splits: number;
+  budgetsAdjusted?: number;
+  budgets?: Record<string, number>;
+  outcome: "target-reached" | "best-safe-result" | "safe-ceiling" | "already-at-target";
+  reasons: string[];
+  changed: boolean;
+  noop?: boolean;
+  reverted?: string;
+  revisionId?: string;
+  baseRevision?: string;
+  artworkUnchanged?: boolean;
+  regionCountBefore: number;
+  regionCountAfter: number;
+  [key: string]: unknown;
 }
 
 export type GenerateSource = "brief" | "reference" | "current";
@@ -409,6 +437,14 @@ export const buildDraft = (pid: string, settings: BuildSettings): Promise<{ jobI
 
 export const runEdit = (pid: string, payload: EditPayload): Promise<{ jobId: string; projectId: string }> =>
   post(`/projects/${pid}/edit`, payload);
+
+/** Task 27 — Optimize Difficulty: reshape the gameplay layer of the current
+ *  revision toward a tier (artwork stays byte-identical; a moved geometry
+ *  lands in a new immutable revision, an unchanged one is a no-op report). */
+export const optimizeDifficulty = (
+  pid: string,
+  body: { base_revision: string; tier: "easy" | "medium" | "hard" | "master" }
+): Promise<{ jobId: string; projectId: string }> => post(`/projects/${pid}/optimize`, body);
 
 export const activateRevision = (pid: string, revision: string): Promise<Project> =>
   post<Project>(`/projects/${pid}/activate`, { revision });
