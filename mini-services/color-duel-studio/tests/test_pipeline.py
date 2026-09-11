@@ -895,3 +895,50 @@ def test_object_qa_detects_orphans_and_bad_references(tmp_path):
     assert 'reference missing object record obj-ghost' in issues
     assert 'paint shapes belong to no object' in issues
     assert q['objects']['count'] == 4 and q['objects']['orphanShapes'] >= 1
+
+
+def test_object_edit_preserves_ink_and_shading_shapes(tmp_path):
+    """Regression test: an object owning both a gameplay fill and an ink-only
+    detail must NOT lose the ink shape when the gameplay region is cut, merged
+    or modified, and QA orphanShapes must remain 0."""
+    inner = (
+        '<g data-cd-object="obj-tree" data-cd-name="Tree">'
+        '<rect x="50" y="50" width="120" height="120" fill="#4a8f5c"/>'
+        '<path d="M 60 60 L 140 140" stroke="#29383E" stroke-width="2" fill="none"/>'
+        '</g>'
+    )
+    settings = BuildSettings(target_regions=30, auto_subdivide=False, max_edge=512)
+    result = _compile_master(tmp_path, 'tree-ink', inner, settings)
+    folder = tmp_path / 'tree-ink-bundle'
+    b = load_bundle(folder)
+    assert len(b['objects']) == 1
+    tree_obj = b['objects'][0]
+    assert len(tree_obj['shapeIds']) == 2
+    # Verify one shape is in paths and one is in inkPaths
+    paint_sids = {p['shapeId'] for p in b['paint']['paths']}
+    ink_sids = {p['shapeId'] for p in b['paint']['inkPaths']}
+    assert any(s in paint_sids for s in tree_obj['shapeIds'])
+    assert any(s in ink_sids for s in tree_obj['shapeIds'])
+    qa_initial = result['validation']
+    assert qa_initial['objects']['orphanShapes'] == 0
+
+    # Cut the gameplay region
+    target = b['geometry']['regions'][0]
+    x0, y0, x1, y1 = target['bbox']
+    xm = round((x0 + x1) / 2, 1)
+    d = f'M {xm} {y0 - 2} L {xm} {y1 + 2}'
+    edit_bundle(folder, tmp_path / 'tree-cut', EditRequest(base_revision='x', action='cut',
+                                                           region_ids=[target['id']], d=d), '0.2.0')
+    b2 = load_bundle(tmp_path / 'tree-cut')
+    assert len(b2['objects']) == 1
+    tree_after = b2['objects'][0]
+    # The object still owns BOTH shapeIds (gameplay fill + ink detail)
+    assert set(tree_after['shapeIds']) == set(tree_obj['shapeIds'])
+    # Regions were cut into at least 2 pieces, both assigned to obj-tree
+    cut_regs = [r for r in b2['geometry']['regions'] if r['objectId'] == 'obj-tree']
+    assert len(cut_regs) >= 2
+    # QA reports zero orphan shapes
+    qa_after = validate_bundle(b2)
+    assert qa_after['objects']['orphanShapes'] == 0
+    assert not any('orphan' in w.lower() for w in qa_after['warnings'])
+

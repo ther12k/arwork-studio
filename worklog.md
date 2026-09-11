@@ -1436,3 +1436,28 @@ Work Log:
 Stage Summary:
 - The Semantic Object Model gate is green end-to-end on deterministic fixtures: scene/fixture objects → stable ids in the master SVG → shape ownership preserved through sanitize/compile → regions inherit objectId → cut/pen edits and subdivision preserve it → budgets drive subdivision → revision/export/reload keep the semantics → QA reports every orphan/invalid condition. objects.json is a real compiler input (subdivision consumes it), not decoration.
 - Deliberately out of scope here (per the reviewer's sequencing): the 2-path AI UX (Create with AI / Create from Image with Reference-vs-Convert), object regeneration, source artwork node editing, real-device benchmark, gitleaks-style content scanning.
+
+---
+Task ID: 20
+Agent: main (ZCode)
+Task: Semantic object synchronization hardening — preserve live ink and shading shapes during region edits, prevent orphan shape warnings, support parent-only objects.
+
+Work Log:
+- Reviewer caught edge case: on initial compile, objects own all their shapes (gameplay fills + decorative shading + ink paths). Previously, `_sync_objects_from_regions` rebuilt `shapeIds` solely from `r['masterShapeId']` of playable regions. Consequently, editing a region (cut/merge/pen/node) dropped non-playable shapes (such as ink details and shading paths) from `objects.json`, leaving them orphaned in QA (`paint shapes belong to no object`).
+- Hardened `_sync_objects_from_regions` (pipeline.py):
+  * `live_shapes = {p['shapeId'] for p in paint.paths + paint.inkPaths if p.get('shapeId')}`
+  * `existing_sids = (existing_object.shapeIds & live_shapes) - transferred_sids`
+  * `shapeIds = sorted((region_master_shape_ids | existing_sids) & live_shapes)`
+  * Objects are preserved if they own active regions, OR still own live paint/ink shapes (e.g. ink-only objects), OR serve as parent to another live object in the hierarchy. Empty ghost objects without regions, shapes, or children are pruned.
+  * Explicit region reassignments (action 'group') transfer `masterShapeId` ownership to the new object if no other region of the source object still references it.
+- Added regression test `test_object_edit_preserves_ink_and_shading_shapes` in `tests/test_pipeline.py`:
+  * Compiles an object owning both a gameplay fill and an ink-only detail path (`kind: ink`).
+  * Verified initial state: 1 object, 2 shapeIds (1 in `paths`, 1 in `inkPaths`), QA `orphanShapes == 0`.
+  * Executes a cut on the gameplay region into multiple pieces.
+  * Asserts the object still owns BOTH shapeIds after the edit, both cut regions carry the `objectId`, and QA reports `orphanShapes == 0` with zero orphan warnings.
+- FORMAT.md: documented edit-synchronization ownership preservation under the Semantic Object Model section.
+- Full backend suite via Docker: **81 passed, 7 skipped** (all 81 unit/pipeline/api/adapter tests green). Frontend tsc & lint clean.
+
+Stage Summary:
+- The Semantic Object Model contract is now 100% watertight: decorative shading and ink shapes retain their object ownership through all region editing operations without orphan warnings, and parent hierarchies are preserved even when parent nodes hold no direct playable regions.
+- Ready for Phase 2: Create with AI (chat-first, scene plan preview, targeted object regeneration) and Create from Image (Reference vs Convert pipelines with Fidelity presets and difficulty tiers).

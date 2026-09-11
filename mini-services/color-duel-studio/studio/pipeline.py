@@ -416,36 +416,81 @@ def _objects_from_shapes(shapes: list) -> List[dict] | None:
 
 
 def _sync_objects_from_regions(bundle: dict) -> List[dict] | None:
-    """Reconcile object records with region truth after an edit.
+    """Reconcile object records with region truth and live paint/ink shapes after an edit.
 
-    Regions (objectId + masterShapeId) define membership; records keep the
-    authoring metadata (name/type/parentId/subdivision/generation). Objects
-    whose regions are all gone are dropped; objects referenced by regions
-    but missing a record are created. Returns None for fully unassigned art.
+    Ownership contract:
+    - Object shapeIds = (existing object's live shapeIds) | (masterShapeIds from regions for this object).
+      This ensures decorative/shading shapes and ink paths belonging to an object
+      are NOT orphaned when a region is cut, merged, or modified.
+    - If a region is explicitly reassigned to another object (e.g. 'group' action),
+      its masterShapeId moves to the new object if no other region of the old
+      object references it.
+    - Objects are kept if they have active regions/decorations, OR still own live
+      paint/ink shapes, OR are parent to another live object.
+    - Preserves authoring metadata (name, type, role, parentId, subdivision, generation).
+    - Returns None for fully unassigned art with no object records.
     """
     regions = bundle['geometry']['regions']
+    decorations = bundle['geometry'].get('decorations', [])
+    all_regs = regions + decorations
+    paint = bundle.get('paint') or {}
+    live_shapes = {p['shapeId'] for p in (paint.get('paths') or []) + (paint.get('inkPaths') or [])
+                   if p.get('shapeId')}
     existing = {o['id']: o for o in (bundle.get('objects') or [])}
     pending_names = bundle.pop('_pending_object_names', None) or {}
+
     by_obj: dict = {}
-    for r in regions:
+    for r in all_regs:
         oid = r.get('objectId') or 'unassigned'
         if oid == 'unassigned':
             continue
         by_obj.setdefault(oid, []).append(r)
-    if not by_obj:
+
+    candidate_ids = set(by_obj.keys())
+    for oid, o in existing.items():
+        if set(o.get('shapeIds') or []) & live_shapes:
+            candidate_ids.add(oid)
+
+    # Keep parent objects if any candidate references them as parentId
+    changed = True
+    while changed:
+        changed = False
+        for oid in list(candidate_ids):
+            pid = existing.get(oid, {}).get('parentId')
+            if pid and pid not in candidate_ids and pid in existing:
+                candidate_ids.add(pid)
+                changed = True
+
+    if not candidate_ids:
         return None
+
     out = []
-    for oid in sorted(by_obj):
+    for oid in sorted(candidate_ids):
         rec = dict(existing.get(oid) or {})
         rec['id'] = oid
         rec['name'] = pending_names.get(oid) or rec.get('name') or oid.replace('-', ' ').title()
-        sids = sorted({r['masterShapeId'] for r in by_obj[oid] if r.get('masterShapeId')})
-        if sids:
-            rec['shapeIds'] = sids
-        else:
-            rec.setdefault('shapeIds', [])
+
+        region_sids = {r['masterShapeId'] for r in by_obj.get(oid, []) if r.get('masterShapeId')}
+        other_region_sids = {r['masterShapeId'] for other_id, regs in by_obj.items()
+                             if other_id != oid for r in regs if r.get('masterShapeId')}
+        transferred = other_region_sids - region_sids
+        existing_sids = (set(existing.get(oid, {}).get('shapeIds') or []) & live_shapes) - transferred
+        combined_sids = sorted((region_sids | existing_sids) & live_shapes)
+        rec['shapeIds'] = combined_sids
+
+        parent = rec.get('parentId')
+        if parent and (parent not in candidate_ids or parent == oid):
+            rec.pop('parentId', None)
+
         out.append(rec)
-    return out
+
+    parent_ids = {rec['parentId'] for rec in out if rec.get('parentId')}
+    final_out = [
+        rec for rec in out
+        if rec['shapeIds'] or rec['id'] in by_obj or rec['id'] in parent_ids
+    ]
+
+    return final_out or None
 
 
 def _object_qa(bundle: dict) -> tuple:

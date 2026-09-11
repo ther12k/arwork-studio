@@ -41,6 +41,8 @@ Identity is born **in the master SVG**: `<g data-cd-object="obj-tree" data-cd-na
 
 Auto-subdivide consumes the budgets: `raw = areaShare × detailWeight × shapeCountShare`, clamped to `[minRegions, maxRegions]` (a contradictory `minRegions > maxRegions` honours maxRegions for allocation and leaves minRegions as the QA threshold), then largest-remainder normalized to the target with leftover redistributed to objects below their caps. Bundles without object groups keep the legacy global largest-first behavior.
 
+Edit synchronization (`_sync_objects_from_regions`) reconciles object records after cuts, merges, pens, or node adjustments: shape ownership is the union of existing live shapes (`paint.paths` + `paint.inkPaths`) and active region `masterShapeId`s, so decorative ink and shading shapes are never orphaned when gameplay regions are edited. Objects without playable regions are kept as long as they retain live paint/ink shapes or serve as parents to other active objects.
+
 QA (`validation.json → objects`) reports orphan shapes/regions, missing shapeIds, invalid parents, zero-geometry objects and impossible budgets as **warnings** — they never fail geometry validation.
 
 ## Difficulty profile
