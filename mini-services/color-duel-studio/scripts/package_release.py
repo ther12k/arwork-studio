@@ -9,8 +9,9 @@ and, worse, secrets. This script packs only the shippable source:
              docs/, examples/ (fixtures), requirements*.txt, compose.yaml,
              Dockerfile, README, run.py.
   EXCLUDED   workspace/ (projects, revisions, playtests, uploads),
-             __pycache__/, node_modules/, .pytest_cache/, .git/, .env*
-             (secrets), *.log, .DS_Store, tool-results/, dist/.
+             __pycache__/, node_modules/, .pytest_cache/, .git/, .env and
+             .env.local/.env.production (secrets; the .env.example template
+             ships), *.log, .DS_Store, tool-results/, dist/.
 
 Usage:  python scripts/package_release.py [output.tar.gz]
 Output: dist/color-duel-studio-<version>.tar.gz (version from studio/app.py)
@@ -71,9 +72,11 @@ def main() -> int:
                 count += 1
     print(f'{target}  ({count} files, {target.stat().st_size / 1024:.1f} KiB)')
     # Safety net: refuse to ship anything that smells like a secret.
+    # .env.example is the committed documentation template — allowed to ship.
     with tarfile.open(target) as tar:
         leaked = [n for n in tar.getnames()
-                  if n.endswith('.env') or '/.env' in n or n.endswith(('.db', '.log'))]
+                  if (n.endswith('.env') or '/.env' in n or n.endswith(('.db', '.log')))
+                  and not n.endswith('.env.example')]
     if leaked:
         target.unlink(missing_ok=True)
         print('REFUSED: secret/artifact files leaked into the archive: ' + ', '.join(leaked), file=sys.stderr)
