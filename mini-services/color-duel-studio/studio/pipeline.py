@@ -68,7 +68,10 @@ BACKENDS = [
      'notes': 'Sanitized SVG master: curves, holes, supported gradients, transforms and drawing order preserved. Never rasterized.'},
     {'id': 'pen-cut-tools', 'name': 'Pen & cut region topology tools', 'kind': 'region-topology-editing',
      'paid': False, 'available': True,
-     'notes': 'Cut a region along a drawn line and draw new pen regions on empty canvas; edges are reclassified as artwork vs subdivision.'},
+     'notes': 'Cut a region along a drawn line and draw new pen regions. Artwork pen emits a paint '
+              'path + masterShapeId and carves the regions underneath (works over fully covered '
+              'artwork); region-only pen draws gameplay-only surfaces on uncovered canvas. Edges are '
+              'reclassified as artwork vs subdivision.'},
     {'id': 'auto-subdivide', 'name': 'Deterministic organic auto-subdivide', 'kind': 'deterministic-subdivision',
      'paid': False, 'available': True,
      'notes': 'Splits oversized regions with seeded organic (sine-wiggled) cuts until the target region count; true-vector, no rasterization.'},
@@ -2299,7 +2302,7 @@ def edit_bundle(source: Path, output: Path, request, version: str):
     if any(rid not in regs for rid in chosen_ids) and request.action != 'draw':
         raise ValueError('Select existing playable regions from the current revision.')
     if request.action == 'draw' and chosen_ids:
-        raise ValueError('The pen tool takes no region selection; draw the shape over empty canvas instead.')
+        raise ValueError('The pen tool takes no region selection; just draw the shape where you need it.')
     chosen = [regs[rid] for rid in chosen_ids if rid in regs]
     # Per-action selection counts (contract addendum):
     # merge>=2, split/cut/label=1, node=2, draw=0, others>=1.
@@ -2435,9 +2438,10 @@ def edit_bundle(source: Path, output: Path, request, version: str):
             if not usable:
                 if request.paint:
                     raise ValueError('The shape would be completely hidden behind the existing artwork; '
-                                     'place it above the art or draw over empty canvas.')
-                raise ValueError('The drawn shape overlaps fully with existing regions; '
-                                 'draw over empty canvas instead.')
+                                     'place it above the art (artwork mode carves the regions underneath) '
+                                     'or draw it on uncovered canvas.')
+                raise ValueError('The drawn shape overlaps fully with existing regions; draw it on '
+                                 'uncovered canvas, or use artwork mode so the regions underneath are carved.')
             if request.paint and request.z_behind and poly.area > 0:
                 ratio = sum(p.area for p in usable) / float(poly.area)
                 if ratio < 0.25:

@@ -64,3 +64,6 @@ db/
 tool-results/
 download/
 *.pyc
+
+# exception: the env template is documentation and is tracked
+!mini-services/color-duel-studio/.env.example

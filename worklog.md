@@ -1392,3 +1392,20 @@ Work Log:
 Stage Summary:
 - The whole studio now runs from a single `docker compose up --build` at http://localhost:81 — static frontend served by Caddy, Python compiler backend and AI bridge on the internal network, project workspace persisted on the host.
 - Dependency tree and ui/ directory trimmed to what the app actually imports (40 packages and 36 source files removed); nothing reachable changed, gates and bundle green.
+
+---
+Task ID: 18
+Agent: main (ZCode)
+Task: Documentation contract alignment after the P0 verdict — remove the stale "pen = empty canvas" and "AI needs an OpenAI key" contracts, document the two deployment modes, bump CI action versions.
+
+Work Log:
+- Verdict context: reviewer closed P0.1 (pen carve over full-canvas artwork) and P0.2 (palette identity) and flagged that docs still taught the pre-fix contracts, risking a future agent "fixing" the code back to the wrong behavior.
+- pipeline.py: the pen selection-guard message no longer claims pen draws "over empty canvas"; the two behind-art / fully-covered pen errors now point at the real alternatives (artwork mode carves the regions underneath; region-only pen needs uncovered canvas); the pen-cut-tools backend 'notes' describes artwork mode (paint path + masterShapeId + carve, works over fully covered artwork) vs region-only mode.
+- Backend README: pen feature line updated to the artwork-mode / region-only-mode semantics; "Start locally" path fixed (mini-services/color-duel-studio, not the original delivery dir); "Optional AI setup" rewritten as "AI setup (two deployment modes)" — (1) bundled bridge via root compose (placeholder OPENAI_API_KEY + AI_BASE_URL=http://aibridge:8787/v1/, glm-4.6/cogview-4, no external key), (2) external OpenAI-compatible provider with a real key and provider charges (https://api.openai.com/v1/ is the AI_BASE_URL default in ai.py). gpt-5.4-mini/gpt-image-2 remain only as ai.py defaults for external mode and in docs/SOURCES.md (historical provenance, left as-is).
+- Added mini-services/color-duel-studio/.env.example (documented template for both modes; the README referenced it but the file was missing — and .gitignore's `.env*` pattern would have kept it untracked forever; added a `!` exception).
+- CI: actions/checkout@v4 → v5, actions/setup-python@v5 → v6 (clears the Node 20 deprecation annotations from run 34565432283).
+- Verification: backend suite via the Docker studio image with the updated tree mounted — 72 passed, 7 skipped (string-only changes, no test regressions).
+
+Stage Summary:
+- The repo no longer documents the pre-P0 contracts anywhere an agent or developer would read first: root README stays the authoritative overview; the backend README now covers standalone setup plus the two AI deployment modes; in-product error strings teach the carve semantics instead of the old empty-canvas rule.
+- Next up per the review roadmap (not started here): semantic object model + per-object region budgets, two-entry AI UX (Create with AI / Create from Image with Reference-vs-Convert), source artwork node editing, real-device benchmark.

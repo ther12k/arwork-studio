@@ -8,7 +8,7 @@ The compiler, editor, validation and export work **without any API key**. AI cha
 
 ## Stage-2 feature set (0.3.0)
 
-- **Cut & pen region tools**: cut one region along a drawn line (`r-c-*` pieces, subdivision edges classified by proximity) and draw new pen regions on empty canvas (`r-p-*`, masks never overlap; gameplay-only surfaces, the artist paints them later).
+- **Cut & pen region tools**: cut one region along a drawn line (`r-c-*` pieces, subdivision edges classified by proximity) and draw new pen regions (`r-p-*`). **Artwork mode** turns the shape into real finished artwork (a paint.json path with a stable `masterShapeId`) and carves the covered regions away — it works over fully covered artwork; **region-only mode** draws gameplay-only surfaces on uncovered canvas. Masks never overlap; edges are reclassified as artwork vs subdivision.
 - **Edges + boundary style**: `geometry.edges` distinguishes true artwork boundaries (solid) from artificial subdivision boundaries (light dashed); optional `boundaryStyle` overrides. Legacy bundles render unchanged.
 - **Deterministic auto-subdivide**: `auto_subdivide: true` splits oversized regions with seeded organic cuts until `target_regions` — true-vector, no rasterization (SVG-master and multi-stage builds).
 - **Difficulty analyzer**: every revision's manifest carries a deterministic `difficulty` profile (rating/score/metrics: region count, required zoom, tiny regions, label clearance, palette ambiguity, adjacency, subdivision edges).
@@ -20,7 +20,8 @@ The compiler, editor, validation and export work **without any API key**. AI cha
 Use Python 3.12 or 3.13. On Linux, install Cairo if it is not already present (`sudo apt-get install libcairo2`). On macOS, `brew install cairo` provides the native renderer. Docker is the simpler option for Windows or native-library issues.
 
 ```bash
-cd color_duel_art_studio
+# from the repository root — this backend lives in mini-services/color-duel-studio
+cd mini-services/color-duel-studio
 python -m venv .venv
 source .venv/bin/activate
 # Windows PowerShell: .venv\Scripts\Activate.ps1
@@ -40,17 +41,31 @@ Open **http://127.0.0.1:8765**. Keep this local authoring MVP private.
 
 The included compiled example has **622 playable regions, 58 fixed-detail regions, 32 palette groups, and 80 combined vector paint paths containing 15,433 color subshapes**. The requested region target was 750, not an exact output guarantee. It was compiled at 576 × 768 pixels. Exporting a larger SVG/PNG does not invent missing source detail.
 
-## Optional AI setup
+## AI setup (two deployment modes)
 
-Edit `.env`:
+The repository root README is the authoritative overview. This backend supports two ways to wire AI; without configuration the AI controls render disabled — never simulated.
+
+**1. Bundled AI bridge (repository Docker setup — the default).** The root `compose.yaml` starts this backend together with the repository's AI bridge (`../ai-bridge`, an OpenAI-compatible shim over `z-ai-web-dev-sdk`) and injects:
 
 ```dotenv
-OPENAI_API_KEY=your-own-key
-CHAT_MODEL=gpt-5.4-mini
-IMAGE_MODEL=gpt-image-2
+OPENAI_API_KEY=local-z-ai-bridge   # placeholder; only satisfies the OpenAI client contract
+AI_BASE_URL=http://aibridge:8787/v1/
+CHAT_MODEL=glm-4.6
+IMAGE_MODEL=cogview-4
 ```
 
-Restart the server. The keys stay on the server; `/api/config` exposes only a configured/not-configured flag and model names. Model names are configurable. Provider/model availability depends on your account.
+No external OpenAI key is needed; actual AI traffic goes to the local bridge.
+
+**2. External OpenAI-compatible provider (standalone backend).** Running this backend on its own, point it at any OpenAI-compatible endpoint — including `https://api.openai.com/v1/` (the default `AI_BASE_URL`), which **incurs provider charges**:
+
+```dotenv
+OPENAI_API_KEY=your-key
+AI_BASE_URL=https://api.openai.com/v1/
+CHAT_MODEL=your-chat-model
+IMAGE_MODEL=your-image-model
+```
+
+Restart the server after editing `.env`. Keys stay server-side; `/api/config` exposes only a configured/not-configured flag and model names. Provider/model availability depends on your account.
 
 **Inspiration workflow:** upload a reference, refine the brief through chat, then use **Generate from brief**. The image generator receives the brief, not the raw reference, on this path. Chat may receive the reference so it can discuss broad visual traits. This does not certify originality or copyright clearance.
 
