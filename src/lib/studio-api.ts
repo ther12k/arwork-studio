@@ -309,7 +309,7 @@ async function api<T>(
     },
   });
   if (!res.ok) {
-    let detail: unknown = null;
+    let detail: unknown;
     try {
       detail = (await res.json())?.detail;
     } catch {

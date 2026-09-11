@@ -1,0 +1,11 @@
+# The studio image must never bake in runtime state or secrets; workspace/ is
+# volume-mounted at /data by compose instead.
+workspace
+dist
+.env
+.env.*
+__pycache__
+**/__pycache__
+*.pyc
+*.log
+.pytest_cache

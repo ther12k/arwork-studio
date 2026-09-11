@@ -15,8 +15,12 @@
  */
 import ZAI from 'z-ai-web-dev-sdk';
 
-const PORT = 8787;
-const HOST = '127.0.0.1';
+// Defaults keep the loopback-only contract for local runs; the Docker/Compose
+// deployment overrides HOST=0.0.0.0 so the Caddy gateway container can route
+// XTransformPort=8787 to this service (it is never published beyond loopback
+// on the host).
+const PORT = Number(process.env.PORT ?? 8787);
+const HOST = process.env.HOST ?? '127.0.0.1';
 
 type AnyObj = Record<string, unknown>;
 type ZaiClient = Awaited<ReturnType<typeof ZAI.create>>;

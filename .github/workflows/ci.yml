@@ -2,9 +2,8 @@
 # Backend: python test suite (pipeline + API + game adapter contract) + a REAL
 # release-archive leak assertion (fails when workspace/env/log/db/pycache
 # entries ship).
-# Frontend: typecheck (strict, no emit) + lint. Full production build stays
-# local-only per the sandbox rules for now.
-# - run: bun run build  # full build gates merge later, once sandbox rules allow
+# Frontend: typecheck (strict, no emit) + lint + the full static production
+# build (vite build; cheap and sandbox-safe since the app left Next.js).
 name: ci
 
 on:
@@ -45,5 +44,7 @@ jobs:
       - run: bun install --frozen-lockfile
       - name: Typecheck (strict, no emit)
         run: bunx tsc --noEmit
-      - name: Lint (includes Next.js rules)
+      - name: Lint
         run: bun run lint
+      - name: Static production build
+        run: bun run build

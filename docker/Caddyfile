@@ -1,0 +1,31 @@
+# Docker gateway: static frontend + explicit upstreams for the two services.
+# The dev repo Caddyfile uses localhost:{query.XTransformPort}; inside the
+# compose network the upstreams are container names instead, so the port
+# query is matched explicitly.
+:81 {
+	@studio query XTransformPort=8765
+	handle @studio {
+		reverse_proxy studio:8765 {
+			header_up Host {host}
+			header_up X-Forwarded-For {remote_host}
+			header_up X-Forwarded-Proto {scheme}
+			header_up X-Real-IP {remote_host}
+		}
+	}
+
+	@aibridge query XTransformPort=8787
+	handle @aibridge {
+		reverse_proxy aibridge:8787 {
+			header_up Host {host}
+			header_up X-Forwarded-For {remote_host}
+			header_up X-Forwarded-Proto {scheme}
+			header_up X-Real-IP {remote_host}
+		}
+	}
+
+	handle {
+		root * /srv/web
+		try_files {path} /index.html
+		file_server
+	}
+}

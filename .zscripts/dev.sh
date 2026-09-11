@@ -125,20 +125,15 @@ echo "[BUN] Installing dependencies..."
 bun install
 log_step_end "bun install"
 
-log_step_start "bun run db:push"
-echo "[BUN] Setting up database..."
-bun run db:push
-log_step_end "bun run db:push"
-
-log_step_start "Starting Next.js dev server"
+log_step_start "Starting Vite dev server"
 echo "[BUN] Starting development server..."
 bun run dev &
 DEV_PID=$!
-log_step_end "Starting Next.js dev server"
+log_step_end "Starting Vite dev server"
 
-log_step_start "Waiting for Next.js dev server"
-wait_for_service "localhost" "3000" "Next.js dev server"
-log_step_end "Waiting for Next.js dev server"
+log_step_start "Waiting for Vite dev server"
+wait_for_service "localhost" "3000" "Vite dev server"
+log_step_end "Waiting for Vite dev server"
 
 log_step_start "Health check"
 echo "[BUN] Performing health check..."

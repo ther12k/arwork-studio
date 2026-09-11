@@ -1,0 +1,45 @@
+# Full local stack for the Color Duel Art Studio:
+#   gateway  — Caddy on :81 serving the static Vite build; `?XTransformPort=`
+#              routes API calls to the studio (8765) or the AI bridge (8787)
+#   studio   — Python FastAPI vector compiler backend (port 8765, internal)
+#   aibridge — bun OpenAI-compatible shim over z-ai-web-dev-sdk (8787, internal)
+#
+# Usage:
+#   docker compose up --build          # then open http://localhost:81
+#   docker compose down                # workspace/ stays on the host
+#
+# Only the gateway is published; the services stay on the internal network
+# (with optional loopback-only ports below for debugging).
+
+services:
+  gateway:
+    build: .
+    ports:
+      - "81:81"
+    depends_on:
+      - studio
+      - aibridge
+    restart: unless-stopped
+
+  studio:
+    build: mini-services/color-duel-studio
+    environment:
+      STUDIO_WORKSPACE: /data
+      OPENAI_API_KEY: local-z-ai-bridge
+      AI_BASE_URL: http://aibridge:8787/v1/
+      CHAT_MODEL: glm-4.6
+      IMAGE_MODEL: cogview-4
+    volumes:
+      - ./mini-services/color-duel-studio/workspace:/data
+    ports:
+      - "127.0.0.1:8765:8765"
+    restart: unless-stopped
+
+  aibridge:
+    build: mini-services/ai-bridge
+    environment:
+      HOST: 0.0.0.0
+      PORT: "8787"
+    ports:
+      - "127.0.0.1:8787:8787"
+    restart: unless-stopped

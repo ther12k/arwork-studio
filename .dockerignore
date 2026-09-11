@@ -1,0 +1,21 @@
+.git
+node_modules
+dist
+dev.log
+server.log
+*.log
+
+# runtime state and local artifacts — never baked into the image
+mini-services/color-duel-studio/workspace
+mini-services/color-duel-studio/dist
+db
+download
+tool-results
+upload/extracted
+.env
+.env.*
+**/__pycache__
+**/*.pyc
+.pytest_cache
+playwright-report
+test-results
