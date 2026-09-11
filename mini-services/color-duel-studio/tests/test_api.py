@@ -1162,6 +1162,7 @@ def test_optimize_creates_revision_with_artwork_frozen(client):
     assert manifest['difficultyOptimization']['initial']['regionCount'] == len(before['regions'])
     assert manifest['difficultyOptimization']['achieved']['regionCount'] == len(regions2)
     assert manifest['difficultyOptimization']['artworkUnchanged'] is True
+    assert manifest['difficultyOptimization']['revisionId'] == rev2
     # objects.shapeIds unchanged (objects.json may gain preferredRegions)
     o1 = {o['id']: o.get('shapeIds', []) for o in (client.get(base + '/files/objects.json').json().get('objects') or [])}
     o2 = {o['id']: o.get('shapeIds', []) for o in (client.get(base2 + '/files/objects.json').json().get('objects') or [])}

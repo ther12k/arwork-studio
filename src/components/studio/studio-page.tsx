@@ -6,6 +6,7 @@ import { Sparkles } from "lucide-react";
 
 import { GuideDialog } from "./guide-dialog";
 import { CanvasWorkspace } from "./canvas-workspace";
+import { CreateArtwork } from "./create-artwork";
 import { LeftPanel } from "./left-panel";
 import { RightPanel } from "./right-panel";
 import { useStudioContext, StudioProvider } from "./use-studio";
@@ -65,6 +66,15 @@ function Footer() {
   );
 }
 
+/** Task 28 — the center workspace switches between Create mode (artwork-less
+ *  project or a resumed generation session) and Editor mode. The shell —
+ *  header, project selector, side panels — stays stable so the transition
+ *  Create → Generate → Commit → Editor feels like one app. */
+function Workspace() {
+  const { centerView } = useStudioContext();
+  return centerView === "create" ? <CreateArtwork /> : <CanvasWorkspace />;
+}
+
 export function StudioPage() {
   return (
     <StudioProvider>
@@ -72,7 +82,7 @@ export function StudioPage() {
         <Header />
         <main className="studio-main w-full flex-1">
           <LeftPanel />
-          <CanvasWorkspace />
+          <Workspace />
           <RightPanel />
         </main>
         <Footer />

@@ -365,6 +365,47 @@ export const listProjects = (): Promise<Project[]> => api<Project[]>("/projects"
 
 export const getProject = (pid: string): Promise<Project> => api<Project>(`/projects/${pid}`);
 
+// --- Generation sessions (Task 28 shells; Tasks 29/30 fill the workspaces) ---
+
+export type SessionMode = "ai_chat" | "image_reference" | "image_convert";
+export type SessionTier = "easy" | "medium" | "hard" | "master";
+
+/** Transactional generation session (draft until committed; the artwork is
+ *  only touched at commit). Sessions are FREE to create — no AI call happens
+ *  until an explicit paid step is confirmed inside the workspace. */
+export interface GenerationSession {
+  id: string;
+  mode: SessionMode;
+  status: "draft_plan" | "generating" | "compiling" | "ready_to_commit" | "committed" | "failed" | "canceled";
+  requestedDifficulty: SessionTier;
+  targetRegions?: number;
+  fidelity?: string;
+  prompt?: string;
+  aspect?: string;
+  error?: string | null;
+  meta?: Record<string, unknown>;
+  createdAt?: string;
+  updatedAt?: string;
+  [key: string]: unknown;
+}
+
+export const listGenerationSessions = (pid: string): Promise<{ sessions: GenerationSession[] }> =>
+  api<{ sessions: GenerationSession[] }>(`/projects/${pid}/generation/sessions`);
+
+export const createGenerationSession = (
+  pid: string,
+  body: {
+    mode: SessionMode;
+    requested_difficulty: SessionTier;
+    prompt?: string;
+    aspect?: "1024x1536" | "1536x1024" | "1024x1024";
+    fidelity?: "stylized" | "balanced" | "faithful";
+  }
+): Promise<GenerationSession> => post(`/projects/${pid}/generation/sessions`, body);
+
+export const discardGenerationSession = (pid: string, sid: string): Promise<unknown> =>
+  api(`/projects/${pid}/generation/sessions/${sid}`, { method: "DELETE" });
+
 export const createProject = (title: string, brief?: string): Promise<Project> =>
   post<Project>("/projects", { title, ...(brief ? { brief } : {}) });
 

@@ -321,6 +321,8 @@ export function CanvasWorkspace() {
     zoomIn,
     zoomOut,
     fit,
+    activeSession,
+    resumeCreationSession,
   } = studio;
   const aiConfigured = studio.config?.ai.configured ?? false;
   const hasMaster = !!project?.master;
@@ -819,6 +821,29 @@ export function CanvasWorkspace() {
           {revision ? `v${revision.version} · ${revision.kind}` : "No revision yet"}
         </div>
       </div>
+
+      {/* Task 28 — an active generation session never disappears behind the
+          editor: resume it any time (the session workspace opens on top). */}
+      {activeSession && (
+        <div className="mb-4 flex flex-wrap items-center justify-between gap-2 rounded-xl border border-[#cce7dc] bg-[#edf6f2] px-3.5 py-2.5">
+          <span className="flex items-center gap-2 text-[11px] font-semibold text-[#126e5e]">
+            <Waypoints className="size-4 shrink-0" aria-hidden />
+            {activeSession.mode === "ai_chat"
+              ? "Create-with-AI session"
+              : activeSession.mode === "image_reference"
+                ? "Reference session"
+                : "Convert session"}{" "}
+            in progress — resume the creation flow any time.
+          </span>
+          <Button
+            size="sm"
+            className="h-8 rounded-md bg-[#0e554e] text-[10px] font-semibold text-white hover:bg-[#0a423d]"
+            onClick={resumeCreationSession}
+          >
+            Resume
+          </Button>
+        </div>
+      )}
 
       {/* Brief box */}
       <div className="rounded-xl border border-[#e1e5df] bg-white/70 p-3.5">

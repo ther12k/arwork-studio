@@ -384,6 +384,7 @@ def create_app(workspace: Path|None=None, transport=None):
             m['version']=version;g['artworkVersion']=version
             m.pop('review',None)
             m['provenance']['lastEdit']='optimize-difficulty'
+            report['revisionId']=rev
             m['difficultyOptimization']=report
             groups=defaultdict(list)
             for r in g['regions']:
@@ -396,7 +397,6 @@ def create_app(workspace: Path|None=None, transport=None):
                 if (src/f).is_file():shutil.copy2(src/f,out/f)
             tick(.8,'Validating the optimized geometry')
             qa=emit_bundle(out,bundle)
-            report['revisionId']=rev
             return {'revision':{'id':rev,'version':version,'createdAt':now(),'kind':'optimize-difficulty',
                 'sourceHash':p['master']['sha256'] if p.get('master') else None,
                 'regionCount':m['regionCount'],'qa':qa,

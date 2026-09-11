@@ -19,6 +19,8 @@ import {
   activateRevision,
   buildDraft,
   createProject,
+  createGenerationSession,
+  discardGenerationSession,
   generateMaster,
   generateSvgMaster,
   getConfig,
@@ -26,6 +28,7 @@ import {
   listProjects,
   loadSample,
   loadSvgSample,
+  listGenerationSessions,
   patchProject,
   promoteReference as promoteReferenceApi,
   recordPlaytest as apiRecordPlaytest,
@@ -39,10 +42,12 @@ import {
   type EditAction,
   type EditPayload,
   type GenerateSource,
+  type GenerationSession,
   type ImageQuality,
   type PlaytestRecordBody,
   type Project,
   type Revision,
+  type SessionTier,
   type StudioConfig,
 } from "@/lib/studio-api";
 
@@ -180,6 +185,28 @@ export interface StudioApi {
   /** Task 27 — Optimize Difficulty: gameplay-only move toward a tier on the
    *  current revision (new immutable revision; artwork stays untouched). */
   optimizeDifficulty: (tier: "easy" | "medium" | "hard" | "master") => Promise<void>;
+  // Task 28 — creation flow (landing + shells; Tasks 29/30 fill the workspaces)
+  /** Which creation shell is open (null = landing). */
+  creationMode: "ai" | "image" | null;
+  /** Latest resumable generation session (null when none / unavailable). */
+  activeSession: GenerationSession | null;
+  /** "create" while the project has no artwork or the flow is resumed over the editor. */
+  centerView: "editor" | "create";
+  setCreationFlow: (mode: "ai" | "image" | null) => void;
+  startAiCreation: (
+    prompt: string,
+    tier: SessionTier,
+    aspect: "1024x1536" | "1536x1024" | "1024x1024"
+  ) => Promise<void>;
+  startImageCreation: (
+    path: "reference" | "convert",
+    tier: SessionTier,
+    fidelity: "stylized" | "balanced" | "faithful",
+    file?: File
+  ) => Promise<void>;
+  discardActiveSession: () => Promise<void>;
+  resumeCreationSession: () => void;
+  closeCreateWorkspace: () => void;
   clearSelection: () => void;
   startPlacing: () => void;
   /** Select a single region by id, switch to the board view and zoom to it (QA drill-down). */
@@ -245,6 +272,12 @@ export function StudioProvider({ children }: { children: React.ReactNode }) {
   const [freeColor, setFreeColor] = useState("#66AA33");
   const [recentColors, setRecentColors] = useState<string[]>([]);
   const [boardMode, setBoardMode] = useState<BoardMode>("number");
+  // Task 28 — creation flow: which shell is open and the project's latest
+  // un-committed generation session (restored across refreshes so an active
+  // session is never "lost" just because the page reloaded).
+  const [creationMode, setCreationMode] = useState<"ai" | "image" | null>(null);
+  const [activeSession, setActiveSession] = useState<GenerationSession | null>(null);
+  const [showCreateWorkspace, setShowCreateWorkspace] = useState(false);
 
   // refs mirroring state for closures created once
   const projectRef = useRef<Project | null>(null);
@@ -304,6 +337,13 @@ export function StudioProvider({ children }: { children: React.ReactNode }) {
 
   const busy = isBusyProject(project);
   const revision = project?.revisions.find((r) => r.id === project.currentRevision) ?? null;
+  // Task 28 — workspace routing: artwork (a revision or an imported master)
+  // opens the editor; an empty project opens the Create Artwork flow (the
+  // landing while no session exists, the session shell once one does). The
+  // override lets the editor's resume banner re-open a session workspace on
+  // top of the editor without losing either side.
+  const hasArtwork = !!(project?.currentRevision || project?.master);
+  const centerView: "editor" | "create" = showCreateWorkspace || !hasArtwork ? "create" : "editor";
   const selectionInfo = selected.size
     ? `${selected.size} selected · ${[...selected].slice(0, 4).join(", ")}${selected.size > 4 ? "…" : ""}`
     : "Tap regions to inspect or select them. Drag to pan.";
@@ -350,6 +390,21 @@ export function StudioProvider({ children }: { children: React.ReactNode }) {
     const items = await listProjects();
     setProjects(items);
     return items;
+  }, []);
+
+  /** Task 28 — latest resumable generation session of the project (committed
+   *  and canceled sessions are history, not active work). Degrades to null
+   *  silently: the landing/shell must render even without session access. */
+  const refreshSessions = useCallback(async (pid: string): Promise<GenerationSession | null> => {
+    try {
+      const { sessions } = await listGenerationSessions(pid);
+      const active =
+        sessions.find((s) => !["committed", "canceled"].includes(s.status)) ?? null;
+      setActiveSession(active);
+      return active;
+    } catch {
+      return null;
+    }
   }, []);
 
   /** Pure DOM update — selection text is derived during render from `selected`. */
@@ -589,6 +644,9 @@ export function StudioProvider({ children }: { children: React.ReactNode }) {
       syncFields(p);
       setChatInput("");
       setPaidConsent(false);
+      setCreationMode(null);
+      setShowCreateWorkspace(false);
+      setActiveSession(null);
       viewRef.current = p.currentRevision ? "colored" : "master";
       setView(viewRef.current);
       try {
@@ -597,10 +655,11 @@ export function StudioProvider({ children }: { children: React.ReactNode }) {
         /* storage unavailable */
       }
       await refreshList();
+      void refreshSessions(p.id);
       if (p.currentRevision) await mountBoard();
       if (isBusyProject(p)) void poll(p.id);
     },
-    [clearBoard, mountBoard, poll, refreshList, setProjectSync, syncFields]
+    [clearBoard, mountBoard, poll, refreshList, refreshSessions, setProjectSync, syncFields]
   );
 
   const ensureProject = useCallback(async () => {
@@ -831,6 +890,89 @@ export function StudioProvider({ children }: { children: React.ReactNode }) {
     },
     [job]
   );
+
+  // ------------------------------------------------- creation flow (Task 28)
+
+  /** Open one of the creation shells (or null → back to the landing). */
+  const setCreationFlow = useCallback((mode: "ai" | "image" | null) => {
+    setCreationMode(mode);
+    if (mode) setShowCreateWorkspace(true);
+  }, []);
+
+  /** Create with AI: creates a REAL generation session (free — no AI call
+   *  happens until a paid step is explicitly confirmed inside the upcoming
+   *  workspace) and stores the prompt as the project brief. */
+  const startAiCreation = useCallback(
+    async (
+      prompt: string,
+      tier: SessionTier,
+      aspect: "1024x1536" | "1536x1024" | "1024x1024"
+    ) => {
+      const p = await ensureProject();
+      briefRef.current = prompt;
+      setBriefInput(prompt);
+      await saveBrief();
+      await createGenerationSession(p.id, { mode: "ai_chat", requested_difficulty: tier, prompt, aspect });
+      await refreshSessions(p.id);
+      setCreationMode("ai");
+      setShowCreateWorkspace(true);
+    },
+    [ensureProject, refreshSessions, saveBrief]
+  );
+
+  /** Create from Image: stores the image as the project reference when the
+   *  path needs one (free), then creates the matching session. The paid
+   *  planning/conversion steps are NOT called here. */
+  const startImageCreation = useCallback(
+    async (
+      path: "reference" | "convert",
+      tier: SessionTier,
+      fidelity: "stylized" | "balanced" | "faithful",
+      file?: File
+    ) => {
+      if (file && path === "reference") await uploadFile(file, "reference");
+      const p = projectRef.current ?? (await ensureProject());
+      await createGenerationSession(p.id, {
+        mode: path === "reference" ? "image_reference" : "image_convert",
+        requested_difficulty: tier,
+        fidelity,
+      });
+      await refreshSessions(p.id);
+      setCreationMode("image");
+      setShowCreateWorkspace(true);
+    },
+    [ensureProject, refreshSessions, uploadFile]
+  );
+
+  /** Start over: discard the draft session entirely (nothing was generated,
+   *  no revision exists — the artwork is untouched by definition). */
+  const discardActiveSession = useCallback(async () => {
+    const p = projectRef.current;
+    const s = activeSession;
+    if (!p || !s) return;
+    await discardGenerationSession(p.id, s.id);
+    const next = await refreshSessions(p.id);
+    if (!next) {
+      setCreationMode(null);
+      if (!projectRef.current?.currentRevision && !projectRef.current?.master) {
+        setShowCreateWorkspace(false);
+      }
+    }
+  }, [activeSession, refreshSessions]);
+
+  /** Re-open the active session's shell (editor resume banner). */
+  const resumeCreationSession = useCallback(() => {
+    if (!activeSession) return;
+    setCreationMode(activeSession.mode === "ai_chat" ? "ai" : "image");
+    setShowCreateWorkspace(true);
+  }, [activeSession]);
+
+  /** Leave the creation workspace (back to the editor when artwork exists,
+   *  back to the landing when the project is still empty and session-less). */
+  const closeCreateWorkspace = useCallback(() => {
+    setShowCreateWorkspace(false);
+    if (!activeSession) setCreationMode(null);
+  }, [activeSession]);
 
   const clearSelection = useCallback(() => {
     selectedRef.current = new Set();
@@ -1134,6 +1276,15 @@ export function StudioProvider({ children }: { children: React.ReactNode }) {
     build,
     runEdit,
     optimizeDifficulty,
+    creationMode,
+    activeSession,
+    centerView,
+    setCreationFlow,
+    startAiCreation,
+    startImageCreation,
+    discardActiveSession,
+    resumeCreationSession,
+    closeCreateWorkspace,
     clearSelection,
     startPlacing,
     inspectRegion,
