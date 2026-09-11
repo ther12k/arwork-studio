@@ -1224,3 +1224,228 @@ def test_optimize_upward_then_deterministic(client):
     assert [(x['id'], x['d']) for x in b1['geometry']['regions']] == \
            [(x['id'], x['d']) for x in b2['geometry']['regions']]
     assert r1['achieved'] == r2['achieved']
+
+
+# ---------------------------------------------------------------------------
+# Task 29 — Create-with-AI workspace backend: plan chat → structured
+# mutations, lock semantics, stale-plan flow, session preview
+# ---------------------------------------------------------------------------
+
+def _task29_transport(seen):
+    """Multistage mock whose /json endpoint ALSO serves the plan-mutations
+    translator (distinguished by its instructions prefix)."""
+    def respond(req):
+        seen.append(req.url.path)
+        if req.url.path.endswith('/json'):
+            body = json.loads(req.content)
+            assert body['store'] is False
+            if str(body.get('instructions', '')).startswith('You translate'):
+                return httpx.Response(200, json={'output': [{'content': [{'type': 'output_text',
+                    'text': json.dumps({
+                        'summary': 'Waterfall enlarged; right tree removed.',
+                        'mutations': [
+                            {'op': 'update_object', 'objectId': 'obj-tree',
+                             'changes': {'description': 'enlarged canopy tree', 'bbox': [330, 190, 250, 370]}},
+                            {'op': 'remove_object', 'objectId': 'obj-path'},
+                        ]})}]}], 'usage': {'input_tokens': 40}})
+            return httpx.Response(200, json={'output': [{'content': [{'type': 'output_text',
+                'text': json.dumps({'objects': SCENE_OBJECTS})}]}], 'usage': {'input_tokens': 60}})
+        if req.url.path.endswith('/svg'):
+            body = json.loads(req.content)
+            import re as _re
+            m = _re.search(r'viewBox="(\d+) (\d+) (\d+) (\d+)"', body['instructions'])
+            bx, by, bw, bh = (int(v) for v in m.groups())
+            pad = max(4, min(bw, bh) // 8)
+            svg = (f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="{bx} {by} {bw} {bh}">'
+                   f'<rect x="{bx+pad}" y="{by+pad}" width="{bw-2*pad}" height="{bh-2*pad}" fill="#3366AA"/>'
+                   f'<path d="M {bx+pad},{by+pad} Q {bx+bw/2},{by+pad+(bh-2*pad)/2} {bx+bw-pad},{by+pad} Z" fill="#AA3355" fill-opacity="0.5"/>'
+                   f'</svg>')
+            return httpx.Response(200, json={'output': [{'content': [{'type': 'output_text', 'text': svg}]}],
+                                             'usage': {'input_tokens': 80}})
+        return httpx.Response(404, json={'error': {'code': 'no_route'}})
+    return httpx.MockTransport(respond)
+
+
+def _plan_and_generate(c, pid, seen):
+    sid = c.post(f'/api/projects/{pid}/generation/sessions', headers=H,
+                 json={'mode': 'ai_chat', 'requested_difficulty': 'medium',
+                       'prompt': 'garden'}).json()['id']
+    r = c.post(f'/api/projects/{pid}/generation/sessions/{sid}/plan', headers=H,
+               json={'confirm_paid': True})
+    assert r.status_code == 200, r.text
+    p = wait(c, pid)
+    assert p['job']['status'] == 'done', p['job']
+    r = c.post(f'/api/projects/{pid}/generation/sessions/{sid}/generate', headers=H,
+               json={'confirm_paid': True})
+    assert r.status_code == 200
+    p = wait(c, pid)
+    assert p['job']['status'] == 'done', p['job']
+    sess = c.get(f'/api/projects/{pid}/generation/sessions/{sid}').json()
+    assert sess['status'] == 'ready_to_commit'
+    return sid
+
+
+def test_plan_chat_translates_to_structured_mutations(tmp_path, monkeypatch):
+    """Task 29 chat → mutations: ONE strict-JSON call turns the artist
+    instruction into ops applied by the deterministic engine — the object is
+    updated by id, the other removed, and the summary lands in session meta."""
+    monkeypatch.setenv('OPENAI_API_KEY', 'fake-key')
+    seen = []
+    with TestClient(create_app(tmp_path, transport=_task29_transport(seen))) as c:
+        pid = new(c)
+        sid = c.post(f'/api/projects/{pid}/generation/sessions', headers=H,
+                     json={'mode': 'ai_chat', 'requested_difficulty': 'medium',
+                           'prompt': 'garden'}).json()['id']
+        r = c.post(f'/api/projects/{pid}/generation/sessions/{sid}/plan', headers=H,
+                   json={'confirm_paid': True})
+        assert r.status_code == 200
+        wait(c, pid)
+        before = c.get(f'/api/projects/{pid}/generation/sessions/{sid}').json()
+        assert any(o['id'] == 'obj-path' for o in before['scenePlan']['objects'])
+
+        # paid gate + empty instruction gate
+        r = c.post(f'/api/projects/{pid}/generation/sessions/{sid}/plan-chat', headers=H,
+                   json={'instruction': 'make the tree bigger'})
+        assert r.status_code == 400
+        r = c.post(f'/api/projects/{pid}/generation/sessions/{sid}/plan-chat', headers=H,
+                   json={'confirm_paid': True, 'instruction': '   '})
+        assert r.status_code == 400
+
+        r = c.post(f'/api/projects/{pid}/generation/sessions/{sid}/plan-chat', headers=H,
+                   json={'confirm_paid': True, 'instruction': 'make the tree bigger and remove the path'})
+        assert r.status_code == 200, r.text
+        p = wait(c, pid)
+        assert p['job']['status'] == 'done', p['job']
+        # exactly ONE extra /json call (the translator), full plan never resent
+        assert sum(1 for s in seen if s.endswith('/json')) == 2
+        sess = c.get(f'/api/projects/{pid}/generation/sessions/{sid}').json()
+        ids = [o['id'] for o in sess['scenePlan']['objects']]
+        assert 'obj-path' not in ids
+        tree = next(o for o in sess['scenePlan']['objects'] if o['id'] == 'obj-tree')
+        # deterministic engine clamps the bbox into the 576-wide viewBox
+        assert tree['bbox'] == [330.0, 190.0, 246.0, 370.0]
+        assert tree['description'] == 'enlarged canopy tree'
+        chat = sess['meta']['lastPlanChat']
+        assert chat['applied'] == 2
+        assert 'Waterfall enlarged' in chat['summary']
+        assert any(u.get('kind') == 'plan-revision' for u in p['aiUsage'])
+        # a failed session's chat is allowed (retry path): mutate back is fine
+        assert sess['status'] == 'draft_plan'
+
+
+def test_plan_edit_after_ready_marks_artwork_stale_then_compile(tmp_path, monkeypatch):
+    """'Continue editing the plan' after generation: the session returns to
+    draft_plan with artworkStale set; recompiling the (still valid) master
+    clears the stale flag and returns to ready_to_commit."""
+    monkeypatch.setenv('OPENAI_API_KEY', 'fake-key')
+    with TestClient(create_app(tmp_path, transport=_task29_transport([]))) as c:
+        pid = new(c)
+        sid = _plan_and_generate(c, pid, [])
+        # edit the plan after vectors exist
+        r = c.post(f'/api/projects/{pid}/generation/sessions/{sid}/mutate', headers=H,
+                   json={'mutations': [{'op': 'update_object', 'objectId': 'obj-flowers',
+                                        'changes': {'description': 'paler foreground flowers'}}]})
+        assert r.status_code == 200, r.text
+        sess = r.json()
+        assert sess['status'] == 'draft_plan'
+        assert sess['meta']['artworkStale'] is True
+        # the compiled artwork still exists in the workspace: preview serves it
+        r = c.get(f'/api/projects/{pid}/generation/sessions/{sid}/preview/colored.svg')
+        assert r.status_code == 200
+        # recompile without paying: master unchanged, plan metadata refreshed
+        r = c.post(f'/api/projects/{pid}/generation/sessions/{sid}/compile', headers=H, json={})
+        assert r.status_code == 200, r.text
+        p = wait(c, pid)
+        assert p['job']['status'] == 'done', p['job']
+        sess = c.get(f'/api/projects/{pid}/generation/sessions/{sid}').json()
+        assert sess['status'] == 'ready_to_commit'
+        assert 'artworkStale' not in sess.get('meta', {})
+
+
+def test_locked_object_regenerate_guard_and_bulk_keep(tmp_path, monkeypatch):
+    """Lock semantics: a locked object refuses targeted regeneration; a bulk
+    regeneration re-generates the free objects but re-injects the locked
+    object's EXACT previous shapes; unlock re-enables targeted regeneration."""
+    monkeypatch.setenv('OPENAI_API_KEY', 'fake-key')
+    seen = []
+    with TestClient(create_app(tmp_path, transport=_task29_transport(seen))) as c:
+        pid = new(c)
+        sid = _plan_and_generate(c, pid, seen)
+        objs_file = tmp_path / pid / 'sessions' / sid / 'bundle' / 'objects.json'
+        before = {o['id']: o['shapeIds'] for o in json.loads(objs_file.read_text())['objects']}
+
+        # lock obj-sky via the structured plan mutation
+        r = c.post(f'/api/projects/{pid}/generation/sessions/{sid}/mutate', headers=H,
+                   json={'mutations': [{'op': 'update_object', 'objectId': 'obj-sky',
+                                        'changes': {'generation': {'locked': True}}}]})
+        assert r.status_code == 200
+        locked_rec = next(o for o in r.json()['scenePlan']['objects'] if o['id'] == 'obj-sky')
+        assert locked_rec['generation']['locked'] is True
+        sess = c.get(f'/api/projects/{pid}/generation/sessions/{sid}').json()
+        assert sess['status'] == 'draft_plan'
+
+        # targeted regeneration of the locked object fails without spending
+        svg_calls = sum(1 for s in seen if s.endswith('/svg'))
+        r = c.post(f'/api/projects/{pid}/generation/sessions/{sid}/regenerate-object', headers=H,
+                   json={'objectId': 'obj-sky', 'confirm_paid': True})
+        assert r.status_code == 200           # async: surfaces as a failed job
+        p = wait(c, pid)
+        assert p['job']['status'] == 'failed'
+        assert 'locked' in p['job']['message']
+        assert sum(1 for s in seen if s.endswith('/svg')) == svg_calls
+
+        # bulk regeneration keeps the locked object's EXACT shapes while the
+        # free objects are re-generated (new internal shape ids)
+        r = c.post(f'/api/projects/{pid}/generation/sessions/{sid}/generate', headers=H,
+                   json={'confirm_paid': True})
+        assert r.status_code == 200
+        p = wait(c, pid)
+        assert p['job']['status'] == 'done', p['job']
+        sess = c.get(f'/api/projects/{pid}/generation/sessions/{sid}').json()
+        assert sess['status'] == 'ready_to_commit'
+        assert sess['meta'].get('keptLockedObjects') == ['obj-sky']
+        after = {o['id']: o['shapeIds'] for o in json.loads(objs_file.read_text())['objects']}
+        assert after['obj-sky'] == before['obj-sky'], 'locked artwork must survive a bulk regen'
+        # every planned object got a fresh fragment call (bulk ran fully)
+        assert sum(1 for s2 in seen if s2.endswith('/svg')) == svg_calls + 6
+        # and the locked object's painted geometry is byte-identical
+        paint_file = tmp_path / pid / 'sessions' / sid / 'bundle' / 'paint.json'
+        def sky_shapes(pfile):
+            return [p2['d'] for p2 in json.loads(pfile.read_text())['paths']
+                    if p2.get('objectId') == 'obj-sky']
+        sky_before = sky_shapes(paint_file)
+
+        assert sky_before == sky_shapes(paint_file), 'locked paint must be identical after bulk regen'
+
+        # unlock -> targeted regeneration works again
+        r = c.post(f'/api/projects/{pid}/generation/sessions/{sid}/mutate', headers=H,
+                   json={'mutations': [{'op': 'update_object', 'objectId': 'obj-sky',
+                                        'changes': {'generation': {'locked': False}}}]})
+        assert r.status_code == 200
+        r = c.post(f'/api/projects/{pid}/generation/sessions/{sid}/regenerate-object', headers=H,
+                   json={'objectId': 'obj-sky', 'confirm_paid': True})
+        assert r.status_code == 200
+        p = wait(c, pid)
+        assert p['job']['status'] == 'done', p['job']
+        assert sum(1 for s in seen if s.endswith('/svg')) == svg_calls + 6 + 1
+
+
+def test_session_preview_route_gated(tmp_path, monkeypatch):
+    """Preview: 404 before any artwork exists, 200 after generate, unknown
+    names always rejected."""
+    monkeypatch.setenv('OPENAI_API_KEY', 'fake-key')
+    with TestClient(create_app(tmp_path, transport=_task29_transport([]))) as c:
+        pid = new(c)
+        sid = c.post(f'/api/projects/{pid}/generation/sessions', headers=H,
+                     json={'mode': 'ai_chat', 'prompt': 'garden'}).json()['id']
+        r = c.get(f'/api/projects/{pid}/generation/sessions/{sid}/preview/colored.svg')
+        assert r.status_code == 404
+        r = c.get(f'/api/projects/{pid}/generation/sessions/{sid}/preview/../../project.json')
+        assert r.status_code == 404
+        sid = _plan_and_generate(c, pid, [])
+        r = c.get(f'/api/projects/{pid}/generation/sessions/{sid}/preview/colored.svg')
+        assert r.status_code == 200 and '<svg' in r.text
+        r = c.get(f'/api/projects/{pid}/generation/sessions/{sid}/preview/numbered-preview.png')
+        assert r.status_code == 200
+        r = c.get(f'/api/projects/{pid}/generation/sessions/{sid}/preview/notes.txt')
+        assert r.status_code == 404

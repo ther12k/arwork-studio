@@ -406,6 +406,85 @@ export const createGenerationSession = (
 export const discardGenerationSession = (pid: string, sid: string): Promise<unknown> =>
   api(`/projects/${pid}/generation/sessions/${sid}`, { method: "DELETE" });
 
+// --- Task 29 — Create-with-AI session steps (paid steps require confirm_paid
+// and run as async jobs; the session itself is re-read after each job) ---
+
+export interface ScenePlanObject {
+  id: string;
+  name: string;
+  description: string;
+  role: "background" | "midground" | "foreground" | "subject" | "accent" | string;
+  z: number;
+  bbox: number[];
+  fills: string[];
+  detailWeight: number;
+  parentId?: string;
+  subdivision?: Record<string, unknown>;
+  generation?: { locked?: boolean; prompt?: string; provider?: string } & Record<string, unknown>;
+}
+
+export interface ScenePlan {
+  schemaVersion: number;
+  title: string;
+  description?: string;
+  requestedDifficulty: SessionTier;
+  targetRegionRange: [number, number];
+  targetRegions: number;
+  objects: ScenePlanObject[];
+  viewBox: number[];
+  aspect?: string;
+}
+
+export interface GenerationSessionFull extends GenerationSession {
+  scenePlan?: ScenePlan;
+  meta?: {
+    planUsage?: Record<string, unknown>;
+    lastPlanChat?: { instruction: string; summary: string; applied: number; mutations?: unknown[] };
+    generationStages?: Record<string, unknown>;
+    keptLockedObjects?: string[];
+    artworkStale?: boolean;
+    qa?: QaReport;
+    measuredDifficulty?: { rating: string; score: number; metrics: Record<string, unknown> };
+    regionCount?: number;
+    [key: string]: unknown;
+  };
+}
+
+export const planSession = (pid: string, sid: string, confirm_paid: boolean): Promise<{ jobId: string }> =>
+  post(`/projects/${pid}/generation/sessions/${sid}/plan`, { confirm_paid });
+
+export const planChatSession = (
+  pid: string,
+  sid: string,
+  instruction: string,
+  confirm_paid: boolean
+): Promise<{ jobId: string }> => post(`/projects/${pid}/generation/sessions/${sid}/plan-chat`, { instruction, confirm_paid });
+
+export const mutateSessionPlan = (pid: string, sid: string, mutations: unknown[]): Promise<GenerationSessionFull> =>
+  post(`/projects/${pid}/generation/sessions/${sid}/mutate`, { mutations });
+
+export const generateSessionArtwork = (pid: string, sid: string, confirm_paid: boolean): Promise<{ jobId: string }> =>
+  post(`/projects/${pid}/generation/sessions/${sid}/generate`, { confirm_paid });
+
+export const regenerateSessionObject = (
+  pid: string,
+  sid: string,
+  objectId: string,
+  instructions: string,
+  confirm_paid: boolean
+): Promise<{ jobId: string }> =>
+  post(`/projects/${pid}/generation/sessions/${sid}/regenerate-object`, { objectId, instructions, confirm_paid });
+
+export const compileSession = (pid: string, sid: string): Promise<{ jobId: string }> =>
+  post(`/projects/${pid}/generation/sessions/${sid}/compile`, {});
+
+export const commitSessionArtwork = (pid: string, sid: string, title?: string): Promise<{ revision: Revision }> =>
+  post(`/projects/${pid}/generation/sessions/${sid}/commit`, { title });
+
+/** Read-only preview of the session's compiled artwork (review stage). */
+export const sessionPreviewUrl = (pid: string, sid: string, name: "colored.svg" | "numbered.svg" | "colored-preview.png" | "numbered-preview.png"): string =>
+  studioUrl(`/projects/${pid}/generation/sessions/${sid}/preview/${name}`);
+
 export const createProject = (title: string, brief?: string): Promise<Project> =>
   post<Project>("/projects", { title, ...(brief ? { brief } : {}) });
 

@@ -236,6 +236,62 @@ class Provider:
             raise ValueError('The scene plan was not usable JSON. Nothing was saved; retry explicitly if you want to spend again.')
         return objects, data.get('usage',{})
 
+    def plan_mutations(self, plan: dict, instruction: str):
+        """Task 29 — translate one artist instruction into structured
+        ScenePlan mutations (strict JSON). The DETERMINISTIC mutation engine
+        (generation.apply_scene_mutations) stays the only writer of the plan:
+        this call returns ops + a human summary, nothing is applied here."""
+        objects = plan.get('objects') or []
+        compact = [{'id': o['id'], 'name': o['name'], 'role': o['role'], 'z': o['z'],
+                    'bbox': o['bbox'], 'detailWeight': o.get('detailWeight', 1.0),
+                    'description': o.get('description', '')[:120]}
+                   for o in objects]
+        vw, vh = plan['viewBox'][2], plan['viewBox'][3]
+        instructions = (
+            'You translate an ARTIST INSTRUCTION into structured ScenePlan mutations.\n'
+            f'Canvas viewBox: "0 0 {int(vw)} {int(vh)}" (x right, y down).\n'
+            'CURRENT PLAN OBJECTS:\n' + json.dumps(compact, ensure_ascii=False) + '\n'
+            'Allowed ops (only these):\n'
+            '- update_object: {"op":"update_object","objectId":"<existing id>","changes":{name?, description?, role?, z?, bbox?:[x,y,w,h], detailWeight?, fills?}}\n'
+            '- add_object: {"op":"add_object","object":{name, description, z, bbox:[x,y,w,h], shapes, fills}}\n'
+            '- remove_object: {"op":"remove_object","objectId":"<existing id>"}\n'
+            '- reorder_objects: {"op":"reorder_objects","order":["<id>", ...]} (full z order)\n'
+            '- set_difficulty: {"op":"set_difficulty","difficulty":"easy|medium|hard|master"}\n'
+            '- update_plan: {"op":"update_plan","changes":{title?, description?}}\n'
+            'Rules: reference objects by their EXACT existing id; bboxes stay inside the viewBox and '
+            'describe one recognizable thing; never invent ops or fields; if the instruction is '
+            'unrelated to the scene, return an empty mutations list and say so in the summary. '
+            'Keep the summary to one short sentence in the artist\'s language.')
+        schema = {'type': 'object', 'properties': {
+            'summary': {'type': 'string'},
+            'mutations': {'type': 'array', 'items': {'type': 'object', 'properties': {
+                'op': {'type': 'string'},
+                'objectId': {'type': 'string'},
+                'changes': {'type': 'object', 'additionalProperties': True},
+                'object': {'type': 'object', 'additionalProperties': True},
+                'difficulty': {'type': 'string'},
+                'order': {'type': 'array', 'items': {'type': 'string'}},
+            }, 'required': ['op'], 'additionalProperties': True}}},
+            'required': ['summary', 'mutations'], 'additionalProperties': False}
+        payload = {'model': self.config()['chatModel'],
+                   'instructions': instructions,
+                   'input': [{'role': 'user', 'content': [
+                       {'type': 'input_text', 'text': 'INSTRUCTION:\n' + instruction}]}],
+                   'store': False, 'max_output_tokens': 2500,
+                   'text': {'format': {'type': 'json_schema', 'name': 'plan_mutations',
+                                       'strict': True, 'schema': schema}}}
+        with self._client() as client:
+            data = self._result(client.post('json', json=payload))
+        text = self._output_text(data)
+        try:
+            parsed = json.loads(text)
+            mutations = parsed['mutations']
+            assert isinstance(mutations, list)
+        except (ValueError, KeyError, TypeError, AssertionError):
+            raise ValueError('The plan revision was not usable JSON. The plan is unchanged; '
+                             'retry explicitly if you want to spend again.')
+        return mutations, str(parsed.get('summary') or ''), data.get('usage', {})
+
     @staticmethod
     def _normalize_plan(objects, vw: float, vh: float):
         """Validate/clamp a scene plan: 6-30 shapes per object, bbox in the

@@ -666,6 +666,51 @@ def create_app(workspace: Path|None=None, transport=None):
 
         return start(pid, 'AI scene planning', run)
 
+    @app.post('/api/projects/{pid}/generation/sessions/{sid}/plan-chat')
+    def plan_chat_session_route(pid: str, sid: str, body: dict = {}):
+        # Task 29 — paid plan revision: ONE strict-JSON call translates the
+        # artist instruction into structured mutations; the deterministic
+        # mutation engine applies them. The full conversation is never resent.
+        with lock:
+            p = project(pid)
+            editable(p)
+            body = body or {}
+            if not body.get('confirm_paid'):
+                raise HTTPException(400, 'Confirm the paid provider request first: this sends your instruction and the current scene plan to the AI provider and may incur charges.')
+            if not provider.config()['configured']:
+                raise HTTPException(503, 'AI not configured. Add OPENAI_API_KEY to .env. Upload-to-vector works without it.')
+            instruction = str(body.get('instruction') or '').strip()
+            if not instruction:
+                raise HTTPException(400, 'Write what should change about the scene first.')
+            sm = GenerationSessionManager(folder(pid), pid)
+
+        def run(tick):
+            session, usage, summary, applied = sm.mutate_plan_with_ai(sid, provider, instruction, progress=tick)
+            return {'session': session, 'summary': summary, 'applied': applied,
+                    'usage': {'kind': 'plan-revision', 'at': now(), **usage}}
+
+        return start(pid, 'AI plan revision', run)
+
+    @app.get('/api/projects/{pid}/generation/sessions/{sid}/preview/{name}')
+    def session_preview_route(pid: str, sid: str, name: str):
+        # Read-only preview of the session workspace's compiled artwork (the
+        # review stage before commit). Restricted to known artifact names.
+        safe = {'colored.svg': 'image/svg+xml', 'numbered.svg': 'image/svg+xml',
+                'colored-preview.png': 'image/png', 'numbered-preview.png': 'image/png',
+                'source-master.svg': 'image/svg+xml'}
+        if name not in safe:
+            raise HTTPException(404, 'Unknown preview artifact.')
+        sm = GenerationSessionManager(folder(pid), pid)
+        try:
+            sdir = sm.session_path(sid)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc))
+        for rel in (Path('bundle') / name, name):
+            f = sdir / rel
+            if f.is_file():
+                return FileResponse(f, media_type=safe[name])
+        raise HTTPException(404, 'This session has no preview yet — generate the artwork first.')
+
     @app.post('/api/projects/{pid}/generation/sessions/{sid}/generate')
     def generate_session_route(pid: str, sid: str, body: dict = {}):
         # Paid step 2 of Create-with-AI: one vector fragment per planned

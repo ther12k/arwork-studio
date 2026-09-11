@@ -29,6 +29,13 @@ import {
   loadSample,
   loadSvgSample,
   listGenerationSessions,
+  commitSessionArtwork as apiCommitSessionArtwork,
+  compileSession as apiCompileSession,
+  generateSessionArtwork as apiGenerateSessionArtwork,
+  mutateSessionPlan as apiMutateSessionPlan,
+  planChatSession as apiPlanChatSession,
+  planSession as apiPlanSession,
+  regenerateSessionObject as apiRegenerateSessionObject,
   patchProject,
   promoteReference as promoteReferenceApi,
   recordPlaytest as apiRecordPlaytest,
@@ -42,7 +49,7 @@ import {
   type EditAction,
   type EditPayload,
   type GenerateSource,
-  type GenerationSession,
+  type GenerationSessionFull,
   type ImageQuality,
   type PlaytestRecordBody,
   type Project,
@@ -189,7 +196,7 @@ export interface StudioApi {
   /** Which creation shell is open (null = landing). */
   creationMode: "ai" | "image" | null;
   /** Latest resumable generation session (null when none / unavailable). */
-  activeSession: GenerationSession | null;
+  activeSession: GenerationSessionFull | null;
   /** "create" while the project has no artwork or the flow is resumed over the editor. */
   centerView: "editor" | "create";
   setCreationFlow: (mode: "ai" | "image" | null) => void;
@@ -207,6 +214,14 @@ export interface StudioApi {
   discardActiveSession: () => Promise<void>;
   resumeCreationSession: () => void;
   closeCreateWorkspace: () => void;
+  // Task 29 — Create-with-AI session steps
+  planSceneWithAi: (confirmPaid: boolean) => Promise<void>;
+  revisePlanWithAi: (instruction: string, confirmPaid: boolean) => Promise<void>;
+  editScenePlan: (mutations: unknown[]) => Promise<void>;
+  generateArtwork: (confirmPaid: boolean) => Promise<void>;
+  regenerateObject: (objectId: string, instructions: string, confirmPaid: boolean) => Promise<void>;
+  recompileSessionArtwork: () => Promise<void>;
+  commitArtworkToEditor: () => Promise<void>;
   clearSelection: () => void;
   startPlacing: () => void;
   /** Select a single region by id, switch to the board view and zoom to it (QA drill-down). */
@@ -276,7 +291,7 @@ export function StudioProvider({ children }: { children: React.ReactNode }) {
   // un-committed generation session (restored across refreshes so an active
   // session is never "lost" just because the page reloaded).
   const [creationMode, setCreationMode] = useState<"ai" | "image" | null>(null);
-  const [activeSession, setActiveSession] = useState<GenerationSession | null>(null);
+  const [activeSession, setActiveSession] = useState<GenerationSessionFull | null>(null);
   const [showCreateWorkspace, setShowCreateWorkspace] = useState(false);
 
   // refs mirroring state for closures created once
@@ -395,7 +410,7 @@ export function StudioProvider({ children }: { children: React.ReactNode }) {
   /** Task 28 — latest resumable generation session of the project (committed
    *  and canceled sessions are history, not active work). Degrades to null
    *  silently: the landing/shell must render even without session access. */
-  const refreshSessions = useCallback(async (pid: string): Promise<GenerationSession | null> => {
+  const refreshSessions = useCallback(async (pid: string): Promise<GenerationSessionFull | null> => {
     try {
       const { sessions } = await listGenerationSessions(pid);
       const active =
@@ -974,6 +989,96 @@ export function StudioProvider({ children }: { children: React.ReactNode }) {
     if (!activeSession) setCreationMode(null);
   }, [activeSession]);
 
+  // --------------------------------------------- session steps (Task 29)
+
+  /** Fire one session step (paid gates live server-side) as an async job.
+   *  All step buttons disable while busy, so double submits are impossible. */
+  const runSessionStep = useCallback(
+    async (step: () => Promise<{ jobId: string }>) => {
+      const p = projectRef.current;
+      if (!p) throw new Error("Create a project first.");
+      if (isBusyProject(p)) throw new Error("Wait for the current job.");
+      if (!activeSession) throw new Error("No active generation session.");
+      await job(step);
+    },
+    [activeSession, job]
+  );
+
+  const planSceneWithAi = useCallback(
+    (confirmPaid: boolean) => runSessionStep(() => apiPlanSession(projectRef.current!.id, activeSession!.id, confirmPaid)),
+    [runSessionStep]
+  );
+
+  const revisePlanWithAi = useCallback(
+    (instruction: string, confirmPaid: boolean) =>
+      runSessionStep(() => apiPlanChatSession(projectRef.current!.id, activeSession!.id, instruction, confirmPaid)),
+    [runSessionStep]
+  );
+
+  const editScenePlan = useCallback(
+    async (mutations: unknown[]) => {
+      const p = projectRef.current;
+      if (!p || !activeSession) throw new Error("No active generation session.");
+      await apiMutateSessionPlan(p.id, activeSession.id, mutations);
+      await refreshSessions(p.id);
+    },
+    [activeSession, refreshSessions]
+  );
+
+  const generateArtwork = useCallback(
+    (confirmPaid: boolean) => runSessionStep(() => apiGenerateSessionArtwork(projectRef.current!.id, activeSession!.id, confirmPaid)),
+    [runSessionStep]
+  );
+
+  const regenerateObject = useCallback(
+    (objectId: string, instructions: string, confirmPaid: boolean) =>
+      runSessionStep(() => apiRegenerateSessionObject(projectRef.current!.id, activeSession!.id, objectId, instructions, confirmPaid)),
+    [runSessionStep]
+  );
+
+  const recompileSessionArtwork = useCallback(
+    () => runSessionStep(() => apiCompileSession(projectRef.current!.id, activeSession!.id)),
+    [runSessionStep]
+  );
+
+  /** Commit the verified session bundle: session → immutable revision → the
+   *  normal editor (committed sessions drop out of active work on refresh). */
+  const commitArtworkToEditor = useCallback(async () => {
+    const p = projectRef.current;
+    if (!p) throw new Error("Create a project first.");
+    if (isBusyProject(p)) throw new Error("Wait for the current job.");
+    if (!activeSession) throw new Error("No active generation session.");
+    const res = await apiCommitSessionArtwork(p.id, activeSession.id);
+    const next = await getProject(p.id);
+    setProjectSync(next);
+    syncFields(next);
+    setActiveSession(null);
+    setCreationMode(null);
+    setShowCreateWorkspace(false);
+    viewRef.current = "colored";
+    setView(viewRef.current);
+    try {
+      localStorage.setItem(PROJECT_STORAGE_KEY, p.id);
+    } catch {
+      /* storage unavailable */
+    }
+    await refreshList();
+    await mountBoard();
+    toast(`Artwork committed — revision v${res.revision.version}.`);
+  }, [activeSession, mountBoard, refreshList, setProjectSync, syncFields]);
+
+  // Session truth lives server-side: after any session-step job finishes,
+  // re-read the active session so the workspace reflects the new stage.
+  const jobId = project?.job?.id ?? null;
+  const jobStatus = project?.job?.status ?? null;
+  const lastRefreshedJobRef = useRef<string | null>(null);
+  useEffect(() => {
+    if (!jobId || (jobStatus !== "done" && jobStatus !== "failed")) return;
+    if (lastRefreshedJobRef.current === jobId) return;
+    lastRefreshedJobRef.current = jobId;
+    if (projectRef.current && activeSession) void refreshSessions(projectRef.current.id);
+  }, [jobId, jobStatus, activeSession, refreshSessions]);
+
   const clearSelection = useCallback(() => {
     selectedRef.current = new Set();
     setSelected(new Set());
@@ -1285,6 +1390,13 @@ export function StudioProvider({ children }: { children: React.ReactNode }) {
     discardActiveSession,
     resumeCreationSession,
     closeCreateWorkspace,
+    planSceneWithAi,
+    revisePlanWithAi,
+    editScenePlan,
+    generateArtwork,
+    regenerateObject,
+    recompileSessionArtwork,
+    commitArtworkToEditor,
     clearSelection,
     startPlacing,
     inspectRegion,

@@ -347,6 +347,32 @@ def _plan_objects_from_provider(raw: list, vw: float, vh: float) -> List[dict]:
     return normalize_plan_objects(mapped, vw, vh)
 
 
+def _reinject_locked_objects(master_path: Path, old_master_text: str,
+                             locked_ids: list, names: dict) -> None:
+    """Carry locked objects' shapes from the previous session master into a
+    freshly composed one (bulk regeneration must not redraw locked artwork).
+
+    Each locked object's sanitized shapes are extracted from the old master,
+    emitted as a standalone sanitized fragment and swapped into the new
+    master via replace_object_shapes — same objectId, same visual shapes."""
+    from .svg_master import MasterDoc, emit_master_svg, import_master
+    new_text = master_path.read_text(encoding='utf-8')
+    old_doc = import_master(old_master_text)
+    for oid in locked_ids:
+        shapes = [s for s in old_doc.shapes if s.get('objectRef') == oid]
+        inks = [s for s in old_doc.ink_shapes if s.get('objectRef') == oid]
+        if not shapes and not inks:
+            continue                    # nothing generated for it yet
+        sub = MasterDoc()
+        sub.view_box = old_doc.view_box
+        sub.shapes = shapes
+        sub.ink_shapes = inks
+        sub.gradients = old_doc.gradients
+        new_text = replace_object_shapes(new_text, oid, emit_master_svg(sub),
+                                         object_name=names.get(oid))
+    clean_svg(new_text.encode('utf-8'), master_path)
+
+
 def replace_object_shapes(master_text: str, object_id: str, fragment_text: str,
                           object_name: str | None = None) -> str:
     """Targeted object regeneration (Phase 2B): replace every shape owned by
@@ -735,10 +761,17 @@ class GenerationSessionManager:
         return sorted(out, key=lambda s: s.get('createdAt', ''), reverse=True)
 
     def mutate_plan(self, session_id: str, mutations: list[dict]) -> dict:
-        """Apply mutations to the draft plan of an active session."""
+        """Apply mutations to the draft plan of an active session.
+
+        Mutating a ready_to_commit session is allowed (Task 29: 'continue
+        editing the plan'): the session returns to draft_plan and the already
+        generated artwork is marked STALE — it still exists in the session
+        workspace, but reflects the older plan until a regenerate/compile
+        refreshes it."""
         session = self.get_session(session_id)
-        if session['status'] not in ('draft_plan', 'failed'):
+        if session['status'] not in ('draft_plan', 'failed', 'ready_to_commit'):
             raise ValueError(f"Cannot mutate plan while session is {session['status']}.")
+        was_ready = session['status'] == 'ready_to_commit'
 
         updated_plan = apply_scene_mutations(session['scenePlan'], mutations)
         session['scenePlan'] = updated_plan
@@ -748,13 +781,48 @@ class GenerationSessionManager:
         session['updatedAt'] = _now()
         session['status'] = 'draft_plan'
         session['error'] = None
+        if was_ready and (master_path := self.session_path(session_id) / 'source-master.svg').is_file():
+            session.setdefault('meta', {})['artworkStale'] = True
 
         sdir = self.session_path(session_id)
         write_json(sdir / 'session.json', session)
         return session
 
+    def mutate_plan_with_ai(self, session_id: str, provider, instruction: str,
+                            progress: Callable = lambda *_: None):
+        """Task 29 — artist chat → structured plan mutations.
+
+        ONE paid strict-JSON call translates the instruction into mutation
+        ops against the CURRENT plan (ids, bboxes, roles); the deterministic
+        apply_scene_mutations engine stays the only plan writer. Returns
+        (session, usage, summary, applied_mutations)."""
+        session = self.get_session(session_id)
+        if session['status'] not in ('draft_plan', 'failed', 'ready_to_commit'):
+            raise ValueError(f"Cannot revise the plan while session is {session['status']}.")
+        if not (instruction or '').strip():
+            raise ValueError('Write what should change about the scene first.')
+        progress(.2, 'Translating your instruction into plan changes')
+        mutations, summary, usage = provider.plan_mutations(session['scenePlan'], instruction.strip())
+        if not mutations:
+            session = self.get_session(session_id)
+            session.setdefault('meta', {})['lastPlanChat'] = {
+                'instruction': instruction.strip(), 'summary': summary,
+                'applied': 0, 'at': _now()}
+            session['updatedAt'] = _now()
+            write_json(self.session_path(session_id) / 'session.json', session)
+            return session, usage, (summary or 'Nothing needed to change.'), []
+        session = self.mutate_plan(session_id, mutations)
+        session = self.get_session(session_id)
+        session.setdefault('meta', {})['lastPlanChat'] = {
+            'instruction': instruction.strip(), 'summary': summary,
+            'applied': len(mutations), 'mutations': mutations, 'at': _now()}
+        session['updatedAt'] = _now()
+        write_json(self.session_path(session_id) / 'session.json', session)
+        return session, usage, (summary or f'{len(mutations)} change(s) applied.'), mutations
+
     def update_status(self, session_id: str, status: str,
-                      error: str | None = None, meta: dict | None = None) -> dict:
+                      error: str | None = None, meta: dict | None = None,
+                      clear_meta: list | None = None) -> dict:
         session = self.get_session(session_id)
         session['status'] = status
         session['updatedAt'] = _now()
@@ -762,6 +830,8 @@ class GenerationSessionManager:
             session['error'] = error
         if meta:
             session.setdefault('meta', {}).update(meta)
+        for key in clear_meta or []:
+            session.get('meta', {}).pop(key, None)
         sdir = self.session_path(session_id)
         write_json(sdir / 'session.json', session)
         return session
@@ -817,11 +887,24 @@ class GenerationSessionManager:
         sdir = self.session_path(session_id)
         try:
             specs = [_fragment_spec(o) for o in objects]
-            svg_text, stages = provider.svg_compose_from_objects(specs, session['aspect'], progress)
+            # Locked objects (generation.locked) survive a bulk regeneration:
+            # keep the previous master around and re-inject their shapes after
+            # the fresh compose, so unlocking is the only way their artwork
+            # changes. A fresh session (no master yet) has nothing to keep.
+            old_master_text = None
             master_path = sdir / 'source-master.svg'
+            if master_path.is_file():
+                old_master_text = master_path.read_text(encoding='utf-8')
+            svg_text, stages = provider.svg_compose_from_objects(specs, session['aspect'], progress)
             clean_svg(svg_text.encode('utf-8'), master_path)
+            locked_ids = [o['id'] for o in objects if (o.get('generation') or {}).get('locked')]
+            if locked_ids and old_master_text:
+                _reinject_locked_objects(master_path, old_master_text, locked_ids,
+                                         {o['id']: o['name'] for o in objects})
             session = self.get_session(session_id)
             session.setdefault('meta', {})['generationStages'] = stages
+            if locked_ids:
+                session['meta']['keptLockedObjects'] = locked_ids
             session['updatedAt'] = _now()
             write_json(sdir / 'session.json', session)
             usage = {'kind': 'generation-synthesis', 'calls': len(specs), 'stages': stages}
@@ -855,6 +938,9 @@ class GenerationSessionManager:
         if not plan_obj:
             raise ValueError(f'Object {object_id} is not part of this session plan. '
                              'Add it to the plan (and regenerate the master) first.')
+        if (plan_obj.get('generation') or {}).get('locked'):
+            raise ValueError(f'"{plan_obj["name"]}" is locked. Unlock it in the scene plan '
+                             'before regenerating it.')
         self.update_status(session_id, 'generating')
         sdir = self.session_path(session_id)
         try:
@@ -1156,7 +1242,9 @@ class GenerationSessionManager:
                 self.update_status(session_id, 'failed', error=err_msg)
                 raise ValueError(err_msg)
 
-            # Store measured difficulty and validation in session
+            # Store measured difficulty and validation in session; a fresh
+            # successful compile always reflects the CURRENT plan, so the
+            # stale marker from plan-after-ready edits is cleared.
             measured = {
                 'rating': result['manifest']['difficulty']['rating'],
                 'score': result['manifest']['difficulty']['score'],
@@ -1166,7 +1254,7 @@ class GenerationSessionManager:
                 'qa': qa,
                 'measuredDifficulty': measured,
                 'regionCount': result['manifest']['regionCount'],
-            })
+            }, clear_meta=['artworkStale'])
             return result
         except Exception as exc:
             self.update_status(session_id, 'failed', error=str(exc))

@@ -46,6 +46,7 @@ import type { BoardMode, EdgeEntry, VectorBoard } from "@/lib/detailed-board";
 import { imageUrl, masterSvgUrl, type DifficultyProfile } from "@/lib/studio-api";
 import { flattenPath, polylineNearestDistance } from "@/lib/svg-path";
 import { VIEW_LABELS, type StudioTool, type StudioView, useStudioContext } from "./use-studio";
+import { sessionResumeCopy } from "./create-artwork";
 import {
   DIFFICULTY_TIERS,
   PlaytestValidatedBadge,
@@ -822,8 +823,8 @@ export function CanvasWorkspace() {
         </div>
       </div>
 
-      {/* Task 28 — an active generation session never disappears behind the
-          editor: resume it any time (the session workspace opens on top). */}
+      {/* Task 28/29 — an active generation session never disappears behind
+          the editor: resume it any time (the session workspace opens on top). */}
       {activeSession && (
         <div className="mb-4 flex flex-wrap items-center justify-between gap-2 rounded-xl border border-[#cce7dc] bg-[#edf6f2] px-3.5 py-2.5">
           <span className="flex items-center gap-2 text-[11px] font-semibold text-[#126e5e]">
@@ -832,8 +833,9 @@ export function CanvasWorkspace() {
               ? "Create-with-AI session"
               : activeSession.mode === "image_reference"
                 ? "Reference session"
-                : "Convert session"}{" "}
-            in progress — resume the creation flow any time.
+                : "Convert session"}
+            {" · "}
+            {sessionResumeCopy(activeSession.status).title.toLowerCase()} — resume any time.
           </span>
           <Button
             size="sm"

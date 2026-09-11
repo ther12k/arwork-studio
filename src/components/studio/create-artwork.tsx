@@ -28,8 +28,9 @@ import { Button } from "@/components/ui/button";
 import { Label } from "@/components/ui/label";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Textarea } from "@/components/ui/textarea";
-import type { SessionTier } from "@/lib/studio-api";
+import type { GenerationSessionFull, SessionTier } from "@/lib/studio-api";
 import { useStudioContext } from "./use-studio";
+import { AiWorkspace } from "./ai-workspace";
 import { DIFFICULTY_TIERS } from "./difficulty";
 
 const TIERS_ONLY: Array<{ key: SessionTier; label: string; color: string }> =
@@ -46,6 +47,21 @@ const FIDELITIES: Array<{ value: "stylized" | "balanced" | "faithful"; label: st
   { value: "balanced", label: "Balanced", hint: "Faithful yet playful" },
   { value: "faithful", label: "Faithful", hint: "Closest to the original" },
 ];
+
+/** Status-aware resume copy — a failed session is never "in progress". */
+export function sessionResumeCopy(status: string | undefined): { title: string; cta: string } {
+  switch (status) {
+    case "generating":
+    case "compiling":
+      return { title: "Generation in progress", cta: "Track generation" };
+    case "ready_to_commit":
+      return { title: "Artwork ready to review", cta: "Review artwork" };
+    case "failed":
+      return { title: "Generation needs attention", cta: "Review session" };
+    default:
+      return { title: "Continue planning", cta: "Resume planning" };
+  }
+}
 
 const MODE_LABEL: Record<string, string> = {
   ai_chat: "Create with AI",
@@ -466,10 +482,10 @@ function Landing() {
               <Layers className="size-5 text-[#087f74]" aria-hidden />
               <div>
                 <p className="text-sm font-bold text-[#183837]">
-                  {MODE_LABEL[activeSession.mode] ?? "Generation"} in progress
+                  {sessionResumeCopy(activeSession.status).title}
                 </p>
                 <p className="mt-0.5 text-[10px] text-[#657671]">
-                  {activeSession.requestedDifficulty} · session {activeSession.id}
+                  {MODE_LABEL[activeSession.mode] ?? "Generation session"} · {activeSession.requestedDifficulty}
                 </p>
               </div>
             </div>
@@ -478,7 +494,7 @@ function Landing() {
               className="h-9 rounded-md bg-[#0e554e] text-[11px] font-semibold text-white hover:bg-[#0a423d]"
               onClick={resumeCreationSession}
             >
-              Resume session
+              {sessionResumeCopy(activeSession.status).cta}
             </Button>
           </div>
         </div>
@@ -609,12 +625,19 @@ function Landing() {
  *  session over the editor): landing → shell → session card. */
 export function CreateArtwork() {
   const { creationMode, activeSession } = useStudioContext();
-  const shell =
-    creationMode === "ai" ? (
-      <AiShell />
-    ) : creationMode === "image" ? (
-      <ImageShell />
-    ) : activeSession ? null : null;
+  let shell: React.ReactNode = null;
+  if (creationMode === "ai") {
+    // Task 29: a live ai_chat session opens the full 3-stage workspace.
+    shell =
+      activeSession?.mode === "ai_chat" ? (
+        <AiWorkspace session={activeSession as GenerationSessionFull} />
+      ) : (
+        <AiShell />
+      );
+  } else if (creationMode === "image") {
+    // Task 30 will replace this with the image workspace.
+    shell = <ImageShell />;
+  }
   // A resumed/opened shell wins; otherwise the landing (which itself shows
   // the resume card when a session exists).
   return (
