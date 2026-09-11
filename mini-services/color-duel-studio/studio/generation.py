@@ -631,6 +631,45 @@ class GenerationSessionManager:
                                       progress=progress)
         return self.get_session(session_id), usage_out
 
+    def plan_session_from_image(self, session_id: str, provider, reference: Path,
+                                instructions: str = '',
+                                progress: Callable = lambda *_: None) -> Tuple[dict, dict]:
+        """Phase 2C — Use as Reference: vision understanding of an uploaded
+        image becomes a NEW semantic ScenePlan (subject/composition/mood),
+        and the artwork itself is generated as native vectors afterwards.
+        The source is never traced: this answers 'what is in the image and
+        what makes the composition recognizable', not 'where are the pixel
+        color boundaries'. Image-reference sessions REUSE the Create-with-AI
+        machinery — only the initial plan input differs."""
+        session = self.get_session(session_id)
+        if session['status'] not in ('draft_plan', 'failed'):
+            raise ValueError(f"Cannot plan while session is '{session['status']}'.")
+        if session['mode'] not in ('image_reference', 'ai_chat'):
+            raise ValueError('This session mode does not support reference planning.')
+        if not reference.is_file():
+            raise ValueError('Upload the reference image first.')
+        plan = session['scenePlan']
+        prompt = session.get('prompt', '') or 'Interpret this reference image as an original artwork.'
+        if plan.get('description'):
+            prompt += '\nScene brief so far: ' + plan['description']
+        if instructions:
+            prompt += '\nReference interpretation instructions: ' + instructions
+        prompt += f"\nRequested difficulty: {session['requestedDifficulty']} (target ≈{plan['targetRegions']} gameplay regions)."
+        progress(.15, 'Understanding the reference (vision scene analysis)')
+        raw, usage = provider.scene_plan(prompt, plan['aspect'], reference, plan['targetRegions'])
+        vw, vh = plan['viewBox'][2], plan['viewBox'][3]
+        plan['objects'] = _plan_objects_from_provider(raw, vw, vh)
+        if not plan['objects']:
+            raise ValueError('The vision scene plan contained no usable objects. '
+                             'The draft plan is unchanged; retry explicitly to spend again.')
+        session['scenePlan'] = plan
+        session['updatedAt'] = _now()
+        session.setdefault('meta', {})['planUsage'] = usage
+        session['meta']['referenceFile'] = reference.name
+        sdir = self.session_path(session_id)
+        write_json(sdir / 'session.json', session)
+        return session, usage
+
     def cancel_session(self, session_id: str) -> dict:
         """Cancel an in-progress or draft session and clean up temp assets."""
         session = self.get_session(session_id)

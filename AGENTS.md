@@ -93,6 +93,9 @@ Backend (in `mini-services/color-duel-studio/`):
   steps with explicit confirm gates: `/plan` (strict-JSON scene planning), `/generate` (one
   fragment per planned object via `svg_compose_from_objects`), `/regenerate-object` (replaces one
   object's shapes in the session master — objectId preserved, neighbours re-derived by recompile).
+  Phase 2C adds `/reference-plan` (Use as Reference): the uploaded image is attached to the vision
+  planning call and drafts a NEW semantic ScenePlan — the source is never traced; artwork is then
+  generated natively via the same `/generate` step.
 
 ## Conventions & hygiene
 

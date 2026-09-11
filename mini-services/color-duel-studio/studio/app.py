@@ -638,6 +638,40 @@ def create_app(workspace: Path|None=None, transport=None):
 
         return start(pid, 'targeted object regeneration', run)
 
+    @app.post('/api/projects/{pid}/generation/sessions/{sid}/reference-plan')
+    async def reference_plan_session_route(pid: str, sid: str, file: UploadFile = File(...), body: str = Form('{}')):
+        # Phase 2C — Use as Reference (paid): vision scene understanding of the
+        # uploaded image drafts the session's ScenePlan; artwork itself is then
+        # generated as native vectors via the normal /generate step. The source
+        # is never traced.
+        with lock:
+            p = project(pid)
+            editable(p)
+            req = json.loads(body or '{}')
+            if not req.get('confirm_paid'):
+                raise HTTPException(400, 'Confirm the paid provider request first: this sends the image to the AI provider for vision analysis and may incur charges.')
+            if not provider.config()['configured']:
+                raise HTTPException(503, 'AI not configured. Add OPENAI_API_KEY to .env. Upload-to-vector works without it.')
+            sm = GenerationSessionManager(folder(pid), pid)
+            sdir = sm.session_path(sid)
+            raw = await file.read(12 * 1024 * 1024 + 1)
+            if len(raw) >= 12 * 1024 * 1024:
+                raise HTTPException(400, 'Use a reference image under 12 MB.')
+            ref_path = sdir / 'reference-image'
+            suffix = Path(file.filename or 'reference.jpg').suffix.lower()
+            if suffix not in ('.png', '.jpg', '.jpeg', '.webp'):
+                suffix = '.jpg'
+            ref_path = ref_path.with_suffix(suffix)
+            ref_path.write_bytes(raw)
+
+        def run(tick):
+            session, usage = sm.plan_session_from_image(sid, provider, ref_path,
+                                                        instructions=str(req.get('instructions') or ''),
+                                                        progress=tick)
+            return {'session': session, 'usage': {'kind': 'reference-scene-plan', 'at': now(), **usage}}
+
+        return start(pid, 'reference scene planning', run)
+
     app.mount('/static',StaticFiles(directory=BASE/'web'),name='static')
     @app.get('/')
     def index():return FileResponse(BASE/'web/index.html')

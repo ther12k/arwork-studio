@@ -660,3 +660,85 @@ def test_generation_targeted_regeneration_mocked(tmp_path, monkeypatch):
         # still no project revision was created by generation
         p_now = c.get(f'/api/projects/{pid}').json()
         assert p_now['currentRevision'] is None and len(p_now['revisions']) == 0
+
+
+def test_generation_reference_plan_mocked(tmp_path, monkeypatch):
+    """Phase 2C gate — Use as Reference: the uploaded image is attached to the
+    vision planning call, drafts a NEW semantic ScenePlan, and the artwork is
+    then generated as native vectors via the normal generate step. The plan
+    instructs the provider to reuse only mood/palette/subject, not tracing."""
+    monkeypatch.setenv('OPENAI_API_KEY', 'fake-key')
+    seen = []
+    def respond(req):
+        seen.append((req.url.path, req.content))
+        if req.url.path.endswith('/json'):
+            body = json.loads(req.content)
+            # the reference image MUST be attached to the vision planning call
+            content = body['input'][0]['content']
+            assert any(part['type'] == 'input_image' for part in content), 'reference image must be sent'
+            assert any('not its composition' in body['instructions'] for _ in [0])
+            return httpx.Response(200, json={'output': [{'content': [{'type': 'output_text',
+                'text': json.dumps({'objects': SCENE_OBJECTS})}]}], 'usage': {'input_tokens': 90}})
+        if req.url.path.endswith('/svg'):
+            return httpx.Response(200, json={'output': [{'content': [{'type': 'output_text',
+                'text': ('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 768">'
+                         '<rect x="0" y="0" width="576" height="768" fill="#88AA99"/></svg>')}]}],
+                'usage': {'input_tokens': 80}})
+        return httpx.Response(404, json={'error': {'code': 'no_route'}})
+
+    with TestClient(create_app(tmp_path, transport=httpx.MockTransport(respond))) as c:
+        pid = new(c)
+        sid = c.post(f'/api/projects/{pid}/generation/sessions', headers=H,
+                     json={'mode': 'image_reference', 'requested_difficulty': 'medium',
+                           'prompt': 'something like my photo', 'fidelity': 'balanced'}).json()['id']
+
+        # paid gate first
+        r = c.post(f'/api/projects/{pid}/generation/sessions/{sid}/reference-plan', headers=H,
+                   files={'file': ('photo.png', picture(), 'image/png')}, data={'body': '{}'})
+        assert r.status_code == 400
+
+        r = c.post(f'/api/projects/{pid}/generation/sessions/{sid}/reference-plan', headers=H,
+                   files={'file': ('photo.png', picture(), 'image/png')},
+                   data={'body': json.dumps({'confirm_paid': True, 'instructions': 'warmer palette'})})
+        assert r.status_code == 200, r.text
+        p = wait(c, pid)
+        assert p['job']['status'] == 'done', p['job']
+        sess = c.get(f'/api/projects/{pid}/generation/sessions/{sid}').json()
+        assert sess['status'] == 'draft_plan'
+        oids = [o['id'] for o in sess['scenePlan']['objects']]
+        assert 'obj-sky' in oids and 'obj-house' in oids
+        assert sess['meta']['planUsage'].get('input_tokens') == 90
+        assert sess['meta']['referenceFile'].startswith('reference-image')
+        assert any(u.get('kind') == 'reference-scene-plan' for u in p['aiUsage'])
+
+        # generate uses the vision-derived plan unchanged (one /svg per object)
+        svg_before = sum(1 for path, _ in seen if path.endswith('/svg'))
+        r = c.post(f'/api/projects/{pid}/generation/sessions/{sid}/generate', headers=H,
+                   json={'confirm_paid': True})
+        assert r.status_code == 200, r.text
+        p = wait(c, pid)
+        assert p['job']['status'] == 'done', p['job']
+        assert sum(1 for path, _ in seen if path.endswith('/svg')) == svg_before + len(SCENE_OBJECTS)
+        sess = c.get(f'/api/projects/{pid}/generation/sessions/{sid}').json()
+        assert sess['status'] == 'ready_to_commit'
+        assert sess['meta']['qa']['passed'] is True
+
+        # commit: provenance records the image_reference mode
+        r = c.post(f'/api/projects/{pid}/generation/sessions/{sid}/commit', headers=H, json={})
+        assert r.status_code == 200, r.text
+        rev = r.json()['revision']['id']
+        manifest = c.get(f'/api/projects/{pid}/revisions/{rev}/files/artwork.json').json()
+        assert manifest['generation']['mode'] == 'image_reference'
+        assert manifest['generation']['fidelity'] == 'balanced'
+
+        # reference-plan on a plain ai_chat session is also allowed (guidance image);
+        # wrong-mode sessions are rejected
+        sid2 = c.post(f'/api/projects/{pid}/generation/sessions', headers=H,
+                      json={'mode': 'image_convert', 'prompt': 'x'}).json()['id']
+        r = c.post(f'/api/projects/{pid}/generation/sessions/{sid2}/reference-plan', headers=H,
+                   files={'file': ('photo.png', picture(), 'image/png')},
+                   data={'body': json.dumps({'confirm_paid': True})})
+        assert r.status_code == 200              # async job carries the failure
+        p = wait(c, pid)
+        assert p['job']['status'] == 'failed'
+        assert 'does not support reference planning' in p['job']['message']
