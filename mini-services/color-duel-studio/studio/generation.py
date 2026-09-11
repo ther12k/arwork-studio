@@ -34,6 +34,7 @@ from .pipeline import (
     validate_bundle,
     write_json,
 )
+from .svg_master import clean_svg
 
 # ---------------------------------------------------------------------------
 # Difficulty Presets and Target Ranges
@@ -301,6 +302,112 @@ def apply_scene_mutations(plan: dict, mutations: list[dict]) -> dict:
 # Generation Session State Machine
 # ---------------------------------------------------------------------------
 
+def _fragment_spec(plan_obj: dict) -> dict:
+    """Translate a ScenePlan object into the provider fragment spec
+    (ai.Provider.svg_object): shapes count derives from detailWeight when the
+    plan does not carry an explicit count."""
+    shapes = plan_obj.get('shapes')
+    if not shapes:
+        try:
+            shapes = max(6, min(30, round(float(plan_obj.get('detailWeight', 1.0)) * 12)))
+        except (TypeError, ValueError):
+            shapes = 12
+    return {'id': plan_obj.get('id'), 'name': plan_obj['name'],
+            'description': plan_obj.get('description', ''),
+            'bbox': plan_obj['bbox'], 'fills': plan_obj.get('fills') or ['#8899AA'],
+            'shapes': int(shapes), 'z': plan_obj.get('z', 0)}
+
+
+def _plan_objects_from_provider(raw: list, vw: float, vh: float) -> List[dict]:
+    """Map raw provider scene-plan objects (name/description/z/bbox/shapes/fills)
+    into ScenePlan records: deterministic obj-* ids, detailWeight derived from
+    the planned shape count (semantic complexity signal)."""
+    mapped = []
+    for i, o in enumerate(raw or []):
+        if not isinstance(o, dict):
+            continue
+        try:
+            shapes = float(o.get('shapes') or 12)
+        except (TypeError, ValueError):
+            shapes = 12.0
+        mapped.append({
+            'name': str(o.get('name') or f'Object {i + 1}'),
+            'description': str(o.get('description') or ''),
+            'z': o.get('z'),
+            'bbox': o.get('bbox'),
+            'fills': o.get('fills') or [],
+            'detailWeight': round(max(0.2, min(shapes / 12.0, 4.0)), 3),
+        })
+    return normalize_plan_objects(mapped, vw, vh)
+
+
+def replace_object_shapes(master_text: str, object_id: str, fragment_text: str,
+                          object_name: str | None = None) -> str:
+    """Targeted object regeneration (Phase 2B): replace every shape owned by
+    object_id in a sanitized master with the shapes of a fresh fragment.
+
+    The objectId is PRESERVED even though all its internal shapeIds change —
+    objects.json ownership (region objectId + record id) stays stable. New
+    shapes take over the old shapes' z slots one-for-one (extra new shapes
+    are appended above the last slot), so untouched objects keep their exact
+    layer position. Neighbouring objects are NOT touched here; their visible
+    surfaces are re-derived by the normal recompile that follows."""
+    from .svg_master import import_master, emit_master_svg
+    doc = import_master(master_text)
+    frag = import_master(fragment_text)
+    if not frag.shapes and not frag.ink_shapes:
+        raise ValueError('The regenerated fragment contains no drawable shapes.')
+    stream = sorted(doc.shapes + doc.ink_shapes, key=lambda s: s['order'])
+    old = [s for s in stream if s.get('objectRef') == object_id]
+    if not old:
+        raise ValueError(f'Object {object_id} has no shapes in the current master.')
+    # Deterministic per-(object, fragment) id prefix: keeps new shape/gradient
+    # ids collision-free against the rest of the master AND across repeated
+    # regenerations of different objects (old shapes are removed in the same
+    # operation, so re-using the prefix for the same object+fragment is safe).
+    prefix = (object_id + '-' +
+              hashlib.sha1((object_id + '\x00' + fragment_text).encode()).hexdigest()[:8] + '-')
+    new_shapes = []
+    for s in frag.shapes + frag.ink_shapes:
+        e = dict(s)
+        e['id'] = prefix + s['id']
+        grad = e.get('gradient')
+        if grad and grad.get('id', '').startswith('g-'):
+            grad = dict(grad)
+            grad['id'] = 'g-' + prefix + grad['id'][2:]
+            e['gradient'] = grad
+        e['objectRef'] = object_id
+        e['objectName'] = object_name or s.get('objectName') or object_id.replace('-', ' ').title()
+        new_shapes.append(e)
+    max_order = max((s['order'] for s in stream), default=0)
+    result = []
+    ni = 0
+    for s in stream:
+        if s.get('objectRef') == object_id:
+            if ni < len(new_shapes):
+                e = new_shapes[ni]
+                e['order'] = s['order']
+                result.append(e)
+                ni += 1
+            # more old slots than new shapes: the surplus slot is dropped
+        else:
+            result.append(s)
+    if ni < len(new_shapes):
+        # fragment grew: append the surplus above everything (documented behavior)
+        for e in new_shapes[ni:]:
+            max_order += 1
+            e['order'] = max_order
+            result.append(e)
+    combined = type(doc)()
+    combined.view_box = doc.view_box
+    for s in sorted(result, key=lambda t: t['order']):
+        if s.get('kind') == 'ink':
+            combined.ink_shapes.append(s)
+        else:
+            combined.shapes.append(s)
+    return emit_master_svg(combined)
+
+
 class GenerationSessionManager:
     """Manages transactional generation sessions for a project."""
 
@@ -405,6 +512,124 @@ class GenerationSessionManager:
         sdir = self.session_path(session_id)
         write_json(sdir / 'session.json', session)
         return session
+
+    # -----------------------------------------------------------------------
+    # AI synthesis steps (Phase 2B — Create with AI). Every step is a separate
+    # paid call: plan first (cheap JSON), then per-object fragments (expensive)
+    # only after the user is satisfied with the draft plan.
+    # -----------------------------------------------------------------------
+
+    def plan_session_with_ai(self, session_id: str, provider,
+                             instructions: str = '',
+                             progress: Callable = lambda *_: None) -> Tuple[dict, dict]:
+        """Synthesize ScenePlan objects from the session prompt via the AI
+        provider (strict-JSON scene planning). Replaces the draft's object
+        list; title/description/difficulty set by earlier mutations survive."""
+        session = self.get_session(session_id)
+        if session['status'] not in ('draft_plan', 'failed'):
+            raise ValueError(f"Cannot plan while session is '{session['status']}'.")
+        plan = session['scenePlan']
+        prompt = session.get('prompt', '')
+        if plan.get('description'):
+            prompt += '\nScene brief so far: ' + plan['description']
+        if instructions:
+            prompt += '\nPlanning instructions: ' + instructions
+        prompt += f"\nRequested difficulty: {session['requestedDifficulty']} (target ≈{plan['targetRegions']} gameplay regions)."
+        progress(.15, 'Planning the scene with AI (objects, composition, z order)')
+        raw, usage = provider.scene_plan(prompt, plan['aspect'], None, plan['targetRegions'])
+        vw, vh = plan['viewBox'][2], plan['viewBox'][3]
+        plan['objects'] = _plan_objects_from_provider(raw, vw, vh)
+        if not plan['objects']:
+            raise ValueError('The AI scene plan contained no usable objects. '
+                             'The draft plan is unchanged; retry explicitly to spend again.')
+        session['scenePlan'] = plan
+        session['updatedAt'] = _now()
+        session.setdefault('meta', {})['planUsage'] = usage
+        sdir = self.session_path(session_id)
+        write_json(sdir / 'session.json', session)
+        return session, usage
+
+    def generate_session_master(self, session_id: str, provider,
+                                progress: Callable = lambda *_: None) -> Tuple[dict, dict]:
+        """Synthesize one vector fragment per planned object, compose the
+        master SVG into the session workspace, and compile + QA it — all in
+        isolation. Healthy revisions are untouched until commit."""
+        session = self.get_session(session_id)
+        if session['status'] == 'committed':
+            raise ValueError('This session is already committed.')
+        objects = session['scenePlan'].get('objects') or []
+        if not objects:
+            raise ValueError('The ScenePlan has no objects yet. Run the AI planning step (or add objects) first.')
+        self.update_status(session_id, 'generating')
+        sdir = self.session_path(session_id)
+        try:
+            specs = [_fragment_spec(o) for o in objects]
+            svg_text, stages = provider.svg_compose_from_objects(specs, session['aspect'], progress)
+            master_path = sdir / 'source-master.svg'
+            clean_svg(svg_text.encode('utf-8'), master_path)
+            session = self.get_session(session_id)
+            session.setdefault('meta', {})['generationStages'] = stages
+            session['updatedAt'] = _now()
+            write_json(sdir / 'session.json', session)
+            usage = {'kind': 'generation-synthesis', 'calls': len(specs), 'stages': stages}
+        except Exception as exc:
+            self.update_status(session_id, 'failed', error=str(exc))
+            raise
+        result = self.compile_session(session_id, master_path,
+                                      BuildSettings(target_regions=session['targetRegions'],
+                                                    auto_subdivide=True),
+                                      progress=progress)
+        return self.get_session(session_id), usage
+
+    def regenerate_session_object(self, session_id: str, provider, object_id: str,
+                                  instructions: str = '',
+                                  progress: Callable = lambda *_: None) -> Tuple[dict, dict]:
+        """Targeted object regeneration: replace ONLY this object's shapes in
+        the session master with a freshly generated fragment, then recompile.
+
+        The objectId is preserved (internal shapeIds change); untouched
+        objects keep their shapes verbatim, and neighbours' visible surfaces
+        are re-derived by the recompile — local regeneration without blind
+        path patching."""
+        session = self.get_session(session_id)
+        if session['status'] == 'committed':
+            raise ValueError('This session is already committed.')
+        master_path = self.session_path(session_id) / 'source-master.svg'
+        if not master_path.is_file():
+            raise ValueError('This session has no master yet. Run the generate step first.')
+        plan_obj = next((o for o in session['scenePlan'].get('objects') or []
+                         if o['id'] == object_id), None)
+        if not plan_obj:
+            raise ValueError(f'Object {object_id} is not part of this session plan. '
+                             'Add it to the plan (and regenerate the master) first.')
+        self.update_status(session_id, 'generating')
+        sdir = self.session_path(session_id)
+        try:
+            spec = _fragment_spec(plan_obj)
+            if instructions:
+                spec['description'] = (spec['description'] + '\n' if spec['description'] else '') + instructions
+            view_box = '0 0 ' + ' '.join(str(int(v)) for v in session['scenePlan']['viewBox'][2:])
+            fragment, usage = provider.svg_object(spec, view_box)
+            progress(.7, f'Replacing object {object_id}')
+            master_text = master_path.read_text(encoding='utf-8')
+            new_master = replace_object_shapes(master_text, object_id, fragment,
+                                               object_name=plan_obj['name'])
+            # The replaced master is already sanitized output of emit_master_svg;
+            # persist it verbatim and recompile the bundle from it.
+            master_path.write_text(new_master, encoding='utf-8')
+            session = self.get_session(session_id)
+            session.setdefault('meta', {})[f'regenUsage:{object_id}'] = usage
+            session['updatedAt'] = _now()
+            write_json(sdir / 'session.json', session)
+            usage_out = {'kind': 'object-regeneration', 'objectId': object_id, **usage}
+        except Exception as exc:
+            self.update_status(session_id, 'failed', error=str(exc))
+            raise
+        result = self.compile_session(session_id, master_path,
+                                      BuildSettings(target_regions=session['targetRegions'],
+                                                    auto_subdivide=True),
+                                      progress=progress)
+        return self.get_session(session_id), usage_out
 
     def cancel_session(self, session_id: str) -> dict:
         """Cancel an in-progress or draft session and clean up temp assets."""

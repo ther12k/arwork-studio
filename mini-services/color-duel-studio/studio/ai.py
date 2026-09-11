@@ -289,29 +289,24 @@ class Provider:
                               'No partial master was saved; retry explicitly if you want to spend again.')
         return text[start:end+6], data.get('usage',{})
 
-    def svg_multistage(self, prompt: str, aspect: str, reference: Path|None=None,
-                       target_regions: int=300, progress: 'callable|None'=None):
-        """Multi-stage native-vector generation (contract 7).
-
-        scene plan (strict JSON) -> per-object SVG fragments (each sanitized
-        through svg_master.import_master with an object id prefix) -> one
-        composed master with defs + shapes in z order. Any fragment failure
-        raises a clear ValueError; NO partial master is saved. No automatic
-        retries on paid calls.
-        """
+    def svg_compose_from_objects(self, objects: list, aspect: str, progress=None):
+        """Compose a master from ALREADY-PLANNED objects (no planning call):
+        one sanitized provider fragment per object, stamped with object
+        identity (obj.get('id') when present, else derived from the name),
+        composed in z order. Used by the Generation Orchestrator, where the
+        ScenePlan is a separate, user-revisable draft stage — vector cost is
+        only paid once the plan is stable. Any fragment failure raises a
+        clear ValueError; no partial master is saved."""
         from .svg_master import import_master, emit_master_svg, MasterDoc
         view_box=ASPECT_VIEWBOX.get(aspect,'0 0 576 768')
         vw,vh=self._viewbox_size(aspect)
         tick=progress or (lambda *_: None)
-        tick(.1,'Planning the scene (object bboxes, z order, fills)')
-        objects,plan_usage=self.scene_plan(prompt,aspect,reference,target_regions)
-        objects=self._normalize_plan(objects,vw,vh)
         combined=MasterDoc()
         combined.view_box=(0.0,0.0,vw,vh)
         order=0
-        stages={'scenePlan':{'usage':plan_usage,'objects':len(objects)}}
+        stages={}
         for i,obj in enumerate(objects):
-            tick(.15+.65*i/max(1,len(objects)),f'Vectorizing object {i+1}/{len(objects)}: {obj["name"]}')
+            tick(.1+.75*i/max(1,len(objects)),f'Vectorizing object {i+1}/{len(objects)}: {obj["name"]}')
             fragment,usage=self.svg_object(obj,view_box)
             if len(fragment.encode('utf-8'))>400*1024:
                 raise ValueError(f'Fragment for "{obj["name"]}" exceeds the 400 KB budget. No partial master was saved.')
@@ -338,7 +333,8 @@ class Provider:
             # the planned object id. emit_master_svg wraps the run in
             # <g data-cd-object>, so any later rebuild reconstructs
             # objects.json with the same ownership (compiler never guesses).
-            obj_id=f'obj-{i}-' + (re.sub(r'[^a-z0-9]+','-',obj['name'].lower()).strip('-')[:32] or f'object{i}')
+            fallback=f'obj-{i}-' + (re.sub(r'[^a-z0-9]+','-',obj['name'].lower()).strip('-')[:32] or f'object{i}')
+            obj_id=obj.get('id') or fallback
             for s in doc.shapes+doc.ink_shapes:
                 entry=dict(s)
                 entry['id']=prefix+s['id']
@@ -353,11 +349,30 @@ class Provider:
                 if entry.get('kind')=='ink': combined.ink_shapes.append(entry)
                 else: combined.shapes.append(entry)
             stages[f'object:{obj["name"]}']={'usage':usage,'shapes':len(doc.shapes)+len(doc.ink_shapes),
-                                             'bbox':obj['bbox'],'z':obj['z']}
-        tick(.85,'Composing the master document (z order, re-ided fragments)')
+                                             'bbox':obj['bbox'],'z':obj.get('z', i)}
+        tick(.9,'Composing the master document (z order, re-ided fragments)')
         svg_text=emit_master_svg(combined)
         if len(svg_text.encode('utf-8'))>1_500_000:
             raise ValueError('The composed SVG master exceeds the size budget. Nothing was saved.')
+        return svg_text,stages
+
+    def svg_multistage(self, prompt: str, aspect: str, reference: Path|None=None,
+                       target_regions: int=300, progress: 'callable|None'=None):
+        """Multi-stage native-vector generation (contract 7).
+
+        scene plan (strict JSON) -> per-object SVG fragments (each sanitized
+        through svg_master.import_master with an object id prefix) -> one
+        composed master with defs + shapes in z order. Any fragment failure
+        raises a clear ValueError; NO partial master is saved. No automatic
+        retries on paid calls.
+        """
+        vw,vh=self._viewbox_size(aspect)
+        tick=progress or (lambda *_: None)
+        tick(.1,'Planning the scene (object bboxes, z order, fills)')
+        objects,plan_usage=self.scene_plan(prompt,aspect,reference,target_regions)
+        objects=self._normalize_plan(objects,vw,vh)
+        svg_text,stages=self.svg_compose_from_objects(objects,aspect,progress)
+        stages['scenePlan']={'usage':plan_usage,'objects':len(objects)}
         meta={'provider':'openai','model':self.config()['chatModel'],'usage':{},
               'sourceMode':'reference-guided' if reference else 'generation','aspect':aspect,'kind':'svg',
               'multistage':True,'objects':[o['name'] for o in objects],'stages':stages}

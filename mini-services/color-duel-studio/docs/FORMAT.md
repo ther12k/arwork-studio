@@ -49,6 +49,8 @@ QA (`validation.json → objects`) reports orphan shapes/regions, missing shapeI
 
 AI generation and image workflows are orchestrated transactionally via `GenerationSessionManager`. A session isolates all drafts in `workspace/projects/{pid}/sessions/{session_id}/` (ScenePlan, vector fragments, candidate master SVG, compiled test bundle) and only promotes to an immutable project revision (`revisions/rev-*`) upon explicit commit after passing QA. If generation fails, cancels, or fails validation, current project revisions remain completely untouched.
 
+Create-with-AI runs as separate paid steps so vector cost is only paid once the plan is stable: `plan` (one strict-JSON scene-planning call → fills the draft's objects) → user revisions via structured mutations → `generate` (one fragment call per planned object, composed into the session master, compiled + QA'd) → `commit`. Targeted object regeneration (`regenerate-object`) replaces a single object's shapes in the session master — the `objectId` is preserved while internal shapeIds change — and recompiles, re-deriving neighbours' visible surfaces without touching untouched objects' shapes.
+
 When committed, `artwork.json` records generation provenance:
 
 ```json

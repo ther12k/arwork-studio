@@ -573,6 +573,71 @@ def create_app(workspace: Path|None=None, transport=None):
             save(p)
             return res
 
+    @app.post('/api/projects/{pid}/generation/sessions/{sid}/plan')
+    def plan_session_route(pid: str, sid: str, body: dict = {}):
+        # Paid step 1 of Create-with-AI: strict-JSON scene planning. Drafts a
+        # revisable ScenePlan; no vector fragments are purchased yet.
+        with lock:
+            p = project(pid)
+            editable(p)
+            if not (body or {}).get('confirm_paid'):
+                raise HTTPException(400, 'Confirm the paid provider request first: this sends the prompt to the AI provider and may incur charges.')
+            if not provider.config()['configured']:
+                raise HTTPException(503, 'AI not configured. Add OPENAI_API_KEY to .env. Upload-to-vector works without it.')
+            sm = GenerationSessionManager(folder(pid), pid)
+
+        def run(tick):
+            session, usage = sm.plan_session_with_ai(sid, provider,
+                                                     instructions=str((body or {}).get('instructions') or ''),
+                                                     progress=tick)
+            return {'session': session, 'usage': {'kind': 'scene-plan', 'at': now(), **usage}}
+
+        return start(pid, 'AI scene planning', run)
+
+    @app.post('/api/projects/{pid}/generation/sessions/{sid}/generate')
+    def generate_session_route(pid: str, sid: str, body: dict = {}):
+        # Paid step 2 of Create-with-AI: one vector fragment per planned
+        # object, composed + compiled + QA'd inside the session workspace.
+        with lock:
+            p = project(pid)
+            editable(p)
+            if not (body or {}).get('confirm_paid'):
+                raise HTTPException(400, 'Confirm the paid provider request first: this runs one AI call per planned object and may incur charges.')
+            if not provider.config()['configured']:
+                raise HTTPException(503, 'AI not configured. Add OPENAI_API_KEY to .env. Upload-to-vector works without it.')
+            sm = GenerationSessionManager(folder(pid), pid)
+
+        def run(tick):
+            session, usage = sm.generate_session_master(sid, provider, progress=tick)
+            return {'session': session, 'usage': {'at': now(), **usage}}
+
+        return start(pid, 'AI artwork synthesis', run)
+
+    @app.post('/api/projects/{pid}/generation/sessions/{sid}/regenerate-object')
+    def regenerate_session_object_route(pid: str, sid: str, body: dict = {}):
+        # Paid targeted regeneration: replace one object's shapes (objectId is
+        # preserved), recompile, QA — everything else keeps its geometry.
+        with lock:
+            p = project(pid)
+            editable(p)
+            body = body or {}
+            if not body.get('confirm_paid'):
+                raise HTTPException(400, 'Confirm the paid provider request first: this sends the object brief to the AI provider and may incur charges.')
+            if not provider.config()['configured']:
+                raise HTTPException(503, 'AI not configured. Add OPENAI_API_KEY to .env. Upload-to-vector works without it.')
+            object_id = str(body.get('objectId') or '')
+            if not object_id:
+                raise HTTPException(400, 'objectId is required.')
+            sm = GenerationSessionManager(folder(pid), pid)
+
+        def run(tick):
+            session, usage = sm.regenerate_session_object(sid, provider, object_id,
+                                                          instructions=str(body.get('instructions') or ''),
+                                                          progress=tick)
+            return {'session': session, 'usage': {'at': now(), **usage}}
+
+        return start(pid, 'targeted object regeneration', run)
+
     app.mount('/static',StaticFiles(directory=BASE/'web'),name='static')
     @app.get('/')
     def index():return FileResponse(BASE/'web/index.html')

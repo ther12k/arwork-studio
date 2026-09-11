@@ -1,4 +1,4 @@
-import io,time,json,base64
+import io,time,json,base64,re
 import httpx,pytest
 from PIL import Image
 from fastapi.testclient import TestClient
@@ -513,3 +513,150 @@ def test_generation_session_failure_rollback(client):
     assert r.status_code == 400
 
 
+
+
+def test_generation_plan_and_generate_mocked(tmp_path, monkeypatch):
+    """Phase 2B gate: chat-first scene plan (cheap JSON call) -> user
+    mutations -> per-object synthesis (one /svg call per planned object) ->
+    ready_to_commit in session isolation -> atomic commit with semantic
+    objects.json."""
+    monkeypatch.setenv('OPENAI_API_KEY', 'fake-key')
+    seen = []
+    with TestClient(create_app(tmp_path, transport=_multistage_transport(seen))) as c:
+        pid = new(c)
+        r = c.post(f'/api/projects/{pid}/generation/sessions', headers=H,
+                   json={'mode': 'ai_chat', 'requested_difficulty': 'hard',
+                         'prompt': 'a cottage garden beside a waterfall'})
+        assert r.status_code == 200, r.text
+        sid = r.json()['id']
+
+        # paid gate: planning without confirm is rejected
+        r = c.post(f'/api/projects/{pid}/generation/sessions/{sid}/plan', headers=H, json={})
+        assert r.status_code == 400
+
+        # plan (cheap strict-JSON call)
+        r = c.post(f'/api/projects/{pid}/generation/sessions/{sid}/plan', headers=H,
+                   json={'confirm_paid': True})
+        assert r.status_code == 200, r.text
+        p = wait(c, pid)
+        assert p['job']['status'] == 'done', p['job']
+        assert sum(1 for s in seen if s.endswith('/json')) == 1
+        sess = c.get(f'/api/projects/{pid}/generation/sessions/{sid}').json()
+        obj_ids = [o['id'] for o in sess['scenePlan']['objects']]
+        assert 'obj-sky' in obj_ids and 'obj-house' in obj_ids
+        sky = next(o for o in sess['scenePlan']['objects'] if o['id'] == 'obj-sky')
+        assert 0 < sky['detailWeight'] <= 4
+        assert sess['meta']['planUsage'].get('input_tokens') == 60
+        assert any(u.get('kind') == 'scene-plan' for u in p['aiUsage'])
+
+        # user revises the draft: add a cat, remove the path
+        r = c.post(f'/api/projects/{pid}/generation/sessions/{sid}/mutate', headers=H,
+                   json={'mutations': [
+                       {'op': 'add_object', 'object': {'id': 'obj-cat-1', 'name': 'Cat',
+                                                       'role': 'foreground', 'z': 6,
+                                                       'bbox': [40, 600, 80, 60],
+                                                       'fills': ['#333333'], 'detailWeight': 0.8}},
+                       {'op': 'remove_object', 'objectId': 'obj-path'},
+                   ]})
+        assert r.status_code == 200, r.text
+        ids = [o['id'] for o in r.json()['scenePlan']['objects']]
+        assert 'obj-cat-1' in ids and 'obj-path' not in ids
+
+        # paid gate on generate
+        r = c.post(f'/api/projects/{pid}/generation/sessions/{sid}/generate', headers=H, json={})
+        assert r.status_code == 400
+
+        # generate: one fragment call per planned object
+        r = c.post(f'/api/projects/{pid}/generation/sessions/{sid}/generate', headers=H,
+                   json={'confirm_paid': True})
+        assert r.status_code == 200, r.text
+        p = wait(c, pid)
+        assert p['job']['status'] == 'done', p['job']
+        assert sum(1 for s in seen if s.endswith('/svg')) == len(ids)
+        sess = c.get(f'/api/projects/{pid}/generation/sessions/{sid}').json()
+        assert sess['status'] == 'ready_to_commit'
+        assert sess['meta']['qa']['passed'] is True
+        assert any(u.get('kind') == 'generation-synthesis' for u in p['aiUsage'])
+
+        # isolation: nothing committed yet
+        p_now = c.get(f'/api/projects/{pid}').json()
+        assert p_now['currentRevision'] is None and len(p_now['revisions']) == 0
+
+        # atomic commit
+        r = c.post(f'/api/projects/{pid}/generation/sessions/{sid}/commit', headers=H,
+                   json={'title': 'Garden from session'})
+        assert r.status_code == 200, r.text
+        rev = r.json()['revision']['id']
+        p = c.get(f'/api/projects/{pid}').json()
+        assert p['currentRevision'] == rev and len(p['revisions']) == 1
+        manifest = c.get(f'/api/projects/{pid}/revisions/{rev}/files/artwork.json').json()
+        assert manifest['generation']['mode'] == 'ai_chat'
+        assert manifest['generation']['requestedDifficulty'] == 'hard'
+        objs = c.get(f'/api/projects/{pid}/revisions/{rev}/files/objects.json').json()
+        oids = {o['id'] for o in objs['objects']}
+        assert 'obj-cat-1' in oids and 'obj-path' not in oids
+        assert {'obj-sky', 'obj-hills', 'obj-house', 'obj-tree', 'obj-flowers'} <= oids
+
+
+def test_generation_targeted_regeneration_mocked(tmp_path, monkeypatch):
+    """Phase 2B gate: targeted regeneration replaces ONE object's shapes and
+    recompiles, while untouched objects keep their exact shapeIds and the
+    objectId stays stable."""
+    monkeypatch.setenv('OPENAI_API_KEY', 'fake-key')
+    seen = []
+    with TestClient(create_app(tmp_path, transport=_multistage_transport(seen))) as c:
+        pid = new(c)
+        sid = c.post(f'/api/projects/{pid}/generation/sessions', headers=H,
+                     json={'mode': 'ai_chat', 'requested_difficulty': 'medium',
+                           'prompt': 'garden'}).json()['id']
+        c.post(f'/api/projects/{pid}/generation/sessions/{sid}/plan', headers=H,
+               json={'confirm_paid': True})
+        wait(c, pid)
+        r = c.post(f'/api/projects/{pid}/generation/sessions/{sid}/generate', headers=H,
+                   json={'confirm_paid': True})
+        assert r.status_code == 200
+        wait(c, pid)
+        sess = c.get(f'/api/projects/{pid}/generation/sessions/{sid}').json()
+        assert sess['status'] == 'ready_to_commit'
+
+        sfile = tmp_path / pid / 'sessions' / sid / 'bundle' / 'objects.json'
+        before = {o['id']: o['shapeIds'] for o in json.loads(sfile.read_text())['objects']}
+        svg_calls_before = sum(1 for s in seen if s.endswith('/svg'))
+
+        # unknown object rejected
+        r = c.post(f'/api/projects/{pid}/generation/sessions/{sid}/regenerate-object', headers=H,
+                   json={'objectId': 'obj-ghost', 'confirm_paid': True})
+        assert r.status_code == 200            # async job: failure surfaces in the job
+        p = wait(c, pid)
+        assert p['job']['status'] == 'failed'
+        assert 'not part of this session plan' in p['job']['message']
+
+        # targeted regeneration of obj-house (one extra /svg call, others untouched)
+        r = c.post(f'/api/projects/{pid}/generation/sessions/{sid}/regenerate-object', headers=H,
+                   json={'objectId': 'obj-house', 'instructions': 'make the roof red',
+                         'confirm_paid': True})
+        assert r.status_code == 200, r.text
+        p = wait(c, pid)
+        assert p['job']['status'] == 'done', p['job']
+        assert sum(1 for s in seen if s.endswith('/svg')) == svg_calls_before + 1
+        sess = c.get(f'/api/projects/{pid}/generation/sessions/{sid}').json()
+        assert sess['status'] == 'ready_to_commit'
+        assert sess['meta']['qa']['passed'] is True
+
+        after = {o['id']: o['shapeIds'] for o in json.loads(sfile.read_text())['objects']}
+        # untouched objects keep their exact shape ownership
+        assert after['obj-sky'] == before['obj-sky']
+        assert after['obj-flowers'] == before['obj-flowers']
+        # regenerated object keeps its objectId and still owns shapes
+        assert after['obj-house']
+        assert any(u.get('kind') == 'object-regeneration' and u.get('objectId') == 'obj-house'
+                   for u in p['aiUsage'])
+        # the master file carries the replacement: the deterministic
+        # per-(object, fragment) regen prefix is present on obj-house shapes
+        # while the group identity is unchanged
+        master_text = (tmp_path / pid / 'sessions' / sid / 'source-master.svg').read_text()
+        assert 'data-cd-object="obj-house"' in master_text
+        assert re.search(r'id="obj-house-[0-9a-f]{8}-s\d{4}"', master_text)
+        # still no project revision was created by generation
+        p_now = c.get(f'/api/projects/{pid}').json()
+        assert p_now['currentRevision'] is None and len(p_now['revisions']) == 0

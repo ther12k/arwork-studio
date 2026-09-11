@@ -89,7 +89,10 @@ Backend (in `mini-services/color-duel-studio/`):
   (`GenerationSessionManager` under `sessions/{session_id}`). ScenePlan drafts support structured
   mutations (add/remove/update/reorder/difficulty). Healthy revisions are never mutated or corrupted
   during generation; failed/canceled sessions rollback cleanly; commit promotes the passed bundle
-  atomically into `revisions/rev-*` with enriched `generation` provenance.
+  atomically into `revisions/rev-*` with enriched `generation` provenance. Phase 2B adds the paid
+  steps with explicit confirm gates: `/plan` (strict-JSON scene planning), `/generate` (one
+  fragment per planned object via `svg_compose_from_objects`), `/regenerate-object` (replaces one
+  object's shapes in the session master — objectId preserved, neighbours re-derived by recompile).
 
 ## Conventions & hygiene
 
