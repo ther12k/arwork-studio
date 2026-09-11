@@ -56,3 +56,10 @@ server.log
 __pycache__/
 mini-services/color-duel-studio/workspace/
 mini-services/color-duel-studio/dist/
+
+# secrets, databases, tool output and downloaded artifacts — never commit
+.env
+db/
+tool-results/
+download/
+*.pyc

@@ -1,7 +1,10 @@
 # CI for the Color Duel Art Studio monorepo.
-# Backend: python test suite (pipeline + API + game adapter contract).
-# Frontend: typecheck + lint (full production build stays local-only per the
-# sandbox rules; this workflow mirrors what CI should gate a merge on).
+# Backend: python test suite (pipeline + API + game adapter contract) + a REAL
+# release-archive leak assertion (fails when workspace/env/log/db/pycache
+# entries ship).
+# Frontend: typecheck (strict, no emit) + lint. Full production build stays
+# local-only per the sandbox rules for now.
+# - run: bun run build  # full build gates merge later, once sandbox rules allow
 name: ci
 
 on:
@@ -25,7 +28,12 @@ jobs:
       - name: Test suite
         run: python -m pytest tests/test_pipeline.py tests/test_api.py tests/test_game_adapter.py -q
       - name: Release archive hygiene
-        run: python scripts/package_release.py && tar -tzf dist/*.tar.gz | grep -Ev 'workspace|\.env|\.log|__pycache__' > /dev/null
+        run: |
+          python scripts/package_release.py
+          if tar -tzf dist/*.tar.gz | grep -E 'workspace/|\.env$|\.log$|__pycache__|\.db$'; then
+            echo "FORBIDDEN FILES FOUND IN RELEASE ARCHIVE"; exit 1
+          fi
+          echo "Archive clean: no workspace/env/log/db/pycache entries."
 
   frontend:
     runs-on: ubuntu-latest
@@ -35,5 +43,7 @@ jobs:
         with:
           bun-version: latest
       - run: bun install --frozen-lockfile
+      - name: Typecheck (strict, no emit)
+        run: bunx tsc --noEmit
       - name: Lint (includes Next.js rules)
         run: bun run lint
