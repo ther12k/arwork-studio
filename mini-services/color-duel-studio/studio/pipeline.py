@@ -91,7 +91,14 @@ BACKENDS = [
 
 
 def write_json(path: Path, value) -> None:
-    path.write_text(json.dumps(value, ensure_ascii=False, separators=(',', ':'), allow_nan=False), encoding='utf-8')
+    # Atomic publish (tmp + rename): concurrent readers — polling HTTP
+    # requests during a running job — must never observe a half-written
+    # session/project file (a truncated read surfaces as a spurious 400
+    # 'Expecting value' JSON error).
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + '.tmp')
+    tmp.write_text(json.dumps(value, ensure_ascii=False, separators=(',', ':'), allow_nan=False), encoding='utf-8')
+    tmp.replace(path)
 
 
 def read_json(path: Path):
