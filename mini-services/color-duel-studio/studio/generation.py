@@ -1154,13 +1154,15 @@ class GenerationSessionManager:
             'width': info['width'], 'height': info['height'],
             'name': (display_name or 'source image')[:120], 'at': _now(),
         }
-        # The stored source is a BUILD INPUT: any previously built result now
-        # mismatches the active inputs — commit refuses until a new convert
-        # run (the snapshot is kept; the comparison is the guard, so
-        # re-uploading the SAME source re-enables commit honestly). The flag
-        # surfaces the mismatch to the UI immediately.
-        if session['status'] == 'ready_to_commit':
-            session['meta']['buildInputsStale'] = True
+        # The stored source is a BUILD INPUT: the result snapshot is kept and
+        # the flag is COMPUTED from the comparison — re-uploading the SAME
+        # source (or restoring matching inputs) honestly clears the flag with
+        # no provider spend.
+        active = session.get('meta', {}).get('activeBuildInputs')
+        if active is not None:
+            session['meta']['buildInputsStale'] = active != self._build_inputs(session)
+        else:
+            session.get('meta', {}).pop('buildInputsStale', None)
         session['updatedAt'] = _now()
         write_json(sdir / 'session.json', session)
         return session
@@ -1197,11 +1199,13 @@ class GenerationSessionManager:
                 session['scenePlan'] = plan
             changed = True
         if changed:
-            # fidelity/difficulty are build inputs: the snapshot stays (the
-            # commit-time comparison refuses the mismatched result) and the
-            # flag surfaces the mismatch to the UI immediately.
-            if session['status'] == 'ready_to_commit':
-                session.setdefault('meta', {})['buildInputsStale'] = True
+            # fidelity/difficulty are build inputs: the snapshot stays and the
+            # flag is COMPUTED — restoring the previous settings clears it
+            # without any provider spend.
+            active = session.get('meta', {}).get('activeBuildInputs')
+            if active is not None:
+                session.setdefault('meta', {})['buildInputsStale'] = (
+                    active != self._build_inputs(session))
             session['updatedAt'] = _now()
             write_json(self.session_path(session_id) / 'session.json', session)
         return session
@@ -1384,9 +1388,18 @@ class GenerationSessionManager:
             diff_report['changed'] = False
             emit_bundle(bundle_dir, bundle)
             post_scores = scores
+        final_manifest = read_json(bundle_dir / 'artwork.json')
         session['meta']['qa'] = read_json(bundle_dir / 'validation.json')
         session['meta']['conversionScores'] = post_scores
         session['meta']['difficultyOptimization'] = diff_report
+        # Summary fields the workspace renders must describe the FINAL bundle
+        # (post-optimization, post-rollback alike).
+        session['meta']['measuredDifficulty'] = {
+            'rating': final_manifest['difficulty']['rating'],
+            'score': final_manifest['difficulty']['score'],
+            'metrics': final_manifest['difficulty']['metrics'],
+        }
+        session['meta']['regionCount'] = final_manifest['regionCount']
         # Task 30D — record WHICH build inputs produced this result; commit
         # re-checks the snapshot against the active session state.
         session['meta']['activeBuildInputs'] = self._build_inputs(session)
@@ -1486,6 +1499,14 @@ class GenerationSessionManager:
                     'measuredDifficulty': measured,
                     'regionCount': result['manifest']['regionCount'],
                 }, clear_meta=['artworkStale'])
+                # Task 30 — the result now matches the ACTIVE inputs; record
+                # the identity snapshot (image sessions only — ai_chat has no
+                # source) so a later source change invalidates the commit.
+                fresh = self.get_session(session_id)
+                if fresh['mode'] in ('image_reference', 'image_convert'):
+                    fresh.setdefault('meta', {})['activeBuildInputs'] = self._build_inputs(fresh)
+                    fresh['meta'].pop('buildInputsStale', None)
+                    write_json(self.session_path(session_id) / 'session.json', fresh)
             return result
         except Exception as exc:
             self.update_status(session_id, 'failed', error=str(exc))
@@ -1510,18 +1531,16 @@ class GenerationSessionManager:
             pending_list = ', '.join(f'{oid} ({"/".join(fields)})' for oid, fields in sorted(pending.items()))
             raise ValueError('The plan has visual changes the artwork does not reflect yet: '
                              f'{pending_list}. Regenerate those objects (or bulk regenerate) before committing.')
-        if session['mode'] == 'image_convert':
-            # Task 30D — a convert result may only be committed while it was
-            # built from the ACTIVE inputs (source, fidelity policy, plan,
-            # gameplay settings). A stale result is never silently committed.
+        if session['mode'] in ('image_convert', 'image_reference'):
+            # Task 30D — an image-session result may only be committed while
+            # it was built from the ACTIVE inputs (source, fidelity policy,
+            # plan, gameplay settings). A stale result is never silently
+            # committed — including a Reference result whose source changed
+            # after generation.
             active = session.get('meta', {}).get('activeBuildInputs')
-            if not active:
-                raise ValueError('This convert result was built from different inputs '
-                                 '(the source or settings changed). Run Convert again.')
-            current = self._build_inputs(session)
-            if active != current:
-                raise ValueError('This convert result was built from different inputs '
-                                 '(the source or settings changed). Run Convert again.')
+            if not active or active != self._build_inputs(session):
+                raise ValueError('This result was built from different inputs '
+                                 '(the source or settings changed). Run the build step again.')
 
         sdir = self.session_path(session_id)
         bundle_dir = sdir / 'bundle'

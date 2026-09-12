@@ -1678,3 +1678,22 @@ Work Log:
 
 Stage Summary:
 - The reviewer's locked+pending hole is closed at the source (guard before spend; local work at zero cost still applies the plan), and the image journey now honors one contract end to end: the visible source is always the stored session asset, results are only committable while they match the active inputs, and both Reference and Convert reuse the exact same session/plan/review/commit machinery as Task 29. Remaining honest limits (per reviewer, deferred to Task 31): no idempotency keys / local in-flight guards beyond the running-job guard yet, and provider-quality smoke testing with a real key stays a pre-release item.
+
+---
+Task ID: 32
+Agent: main (ZCode)
+Task: Task-30 closing patch (reviewer table P1×3 + P2×3) + Reference golden-path browser verification. No feature work beyond the table; single commit becomes the next review baseline.
+
+Work Log:
+- P1 Reference without a file: /reference-plan's stored-source branch no longer touches file.filename — it copies the already-normalized source.png verbatim as reference-image.png; the multipart branch keeps its own suffix handling. Regression: upload → refresh-equivalent (plain session get) → /reference-plan with NO multipart file → planning succeeds from the stored source (objects planned, source sha intact).
+- P1 Reference source invalidation: the activeBuildInputs commit guard now covers image_reference too, and compile_session records the identity snapshot for BOTH image modes (ai_chat has no source and stays out). Regression: Reference A → analyze → generate (ready, snapshot src=A) → source swapped to B (flag computed True) → commit REFUSED ('built from different inputs').
+- P1 inline Convert metadata: the /convert route funnels BOTH entry paths through set_session_source — an inline multipart upload updates the stored bytes, meta.source hash AND the build-identity together (no more silent divergence). Regression: stored A → inline Convert B → bytes/meta/snapshot all report B.
+- P2 restore-fidelity semantics: buildInputsStale is now COMPUTED from activeBuildInputs != current inputs at every source/settings change (never blanket-true); restore → flag False → Commit enabled, zero provider calls. Regression test asserts exactly that (Balanced → Faithful → Balanced, no /svg spend, commit 200).
+- P2 Convert summary: convert_session_image now reads the FINAL manifest after optimization/rollback and fills meta.measuredDifficulty + meta.regionCount from it (the workspace summary can no longer disagree with the shipped bundle). Regression asserts summary == final manifest.
+- P2 source-isolation test: the 'or True' crutch is gone — the two-session test now swaps one session's source through the real endpoint and verifies each session's stored hash + preview BYTES stay its own.
+- Two real bugs found by the new tests and fixed: (1) palette_for_regions crashed on single-color images ('cannot reshape array of size 1') — cv2.kmeans cannot run on one sample; guarded: single-candidate input returns that color as the palette (deterministic). (2) _convert_transport's static 100×100 fragment failed the compose placement sanity for reference plans positioned away from the origin — the mock now draws inside the requested bbox (multistage pattern).
+- Browser golden path REFERENCE (the one Convert couldn't prove): live stack + deterministic mock bridge — reference session + source stored via the same calls the shell makes → PAGE RELOAD → resume → workspace renders the stored source card ('your image is never traced') → 'Analyze reference with AI' (confirm dialog: vision analysis + NEW-original-scene semantics) → plan drafted from the STORED source (P1-1 end-to-end, zero file sent) → Generate (~6 calls confirm) → ready_to_commit with identity src == stored sha → review (QA Passed ✓) → Commit artwork → editor v0.1.0 · generation.
+- Gates: full suite 117 passed / 7 skipped (+5 tests), tsc/eslint/build green.
+
+Stage Summary:
+- The reviewer's six-item table is closed with regressions proving each row, the Reference journey is now browser-verified end-to-end from a stored source (the exact path Convert couldn't cover), and two latent bugs (single-color palette crash; misleading convert mock) surfaced and fixed by the new tests. Baseline for the next review is this single commit; Task 31 (progress/cancel/retry/recovery + idempotency) follows with no scope bleed from this patch.

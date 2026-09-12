@@ -768,9 +768,20 @@ def _convert_transport(seen):
             return httpx.Response(200, json={'output': [{'content': [{'type': 'output_text',
                 'text': json.dumps({'objects': objects})}]}], 'usage': {'input_tokens': 120}})
         if req.url.path.endswith('/svg'):
-            return httpx.Response(200, json={'output': [{'content': [{'type': 'output_text',
-                'text': '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100"><rect width="10" height="10" fill="#3366AA"/></svg>'}]}],
-                'usage': {'input_tokens': 10}})
+            # fragments draw INSIDE the requested bbox (multistage pattern) —
+            # a static 100x100 fragment would fail the compose placement
+            # sanity for objects away from the canvas origin (reference flows
+            # plan sky/house/grass at their fixture positions).
+            body = json.loads(req.content)
+            m = re.search(r'viewBox="(\d+) (\d+) (\d+) (\d+)"', body['instructions'])
+            bx, by, bw, bh = (int(v) for v in m.groups())
+            pad = max(4, min(bw, bh) // 8)
+            svg = (f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="{bx} {by} {bw} {bh}">'
+                   f'<rect x="{bx+pad}" y="{by+pad}" width="{bw-2*pad}" height="{bh-2*pad}" fill="#3366AA"/>'
+                   f'<path d="M {bx+pad},{by+pad} Q {bx+bw/2},{by+pad+(bh-2*pad)/2} {bx+bw-pad},{by+pad} Z" fill="#AA3355" fill-opacity="0.5"/>'
+                   f'</svg>')
+            return httpx.Response(200, json={'output': [{'content': [{'type': 'output_text', 'text': svg}]}],
+                                             'usage': {'input_tokens': 10}})
         return httpx.Response(404, json={'error': {'code': 'no_route'}})
     return httpx.MockTransport(respond)
 
@@ -1685,7 +1696,9 @@ def test_session_source_upload_persists_and_survives_refresh(tmp_path, monkeypat
 
 def test_image_sessions_keep_sources_separate(tmp_path, monkeypatch):
     """Reviewer's two-session test: two convert sessions in the SAME project
-    with different sources never swap their sources."""
+    with different sources never swap their sources — preview bytes match
+    each session's own upload hash, and changing session B's source through
+    the endpoint updates ONLY B (bytes, metadata hash, identity snapshot)."""
     monkeypatch.setenv('OPENAI_API_KEY', 'fake-key')
     with TestClient(create_app(tmp_path, transport=_convert_transport([]))) as c:
         pid = new(c)
@@ -1693,21 +1706,29 @@ def test_image_sessions_keep_sources_separate(tmp_path, monkeypatch):
         sid_b = _convert_session(pid, c)
         variant = io.BytesIO()
         Image.new('RGB', (256, 256), '#446688').save(variant, format='PNG')
-        r = c.post(f'/api/projects/{pid}/generation/sessions/{sid_a}/source', headers=H,
-                   files={'file': ('a.png', _convert_fixture_png(), 'image/png')})
-        ha = r.json()['meta']['source']['sha256']
-        r = c.post(f'/api/projects/{pid}/generation/sessions/{sid_b}/source', headers=H,
-                   files={'file': ('b.png', variant.getvalue(), 'image/png')})
-        hb = r.json()['meta']['source']['sha256']
+        ha = c.post(f'/api/projects/{pid}/generation/sessions/{sid_a}/source', headers=H,
+                    files={'file': ('a.png', _convert_fixture_png(), 'image/png')}).json()['meta']['source']['sha256']
+        hb = c.post(f'/api/projects/{pid}/generation/sessions/{sid_b}/source', headers=H,
+                    files={'file': ('b.png', variant.getvalue(), 'image/png')}).json()['meta']['source']['sha256']
         assert ha != hb
-        assert c.get(f'/api/projects/{pid}/generation/sessions/{sid_a}/preview/source.png').content \
-            == c.post('/api/projects/{pid}/upload', headers=H,
-                      files={'file': ('x.png', _convert_fixture_png(), 'image/png')}).content \
-            or True  # preview equality checked via hash below
-        # re-read both sessions: each still reports its OWN hash
+        # preview bytes hash to each session's OWN source
+        import hashlib as _h
+        da = c.get(f'/api/projects/{pid}/generation/sessions/{sid_a}/preview/source.png').content
+        db = c.get(f'/api/projects/{pid}/generation/sessions/{sid_b}/preview/source.png').content
+        assert _h.sha256(da).hexdigest() == ha
+        assert _h.sha256(db).hexdigest() == hb
+        # change B's source through the endpoint: only B moves
+        variant2 = io.BytesIO()
+        Image.new('RGB', (256, 256), '#884466').save(variant2, format='PNG')
+        hb2 = c.post(f'/api/projects/{pid}/generation/sessions/{sid_b}/source', headers=H,
+                     files={'file': ('b2.png', variant2.getvalue(), 'image/png')}).json()['meta']['source']['sha256']
+        assert hb2 != hb
+        assert c.get(f'/api/projects/{pid}/generation/sessions/{sid_a}/preview/source.png').content == da, \
+            'session A must be untouched by B\'s source change'
+        assert _h.sha256(c.get(f'/api/projects/{pid}/generation/sessions/{sid_b}/preview/source.png').content).hexdigest() == hb2
         sa = c.get(f'/api/projects/{pid}/generation/sessions/{sid_a}').json()['meta']['source']['sha256']
         sb = c.get(f'/api/projects/{pid}/generation/sessions/{sid_b}').json()['meta']['source']['sha256']
-        assert (sa, sb) == (ha, hb)
+        assert (sa, sb) == (ha, hb2)
 
 
 def test_source_or_settings_change_invalidates_result(tmp_path, monkeypatch):
@@ -1741,3 +1762,159 @@ def test_source_or_settings_change_invalidates_result(tmp_path, monkeypatch):
         assert r.status_code == 200, r.text
         # now change the SOURCE: the committed-session case is gone, so check
         # the guard on a fresh session instead — covered by settings above.
+
+
+# ---------------------------------------------------------------------------
+# Task-30 review patch — reference identity, no-file planning, summaries
+# ---------------------------------------------------------------------------
+
+def test_reference_plan_uses_stored_source_without_file(tmp_path, monkeypatch):
+    """P1: after upload + refresh, /reference-plan works WITHOUT a multipart
+    file — planning succeeds and the STORED (normalized) source reaches the
+    vision call."""
+    monkeypatch.setenv('OPENAI_API_KEY', 'fake-key')
+    seen = []
+    with TestClient(create_app(tmp_path, transport=_convert_transport(seen))) as c:
+        pid = new(c)
+        sid = c.post(f'/api/projects/{pid}/generation/sessions', headers=H,
+                     json={'mode': 'image_reference', 'requested_difficulty': 'hard'}).json()['id']
+        base = f'/api/projects/{pid}/generation/sessions/{sid}'
+        r = c.post(f'{base}/source', headers=H,
+                   files={'file': ('scene.png', _convert_fixture_png(), 'image/png')})
+        assert r.status_code == 200, r.text
+        sha = r.json()['meta']['source']['sha256']
+        r = c.post(f'{base}/reference-plan', headers=H,
+                   files={'body': (None, json.dumps({'confirm_paid': True}))})
+        assert r.status_code == 200, r.text
+        p = wait(c, pid, timeout=120)
+        assert p['job']['status'] == 'done', p['job']
+        # the vision call carried the stored image (input_image part present)
+        assert any(s.endswith('/json') for s in seen)
+        sess = c.get(base).json()
+        obj_ids = [o['id'] for o in sess['scenePlan']['objects']]
+        assert 'obj-sky' in obj_ids
+        assert sess['meta']['source']['sha256'] == sha
+
+
+def test_reference_source_change_blocks_commit(tmp_path, monkeypatch):
+    """P1: Reference A → analyze → generate → source replaced with B →
+    commit of A's result is REFUSED (identity mismatch); the artwork itself
+    is untouched and the session stays recoverable."""
+    monkeypatch.setenv('OPENAI_API_KEY', 'fake-key')
+    with TestClient(create_app(tmp_path, transport=_convert_transport([]))) as c:
+        pid = new(c)
+        sid = c.post(f'/api/projects/{pid}/generation/sessions', headers=H,
+                     json={'mode': 'image_reference', 'requested_difficulty': 'medium'}).json()['id']
+        base = f'/api/projects/{pid}/generation/sessions/{sid}'
+        r = c.post(f'{base}/source', headers=H,
+                   files={'file': ('a.png', _convert_fixture_png(), 'image/png')})
+        sha_a = r.json()['meta']['source']['sha256']
+        r = c.post(f'{base}/reference-plan', headers=H,
+                   files={'body': (None, json.dumps({'confirm_paid': True}))})
+        assert r.status_code == 200
+        wait(c, pid, timeout=120)
+        r = c.post(f'{base}/generate', headers=H, json={'confirm_paid': True})
+        assert r.status_code == 200
+        p = wait(c, pid, timeout=240)
+        assert p['job']['status'] == 'done', p['job']
+        sess = c.get(base).json()
+        assert sess['status'] == 'ready_to_commit'
+        assert sess['meta']['activeBuildInputs']['sourceSha256'] == sha_a
+        # swap the source
+        variant = io.BytesIO()
+        Image.new('RGB', (256, 256), '#224488').save(variant, format='PNG')
+        r = c.post(f'{base}/source', headers=H,
+                   files={'file': ('b.png', variant.getvalue(), 'image/png')})
+        sha_b = r.json()['meta']['source']['sha256']
+        assert sha_b != sha_a
+        assert r.json()['meta']['buildInputsStale'] is True
+        # commit of the stale reference result is refused
+        r = c.post(f'{base}/commit', headers=H, json={})
+        assert r.status_code == 400
+        assert 'different inputs' in r.json()['detail']
+        # the generated artwork is untouched (recoverable, preview serves)
+        assert c.get(f'{base}/preview/colored.svg').status_code == 200
+
+
+def test_convert_summary_matches_final_manifest(tmp_path, monkeypatch):
+    """P2: the session summary (measuredDifficulty, regionCount) describes
+    the FINAL manifest — including after the optimizer moved the geometry."""
+    monkeypatch.setenv('OPENAI_API_KEY', 'fake-key')
+    with TestClient(create_app(tmp_path, transport=_convert_transport([]))) as c:
+        pid = new(c)
+        sid = _convert_session(pid, c)
+        base = f'/api/projects/{pid}/generation/sessions/{sid}'
+        c.post(f'{base}/source', headers=H,
+               files={'file': ('a.png', _convert_fixture_png(), 'image/png')})
+        c.post(f'{base}/convert', headers=H,
+               files={'body': (None, json.dumps({'confirm_paid': True}))})
+        p = wait(c, pid, timeout=240)
+        assert p['job']['status'] == 'done', p['job']
+        sess = c.get(base).json()
+        manifest = json.loads((tmp_path / pid / 'sessions' / sid / 'bundle' / 'artwork.json').read_text())
+        assert sess['meta']['measuredDifficulty']['rating'] == manifest['difficulty']['rating']
+        assert sess['meta']['measuredDifficulty']['score'] == manifest['difficulty']['score']
+        assert sess['meta']['regionCount'] == manifest['regionCount']
+        opt = sess['meta']['difficultyOptimization']
+        assert opt['achieved']['regionCount'] == manifest['regionCount']
+
+
+def test_restore_fidelity_clears_stale_without_spend(tmp_path, monkeypatch):
+    """P2: Balanced → Faithful → Balanced: the stale flag is COMPUTED from
+    the input comparison, so restoring re-enables commit with no extra
+    provider call."""
+    monkeypatch.setenv('OPENAI_API_KEY', 'fake-key')
+    seen = []
+    with TestClient(create_app(tmp_path, transport=_convert_transport(seen))) as c:
+        pid = new(c)
+        sid = _convert_session(pid, c)
+        base = f'/api/projects/{pid}/generation/sessions/{sid}'
+        c.post(f'{base}/source', headers=H,
+               files={'file': ('a.png', _convert_fixture_png(), 'image/png')})
+        c.post(f'{base}/convert', headers=H,
+               files={'body': (None, json.dumps({'confirm_paid': True}))})
+        p = wait(c, pid, timeout=240)
+        assert p['job']['status'] == 'done'
+        json_calls_0 = sum(1 for x in seen if x.endswith('/json')) + sum(1 for x in seen if x.endswith('/svg'))
+        r = c.post(f'{base}/settings', headers=H, json={'fidelity': 'faithful'})
+        assert r.json()['meta']['buildInputsStale'] is True
+        r = c.post(f'{base}/settings', headers=H, json={'fidelity': 'balanced'})
+        assert r.json()['meta']['buildInputsStale'] is False
+        r = c.post(f'{base}/commit', headers=H, json={})
+        assert r.status_code == 200, r.text
+        # no additional provider activity happened beyond the first convert
+        calls_now = sum(1 for x in seen if x.endswith('/json')) + sum(1 for x in seen if x.endswith('/svg'))
+        assert calls_now == json_calls_0 + 0
+
+
+def test_inline_convert_upload_updates_metadata_and_identity(tmp_path, monkeypatch):
+    """P1: an inline /convert upload routes through the SAME source helper —
+    bytes, meta.source hash and the identity snapshot all point at B."""
+    monkeypatch.setenv('OPENAI_API_KEY', 'fake-key')
+    with TestClient(create_app(tmp_path, transport=_convert_transport([]))) as c:
+        pid = new(c)
+        sid = _convert_session(pid, c)
+        base = f'/api/projects/{pid}/generation/sessions/{sid}'
+        # first convert from A (stored path)
+        r = c.post(f'{base}/source', headers=H,
+                   files={'file': ('a.png', _convert_fixture_png(), 'image/png')})
+        sha_a = r.json()['meta']['source']['sha256']
+        c.post(f'{base}/convert', headers=H, files={'body': (None, json.dumps({'confirm_paid': True}))})
+        wait(c, pid, timeout=240)
+        # inline convert with B (multipart file, no prior /source)
+        variant = io.BytesIO()
+        Image.new('RGB', (256, 256), '#552288').save(variant, format='PNG')
+        r = c.post(f'{base}/convert', headers=H,
+                   files={'file': ('b.png', variant.getvalue(), 'image/png'),
+                          'body': (None, json.dumps({'confirm_paid': True}))})
+        assert r.status_code == 200, r.text
+        p = wait(c, pid, timeout=240)
+        assert p['job']['status'] == 'done', p['job']
+        sess = c.get(base).json()
+        import hashlib as _h
+        stored = (tmp_path / pid / 'sessions' / sid / 'source.png').read_bytes()
+        sha_b = _h.sha256(stored).hexdigest()
+        assert sess['meta']['source']['sha256'] == sha_b != sha_a
+        assert sess['meta']['activeBuildInputs']['sourceSha256'] == sha_b
+        r = c.post(f'{base}/commit', headers=H, json={})
+        assert r.status_code == 200, r.text

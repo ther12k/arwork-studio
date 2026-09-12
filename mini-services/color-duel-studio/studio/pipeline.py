@@ -1508,9 +1508,15 @@ def palette_for_regions(means: np.ndarray, requested: int):
     labs = rgb2lab(np.asarray(means, dtype=float).reshape(-1, 1, 3) / 255).reshape(-1, 3).astype(np.float32)
     count = min(requested, len(labs), len(np.unique(np.round(labs, 1), axis=0)))
     count = max(1, count)
-    cv2.setRNGSeed(23)
-    _, indexes, centers = cv2.kmeans(labs, count, None,
-                                      (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 80, .1), 1, cv2.KMEANS_PP_CENTERS)
+    if len(labs) < 2:
+        # Single-candidate input (e.g. a solid-color image): cv2.kmeans cannot
+        # run on one sample — the palette IS that color, no clustering.
+        centers = labs.astype(np.float32)
+        indexes = np.zeros(len(labs), dtype=np.int32)
+    else:
+        cv2.setRNGSeed(23)
+        _, indexes, centers = cv2.kmeans(labs, count, None,
+                                          (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 80, .1), 1, cv2.KMEANS_PP_CENTERS)
     order = np.argsort(centers[:, 0], kind='stable')
     inverse = np.empty(count, dtype=int); inverse[order] = np.arange(count)
     colors = np.clip(lab2rgb(centers[order].reshape(-1, 1, 3)).reshape(-1, 3) * 255, 0, 255).astype(np.uint8)

@@ -806,21 +806,23 @@ def create_app(workspace: Path|None=None, transport=None):
                 raise HTTPException(503, 'AI not configured. Add OPENAI_API_KEY to .env. Upload-to-vector works without it.')
             sm = GenerationSessionManager(folder(pid), pid)
             sdir = sm.session_path(sid)
+            ref_path = sdir / 'reference-image'
             if file is None:
                 stored = sdir / 'source.png'
                 if not stored.is_file():
                     raise HTTPException(400, 'Upload the reference image first.')
-                raw = stored.read_bytes()
+                # already clean_image-normalized PNG: use it verbatim
+                ref_path = sdir / 'reference-image.png'
+                ref_path.write_bytes(stored.read_bytes())
             else:
                 raw = await file.read(12 * 1024 * 1024 + 1)
-            if len(raw) >= 12 * 1024 * 1024:
-                raise HTTPException(400, 'Use a reference image under 12 MB.')
-            ref_path = sdir / 'reference-image'
-            suffix = Path(file.filename or 'reference.jpg').suffix.lower()
-            if suffix not in ('.png', '.jpg', '.jpeg', '.webp'):
-                suffix = '.jpg'
-            ref_path = ref_path.with_suffix(suffix)
-            ref_path.write_bytes(raw)
+                if len(raw) >= 12 * 1024 * 1024:
+                    raise HTTPException(400, 'Use a reference image under 12 MB.')
+                suffix = Path(file.filename or 'reference.jpg').suffix.lower()
+                if suffix not in ('.png', '.jpg', '.jpeg', '.webp'):
+                    suffix = '.jpg'
+                ref_path = ref_path.with_suffix(suffix)
+                ref_path.write_bytes(raw)
 
         def run(tick):
             session, usage = sm.plan_session_from_image(sid, provider, ref_path,
@@ -845,20 +847,20 @@ def create_app(workspace: Path|None=None, transport=None):
                 raise HTTPException(503, 'AI not configured. Add OPENAI_API_KEY to .env. Upload-to-vector works without it.')
             sm = GenerationSessionManager(folder(pid), pid)
             sdir = sm.session_path(sid)
-            if file is None:
-                source_png = sdir / 'source.png'
-                if not source_png.is_file():
-                    raise HTTPException(400, 'Upload the source image first.')
-                raw = source_png.read_bytes()
-            else:
+            # BOTH entry paths resolve through set_session_source so the bytes,
+            # meta.source hash and build-input identity always point at the
+            # SAME image (P1: an inline upload must not bypass the metadata).
+            if file is not None:
                 raw = await file.read(12 * 1024 * 1024 + 1)
                 if len(raw) >= 12 * 1024 * 1024:
                     raise HTTPException(400, 'Use a source image under 12 MB.')
+                try:
+                    sm.set_session_source(sid, raw, file.filename or 'source image')
+                except (ValueError, FileNotFoundError) as exc:
+                    raise HTTPException(400, str(exc))
             source_png = sdir / 'source.png'
-            try:
-                clean_image(raw, source_png)     # entrance gate + normalized pixels
-            except ValueError as exc:
-                raise HTTPException(400, str(exc))
+            if not source_png.is_file():
+                raise HTTPException(400, 'Upload the source image first.')
 
         def run(tick):
             session = sm.convert_session_image(sid, provider, source_png,
