@@ -387,52 +387,74 @@ class Provider:
             tick(.1+.75*i/max(1,len(objects)),f'Vectorizing object {i+1}/{len(objects)}: {obj["name"]}',
                  {'stage': 'vector_generation', 'completedObjects': i, 'totalObjects': len(objects),
                   'currentObjectId': obj.get('id') or f'obj-{i}'})
+            fp=_hashlib.sha256(json.dumps(
+                {'name':obj['name'],'description':obj.get('description',''),
+                 'bbox':obj['bbox'],'shapes':obj.get('shapes'),
+                 'fills':obj.get('fills')},sort_keys=True).encode()).hexdigest()[:16]
+            cached_file=_Path(cache_dir)/f'{obj["id"]}.svg' if cache_dir is not None else None
+            meta_file=_Path(cache_dir)/f'{obj["id"]}.json' if cache_dir is not None else None
             fragment=None
-            if cache_dir is not None:
-                # Task 31 checkpoint: reuse a previously VALIDATED fragment
-                # when its generation inputs (name/description/bbox/shapes/
-                # fills) are unchanged — plan changes or edits invalidate it.
-                fp=_hashlib.sha256(json.dumps(
-                    {'name':obj['name'],'description':obj.get('description',''),
-                     'bbox':obj['bbox'],'shapes':obj.get('shapes'),
-                     'fills':obj.get('fills')},sort_keys=True).encode()).hexdigest()[:16]
+            from_cache=False
+            if cached_file is not None:
+                # Task 31 checkpoint (read side): reuse a previously validated
+                # fragment when its generation inputs are unchanged. A corrupt
+                # or stale cache entry is discarded, never trusted.
                 try:
-                    cfile=_Path(cache_dir)/f'{obj["id"]}.svg'
-                    mfile=_Path(cache_dir)/f'{obj["id"]}.json'
-                    if cfile.is_file() and mfile.is_file():
-                        meta=json.loads(mfile.read_text(encoding='utf-8'))
+                    if cached_file.is_file() and meta_file.is_file():
+                        meta=json.loads(meta_file.read_text(encoding='utf-8'))
                         if meta.get('fp')==fp:
-                            fragment=cfile.read_text(encoding='utf-8')
+                            fragment=cached_file.read_text(encoding='utf-8')
+                            from_cache=True
                 except Exception:
                     fragment=None
+                    from_cache=False
             if fragment is None:
                 fragment,usage=self.svg_object(obj,view_box)
-                if cache_dir is not None:
+            # ---- validation pipeline (runs for NEW and CACHED fragments) ----
+            invalid_reason=None
+            if len(fragment.encode('utf-8'))>400*1024:
+                invalid_reason=f'Fragment for "{obj["name"]}" exceeds the 400 KB budget. No partial master was saved.'
+            doc=None
+            if invalid_reason is None:
+                try:
+                    doc=import_master(fragment)
+                except ValueError as exc:
+                    invalid_reason=f'Fragment for "{obj["name"]}" failed sanitization: {exc} No partial master was saved.'
+            if invalid_reason is None and doc is not None and not doc.shapes and not doc.ink_shapes:
+                invalid_reason=f'Fragment for "{obj["name"]}" contains no drawable shapes. No partial master was saved.'
+            if invalid_reason is None and doc is not None:
+                # placement sanity: the fragment must actually sit inside its bbox
+                xs=[];ys=[]
+                for sh in doc.shapes+doc.ink_shapes:
+                    b=sh.get('bbox') or (0,0,0,0)
+                    xs+= [b[0],b[2]]; ys+=[b[1],b[3]]
+                if xs and (min(xs)>obj['bbox'][0]+obj['bbox'][2] or max(xs)<obj['bbox'][0]
+                           or min(ys)>obj['bbox'][1]+obj['bbox'][3] or max(ys)<obj['bbox'][1]):
+                    invalid_reason=f'Fragment for "{obj["name"]}" was drawn outside its planned bbox. ' \
+                                   'No partial master was saved; retry explicitly if you want to spend again.'
+            if invalid_reason is not None:
+                if from_cache and cached_file is not None:
+                    # Task 31 review: a cached fragment that fails re-validation
+                    # is poisoned — delete it so the retry fetches fresh work
+                    # instead of replaying the same failure forever.
                     try:
-                        (_Path(cache_dir)/f'{obj["id"]}.svg').write_text(fragment,encoding='utf-8')
-                        (_Path(cache_dir)/f'{obj["id"]}.json').write_text(json.dumps(
-                            {'fp':fp,'name':obj['name']}),encoding='utf-8')
+                        cached_file.unlink(missing_ok=True)
+                        meta_file.unlink(missing_ok=True)
                     except Exception:
                         pass
-            if len(fragment.encode('utf-8'))>400*1024:
-                raise ValueError(f'Fragment for "{obj["name"]}" exceeds the 400 KB budget. No partial master was saved.')
-            try:
-                doc=import_master(fragment)
-            except ValueError as exc:
-                raise ValueError(f'Fragment for "{obj["name"]}" failed sanitization: {exc} '
-                                 'No partial master was saved.') from exc
-            if not doc.shapes and not doc.ink_shapes:
-                raise ValueError(f'Fragment for "{obj["name"]}" contains no drawable shapes. '
-                                 'No partial master was saved.')
-            # placement sanity: the fragment must actually sit inside its bbox
-            xs=[];ys=[]
-            for s in doc.shapes+doc.ink_shapes:
-                b=s.get('bbox') or (0,0,0,0)
-                xs+= [b[0],b[2]]; ys+=[b[1],b[3]]
-            if xs and (min(xs)>obj['bbox'][0]+obj['bbox'][2] or max(xs)<obj['bbox'][0]
-                       or min(ys)>obj['bbox'][1]+obj['bbox'][3] or max(ys)<obj['bbox'][1]):
-                raise ValueError(f'Fragment for "{obj["name"]}" was drawn outside its planned bbox. '
-                                 'No partial master was saved; retry explicitly if you want to spend again.')
+                raise ValueError(invalid_reason)
+            # ---- ALL validations passed: publish the checkpoint atomically ----
+            if cached_file is not None and not from_cache:
+                try:
+                    cached_file.parent.mkdir(parents=True,exist_ok=True)
+                    tmp=cached_file.with_suffix('.tmp')
+                    tmp.write_text(fragment,encoding='utf-8')
+                    tmp.replace(cached_file)                      # atomic publish
+                    mtmp=meta_file.with_suffix('.tmp')
+                    mtmp.write_text(json.dumps({'fp':fp,'name':obj['name']}),encoding='utf-8')
+                    mtmp.replace(meta_file)
+                except Exception:
+                    pass
             prefix=f'o{i}-'
             # Semantic object identity is born HERE, before any SVG exists in
             # the final master: every shape of this fragment is stamped with

@@ -107,7 +107,12 @@ def create_app(workspace: Path|None=None, transport=None):
             p['job']=job;save(p)
             return jid
 
-    def launch(pid,jid,kind,fn,on_cancel=None):
+    def launch(pid,jid,kind,fn,on_cancel=None,on_terminal=None):
+        """Schedule the worker. ``on_terminal(outcome, error, result)`` is the
+        SINGLE terminal decision owner: it is invoked exactly once, inside the
+        project lock, at the same moment the job's terminal status is decided
+        and published — so attempt records can never disagree with the job
+        (Task 31: no attempt=done + job=canceled interleaving)."""
         def tick(fraction,message,detail=None):
             with lock:
                 p=project(pid)
@@ -122,6 +127,7 @@ def create_app(workspace: Path|None=None, transport=None):
                 if detail: p['job'].update(detail)
                 save(p)
         def work():
+            outcome=('failed',None,None)
             try:
                 tick(.01,'Starting '+kind)
                 result=fn(tick)
@@ -147,6 +153,7 @@ def create_app(workspace: Path|None=None, transport=None):
                     if result.get('consumePending'):
                         p.pop('pendingBuildSettings',None)
                     p['job'].update(status='done',progress=1,message='Ready',finishedAt=now());save(p)
+                    outcome=('done',None,result)
             except JobCanceled:
                 # on_cancel runs BEFORE status='canceled' is published so the
                 # session's draft state settles before any waiting caller or
@@ -160,10 +167,16 @@ def create_app(workspace: Path|None=None, transport=None):
                         message='Cancellation requested. No further generation steps will start.',
                         finishedAt=now())
                     p['job'].pop('cancelRequested',None)
+                    outcome=('canceled',None,None)
                     save(p)
             except Exception as exc:
                 with lock:
-                    p=project(pid);p['job'].update(status='failed',message=str(exc)[:700],finishedAt=now());save(p)
+                    p=project(pid);p['job'].update(status='failed',message=str(exc)[:700],finishedAt=now())
+                    outcome=('failed',str(exc)[:200],None)
+                    save(p)
+            if on_terminal:
+                try: on_terminal(outcome[0],outcome[1],outcome[2])
+                except Exception: pass
         pool.submit(work)
 
     def start(pid,kind,fn,on_cancel=None,sid=None):
@@ -241,30 +254,36 @@ def create_app(workspace: Path|None=None, transport=None):
 
         def wrapped(tick):
             record(attempt_id, status='running')
-            try:
-                result = run_fn(tick)
-                # Terminal-state check BEFORE publishing done: a cancel that
-                # arrived during the last step wins — done is never published
-                # for work the user asked to cancel.
-                with lock:
-                    if project(pid)['job'].get('cancelRequested'):
-                        raise JobCanceled('canceled')
-                record(attempt_id, status='done')
-                if on_result:
-                    on_result(result, attempt_id)
-                return result
-            except JobCanceled:
-                record(attempt_id, status='canceled')
-                raise
-            except Exception as exc:
-                record(attempt_id, status='failed', error=str(exc)[:200])
-                raise
+            # The terminal outcome (done/canceled/failed) is decided by the
+            # job owner (launch -> on_terminal) in ONE place. This function
+            # intentionally does not publish terminal state itself — that is
+            # what previously allowed attempt=done alongside job=canceled.
+            return run_fn(tick)
+
+        def terminal(outcome, error, result):
+            fields = {'status': outcome}
+            if error:
+                fields['error'] = error
+            if outcome == 'done' and result and result.get('revision'):
+                fields['revision'] = result['revision']
+            record(attempt_id, **fields)
+            if outcome == 'done' and on_result:
+                on_result(result, attempt_id)
+
         # Worker scheduled only after the complete record exists. If launch
-        # itself fails, the attempt is marked so it never reads as available.
+        # itself fails, BOTH the attempt and the project job are finalized as
+        # failed-admission — the project must never stay locked busy.
         try:
-            launch(pid, jid, kind, wrapped, on_cancel)
+            launch(pid, jid, kind, wrapped, on_cancel=on_cancel, on_terminal=terminal)
         except Exception as exc:
-            record(attempt_id, status='admission-failed', error=str(exc)[:200])
+            record(attempt_id, status='failed', error='admission: ' + str(exc)[:180])
+            with lock:
+                p = project(pid)
+                if p.get('job', {}).get('id') == jid and p['job'].get('status') == 'queued':
+                    p['job'].update(status='failed',
+                                    message='Could not schedule the job: ' + str(exc)[:300],
+                                    finishedAt=now())
+                    save(p)
             raise
         return {'jobId': jid, 'projectId': pid, 'attemptId': attempt_id}
 

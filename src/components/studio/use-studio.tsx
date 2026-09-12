@@ -1005,30 +1005,79 @@ export function StudioProvider({ children }: { children: React.ReactNode }) {
 
   // --------------------------------------------- session steps (Task 29/31)
 
-  /** The operation key of the currently in-flight step (set before the
-   *  request is sent, cleared when the job settles) — resending the same
-   *  logical action reuses the SAME key, so a lost response replays the
-   *  existing attempt instead of buying new work. A retry after a failed
-   *  attempt generates a NEW key: it is an explicit new purchase. */
-  const inFlightOpRef = useRef<string | null>(null);
+  /** Task 31 review fix — TWO distinct pieces of state:
+   *  - requestInFlight: transient guard, true only while the HTTP request
+   *    itself is on the wire.
+   *  - pendingOperation: the operation identity (operation, sessionId, key)
+   *    kept while the OUTCOME is unknown. A lost response does NOT clear it:
+   *    resending the same logical action reuses the SAME key, so the backend
+   *    replays the existing attempt instead of buying new work. It clears
+   *    only when a terminal outcome is observed (via polling) or the session
+   *    is discarded. The record is mirrored to localStorage so a page reload
+   *    can still replay with the same identity. */
+  const requestInFlightRef = useRef(false);
+  const PENDING_OP_KEY = "cd-pending-operation";
+  type PendingOp = { operation: string; sessionId: string; key: string };
+  const pendingOpRef = useRef<PendingOp | null>(null);
+
+  const setPendingOp = useCallback((op: PendingOp | null) => {
+    pendingOpRef.current = op;
+    try {
+      if (op) localStorage.setItem(PENDING_OP_KEY, JSON.stringify(op));
+      else localStorage.removeItem(PENDING_OP_KEY);
+    } catch {
+      /* storage unavailable — in-memory identity still guards this tab */
+    }
+  }, []);
+
+  // Restore a pending operation after a page reload: the outcome is unknown,
+  // so the next explicit action for the same session reuses the same key.
+  useEffect(() => {
+    try {
+      const raw = localStorage.getItem(PENDING_OP_KEY);
+      if (raw) {
+        const op = JSON.parse(raw) as PendingOp;
+        if (op?.key && op?.sessionId) pendingOpRef.current = op;
+      }
+    } catch {
+      /* corrupted record — ignore */
+    }
+  }, []);
 
   /** Fire one session step (paid gates live server-side) as an async job. */
   const runSessionStep = useCallback(
     async (operation: string, step: (key: string) => Promise<{ jobId: string }>) => {
       const p = projectRef.current;
       if (!p) throw new Error("Create a project first.");
+      if (requestInFlightRef.current) throw new Error("A request is already in flight.");
       if (isBusyProject(p)) throw new Error("Wait for the current job.");
       if (!activeSession) throw new Error("No active generation session.");
-      if (inFlightOpRef.current) throw new Error("A request is already in flight.");
-      const key = `${operation}:${activeSession.id}:${crypto.randomUUID()}`;
-      inFlightOpRef.current = key;
+      // Reuse the pending identity when the previous send for this session
+      // has an UNKNOWN outcome (lost response) — same key, backend replays.
+      const pending = pendingOpRef.current;
+      const key =
+        pending && pending.sessionId === activeSession.id
+          ? pending.key
+          : `${operation}:${activeSession.id}:${crypto.randomUUID()}`;
+      setPendingOp({ operation, sessionId: activeSession.id, key });
+      requestInFlightRef.current = true;
       try {
         await job(() => step(key));
+        // The request was ACCEPTED (queued). The terminal outcome arrives via
+        // polling; the post-job effect clears the pending identity then.
+      } catch (err) {
+        // A DEFINITE server rejection (our own API 4xx) means the work was
+        // never admitted — drop the identity so the next confirm is a fresh
+        // attempt. Network-type failures keep it (outcome still unknown).
+        if (err instanceof Error && !/failed to fetch|network|load failed/i.test(err.message)) {
+          setPendingOp(null);
+        }
+        throw err;
       } finally {
-        inFlightOpRef.current = null;
+        requestInFlightRef.current = false;
       }
     },
-    [activeSession, job]
+    [activeSession, job, setPendingOp]
   );
 
   const planSceneWithAi = useCallback(
@@ -1123,22 +1172,31 @@ export function StudioProvider({ children }: { children: React.ReactNode }) {
   const cancelJob = useCallback(async () => {
     const p = projectRef.current;
     if (!p) return;
-    const next = await apiCancelProjectJob(p.id);
+    // Send the DISPLAYED job's id: a late cancel carrying a stale jobId is a
+    // server-side no-op, so it can never cancel a newer attempt.
+    const next = await apiCancelProjectJob(p.id, p.job?.id);
     setProjectSync(next);
     toast("Cancellation requested — no further generation steps will start.");
   }, [setProjectSync]);
 
-  // Session truth lives server-side: after any session-step job finishes,
-  // re-read the active session so the workspace reflects the new stage.
+  // Session truth lives server-side: after any session-step job reaches a
+  // TERMINAL state (done / failed / canceled / interrupted), re-read the
+  // active session so the workspace reflects the new stage without a manual
+  // reload, and clear the pending operation identity (a retry after a KNOWN
+  // outcome is an explicit new purchase and gets a fresh key).
   const jobId = project?.job?.id ?? null;
   const jobStatus = project?.job?.status ?? null;
   const lastRefreshedJobRef = useRef<string | null>(null);
   useEffect(() => {
-    if (!jobId || (jobStatus !== "done" && jobStatus !== "failed")) return;
+    if (!jobId || !jobStatus) return;
+    const terminal = jobStatus === "done" || jobStatus === "failed" ||
+      jobStatus === "canceled" || jobStatus === "interrupted";
+    if (!terminal) return;
     if (lastRefreshedJobRef.current === jobId) return;
     lastRefreshedJobRef.current = jobId;
+    if (pendingOpRef.current) setPendingOp(null);
     if (projectRef.current && activeSession) void refreshSessions(projectRef.current.id);
-  }, [jobId, jobStatus, activeSession, refreshSessions]);
+  }, [jobId, jobStatus, activeSession, refreshSessions, setPendingOp]);
 
   const clearSelection = useCallback(() => {
     selectedRef.current = new Set();

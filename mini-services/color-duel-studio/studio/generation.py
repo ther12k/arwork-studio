@@ -989,8 +989,18 @@ class GenerationSessionManager:
             stages = {}
             if spec_objects:
                 specs = [_fragment_spec(o) for o in spec_objects]
+                # Task 31 checkpoint namespace: derived from the FROZEN
+                # attempt inputs (plan content + active source) so retries of
+                # the same work share a cache while changed work starts fresh.
+                era = hashlib.sha256(json.dumps(
+                    {'plan': self._plan_fingerprint(session.get('scenePlan') or {}),
+                     'src': (session.get('meta', {}).get('source') or {}).get('sha256'),
+                     'locked': sorted(locked_keep)},
+                    sort_keys=True).encode()).hexdigest()[:12]
+                era_dir = sdir / 'fragments' / era
+                era_dir.mkdir(parents=True, exist_ok=True)
                 svg_text, stages = provider.svg_compose_from_objects(
-                    specs, session['aspect'], progress, cache_dir=sdir / 'fragments')
+                    specs, session['aspect'], progress, cache_dir=era_dir)
                 clean_svg(svg_text.encode('utf-8'), master_path)
                 if locked_keep:
                     _reinject_locked_objects(master_path, old_master_text, locked_keep, objects)
@@ -1031,17 +1041,7 @@ class GenerationSessionManager:
                 'sourceSha256': (session.get('meta', {}).get('source') or {}).get('sha256'),
                 'planRev': self._plan_fingerprint(session.get('scenePlan') or {}),
             }
-            old_origin = session.get('meta', {}).get('masterOrigin')
             session['meta']['masterOrigin'] = new_origin
-            # Task 31 checkpoint scoping: the fragment cache serves RETRIES of
-            # the same master era (same origin). Once a NEW origin is about to
-            # be stamped, prior-era fragments must not leak into it — clear
-            # the cache so the next retry of THIS era still hits, but a later
-            # unrelated era starts fresh.
-            if old_origin != new_origin:
-                frags = sdir / 'fragments'
-                if frags.is_dir():
-                    shutil.rmtree(frags, ignore_errors=True)
             session['updatedAt'] = _now()
             write_json(sdir / 'session.json', session)
             usage = {'kind': 'generation-synthesis', 'calls': calls, 'stages': stages}

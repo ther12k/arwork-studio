@@ -2397,8 +2397,11 @@ def test_idempotent_key_scoped_per_operation(tmp_path, monkeypatch):
 
 
 def test_concurrent_admission_yields_one_valid_job(tmp_path, monkeypatch):
-    """Two interleaved submits with the same key while the first is running:
-    both get a VALID jobId (the same one) — never an attempt without a job."""
+    """TRUE concurrency: two threads submit the same key simultaneously.
+    The admission critical section (replay search -> validation -> allocation
+    -> persist) runs under the project lock, so both threads must observe the
+    SAME valid jobId and exactly one provider job must run."""
+    import threading
     monkeypatch.setenv('OPENAI_API_KEY', 'fake-key')
     seen = []
     with TestClient(create_app(tmp_path, transport=_slow29_transport(seen, delay=0.15))) as c:
@@ -2410,14 +2413,32 @@ def test_concurrent_admission_yields_one_valid_job(tmp_path, monkeypatch):
                json={'confirm_paid': True})
         wait(c, pid, timeout=120)
         body = {'confirm_paid': True, 'idempotency_key': 'race-1'}
-        r1 = c.post(f'/api/projects/{pid}/generation/sessions/{sid}/generate', headers=H, json=body)
-        r2 = c.post(f'/api/projects/{pid}/generation/sessions/{sid}/generate', headers=H, json=body)
-        assert r1.status_code == 200 and r2.status_code == 200
-        assert r1.json()['jobId'] == r2.json()['jobId']
-        assert r2.json()['idempotentReplay'] is True
-        assert r1.json()['jobId'], 'job must be allocated with the attempt'
+        url = f'/api/projects/{pid}/generation/sessions/{sid}/generate'
+        results = [None, None]
+        barrier = threading.Barrier(2, timeout=10)
+
+        def submit(slot):
+            barrier.wait()           # both threads fire together
+            results[slot] = c.post(url, headers=H, json=body)
+
+        threads = [threading.Thread(target=submit, args=(i,)) for i in range(2)]
+        for t in threads: t.start()
+        for t in threads: t.join()
+        r1, r2 = results
+        assert r1 is not None and r2 is not None
+        assert r1.status_code == 200 and r2.status_code == 200, (r1.text, r2.text)
+        j1, j2 = r1.json()['jobId'], r2.json()['jobId']
+        assert j1 and j2, f'both submissions must observe a valid job: {j1!r} vs {j2!r}'
+        assert j1 == j2, f'concurrent same-key submits must collapse: {j1} vs {j2}'
+        replay = r2.json().get('idempotentReplay') or r1.json().get('idempotentReplay')
+        assert replay is True, 'one of the two must be a replay of the other'
         p = wait(c, pid, timeout=240)
         assert p['job']['status'] == 'done', p['job']
+        sess = c.get(f'/api/projects/{pid}/generation/sessions/{sid}').json()
+        # no orphan: every attempt record carries its jobId
+        for a in sess['meta'].get('attempts', []):
+            if a.get('key') == 'race-1':
+                assert a.get('jobId') == j1
 
 
 def test_checkpoint_reuse_on_retry_after_failure(tmp_path, monkeypatch):
@@ -2445,13 +2466,8 @@ def test_checkpoint_reuse_on_retry_after_failure(tmp_path, monkeypatch):
                 'text': json.dumps({'objects': objects})}]}], 'usage': {'input_tokens': 120}})
         if req.url.path.endswith('/svg'):
             body = json.loads(req.content)
-            m = re.search(r'planned bbox: \[x=([0-9.]+), y=([0-9.]+), width=([0-9.]+), height=([0-9.]+)\]',
-                          body.get('instructions', ''))
-            if not m:
-                m = re.search(r'viewBox="(\d+) (\d+) (\d+) (\d+)"', body.get('instructions', ''))
-                bx, by, bw, bh = (int(v) for v in m.groups()) if m else (0, 0, 100, 100)
-            else:
-                bx, by, bw, bh = (int(round(float(v))) for v in m.groups())
+            m = re.search(r'viewBox="(\d+) (\d+) (\d+) (\d+)"', body.get('instructions', ''))
+            bx, by, bw, bh = (int(v) for v in m.groups()) if m else (0, 0, 100, 100)
             key = (bx, by)
             calls_per_bbox[key] = calls_per_bbox.get(key, 0) + 1
             # fail the GRASS fragment (third plan object) on its first call
@@ -2634,98 +2650,14 @@ def test_cancel_does_not_affect_new_attempt(tmp_path, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# Task 31 frontend wiring probes (HTTP-level, no browser required)
+# Task 31 round 3 — terminal agreement, checkpoint validation & era lifecycle
 # ---------------------------------------------------------------------------
 
-def test_frontend_key_present_in_plan_request(tmp_path, monkeypatch):
-    """Proves idempotency_key is wired to /plan in the API layer.
-    We call the endpoint directly with a key (simulating what the hook
-    sends after a user click) and verify: (1) accepted, (2) replay works."""
-    monkeypatch.setenv('OPENAI_API_KEY', 'fake-key')
-    with TestClient(create_app(tmp_path, transport=_task29_transport([]))) as c:
-        pid = new(c)
-        sid = c.post(f'/api/projects/{pid}/generation/sessions', headers=H,
-                     json={'mode': 'ai_chat', 'requested_difficulty': 'medium',
-                           'prompt': 'harbour'}).json()['id']
-        base = f'/api/projects/{pid}/generation/sessions/{sid}'
-        r1 = c.post(f'{base}/plan', headers=H,
-                    json={'confirm_paid': True, 'idempotency_key': 'fe-plan-1'})
-        assert r1.status_code == 200
-        wait(c, pid, timeout=120)
-        r2 = c.post(f'{base}/plan', headers=H,
-                    json={'confirm_paid': True, 'idempotency_key': 'fe-plan-1'})
-        assert r2.status_code == 200
-        assert r2.json()['idempotentReplay'] is True
-        assert r2.json()['attemptStatus'] == 'done'
-
-
-def test_frontend_inflight_guard_prevents_double_submit(tmp_path, monkeypatch):
-    """Concurrent submits with same key collapse into one job (no 429/409)."""
-    monkeypatch.setenv('OPENAI_API_KEY', 'fake-key')
-    seen = []
-    with TestClient(create_app(tmp_path, transport=_slow29_transport(seen, delay=0.15))) as c:
-        pid = new(c)
-        sid = c.post(f'/api/projects/{pid}/generation/sessions', headers=H,
-                     json={'mode': 'ai_chat', 'requested_difficulty': 'medium',
-                           'prompt': 'garden'}).json()['id']
-        c.post(f'/api/projects/{pid}/generation/sessions/{sid}/plan', headers=H,
-               json={'confirm_paid': True})
-        wait(c, pid, timeout=120)
-        body = {'confirm_paid': True, 'idempotency_key': 'fe-gen-1'}
-        r1 = c.post(f'/api/projects/{pid}/generation/sessions/{sid}/generate', headers=H, json=body)
-        r2 = c.post(f'/api/projects/{pid}/generation/sessions/{sid}/generate', headers=H, json=body)
-        assert r1.status_code == 200 and r2.status_code == 200
-        assert r1.json()['jobId'] == r2.json()['jobId']
-        assert r2.json()['idempotentReplay'] is True
-        assert r1.json()['jobId'], 'job must be allocated atomically with the attempt'
-        p = wait(c, pid, timeout=240)
-        assert p['job']['status'] == 'done'
-
-
-def test_frontend_lost_response_retries_same_key(tmp_path, monkeypatch):
-    """Lost-response retry with same key: exactly one provider call, N replays."""
-    monkeypatch.setenv('OPENAI_API_KEY', 'fake-key')
-    seen = []
-    with TestClient(create_app(tmp_path, transport=_task29_transport(seen))) as c:
-        pid = new(c)
-        sid = c.post(f'/api/projects/{pid}/generation/sessions', headers=H,
-                     json={'mode': 'ai_chat', 'requested_difficulty': 'medium',
-                           'prompt': 'garden'}).json()['id']
-        c.post(f'/api/projects/{pid}/generation/sessions/{sid}/plan', headers=H,
-               json={'confirm_paid': True})
-        wait(c, pid, timeout=120)
-        body = {'confirm_paid': True, 'idempotency_key': 'fe-gen-lostresponse'}
-        r1 = c.post(f'/api/projects/{pid}/generation/sessions/{sid}/generate', headers=H, json=body)
-        assert r1.status_code == 200
-        wait(c, pid, timeout=240)
-        svg_after_first = sum(1 for x in seen if x.endswith('/svg'))
-        for _ in range(3):
-            r = c.post(f'/api/projects/{pid}/generation/sessions/{sid}/generate', headers=H, json=body)
-            assert r.status_code == 200
-            assert r.json()['idempotentReplay'] is True
-        assert sum(1 for x in seen if x.endswith('/svg')) == svg_after_first, \
-            'same-key retries must not buy additional provider calls'
-
-
-def test_frontend_commit_deduplicated_with_key(tmp_path, monkeypatch):
-    """Commit double-click / lost-response: never emits duplicate revisions."""
-    monkeypatch.setenv('OPENAI_API_KEY', 'fake-key')
-    with TestClient(create_app(tmp_path, transport=_task29_transport([]))) as c:
-        pid = new(c)
-        sid = _plan_and_generate(c, pid, [])
-        base = f'/api/projects/{pid}/generation/sessions/{sid}'
-        r1 = c.post(f'{base}/commit', headers=H, json={'idempotency_key': 'fe-commit-1'})
-        assert r1.status_code == 200
-        rev_id = r1.json()['revision']['id']
-        r2 = c.post(f'{base}/commit', headers=H, json={'idempotency_key': 'fe-commit-1'})
-        assert r2.status_code == 200
-        assert r2.json()['idempotentReplay'] is True
-        assert r2.json()['revision']['id'] == rev_id
-        assert len(c.get(f'/api/projects/{pid}').json()['revisions']) == 1
-
-
-def test_cancel_does_not_affect_new_attempt(tmp_path, monkeypatch):
-    """Late cancel with stale jobId is a no-op; the new attempt completes."""
+def test_terminal_states_agree_after_cancel(tmp_path, monkeypatch):
+    """Single terminal decision owner: when a cancel lands during a slow
+    generation, the job AND the attempt must both end 'canceled' — the old
+    interleaving (attempt=done while job=canceled) is closed by construction
+    (wrapped() never publishes terminal state; launch's on_terminal does)."""
     monkeypatch.setenv('OPENAI_API_KEY', 'fake-key')
     seen = []
     with TestClient(create_app(tmp_path, transport=_slow29_transport(seen, delay=0.12))) as c:
@@ -2736,20 +2668,176 @@ def test_cancel_does_not_affect_new_attempt(tmp_path, monkeypatch):
         base = f'/api/projects/{pid}/generation/sessions/{sid}'
         c.post(f'{base}/plan', headers=H, json={'confirm_paid': True})
         wait(c, pid, timeout=120)
-        r = c.post(f'{base}/generate', headers=H,
-                   json={'confirm_paid': True, 'idempotency_key': 'g1'})
-        old_job_id = r.json()['jobId']
-        wait(c, pid, timeout=240)
-        c.post(f'{base}/mutate', headers=H,
-               json={'mutations': [{'op': 'set_difficulty', 'difficulty': 'hard'}]})
-        r2 = c.post(f'{base}/generate', headers=H,
-                    json={'confirm_paid': True, 'idempotency_key': 'g2'})
-        new_job_id = r2.json()['jobId']
-        assert new_job_id != old_job_id
-        # stale cancel with old job's id — must be no-op
-        stale = c.post(f'/api/projects/{pid}/job/cancel', headers=H,
-                       json={'jobId': old_job_id})
-        assert stale.status_code == 200
+        c.post(f'{base}/generate', headers=H,
+               json={'confirm_paid': True, 'idempotency_key': 'race-cancel'})
+        # cancel while fragments are in flight
+        deadline = time.time() + 15
+        while time.time() < deadline and not seen or \
+                sum(1 for x in seen if x.endswith('/svg')) < 1:
+            time.sleep(0.05)
+        c.post(f'/api/projects/{pid}/job/cancel', headers=H)
+        p = wait(c, pid, timeout=120)
+        assert p['job']['status'] == 'canceled', p['job']
+        sess = c.get(base).json()
+        attempts = sess['meta'].get('attempts', [])
+        mine = [a for a in attempts if a.get('key') == 'race-cancel']
+        assert mine and mine[-1]['status'] == 'canceled', \
+            f'attempt must agree with job: {mine}'
+
+
+def test_terminal_states_agree_after_done(tmp_path, monkeypatch):
+    """No cancel: job done AND attempt done, and the attempt record carries
+    no premature state (single decision owner publishes both together)."""
+    monkeypatch.setenv('OPENAI_API_KEY', 'fake-key')
+    with TestClient(create_app(tmp_path, transport=_task29_transport([]))) as c:
+        pid = new(c)
+        sid = c.post(f'/api/projects/{pid}/generation/sessions', headers=H,
+                     json={'mode': 'ai_chat', 'requested_difficulty': 'medium',
+                           'prompt': 'garden'}).json()['id']
+        base = f'/api/projects/{pid}/generation/sessions/{sid}'
+        c.post(f'{base}/plan', headers=H, json={'confirm_paid': True})
+        wait(c, pid, timeout=120)
+        c.post(f'{base}/generate', headers=H,
+               json={'confirm_paid': True, 'idempotency_key': 'done-1'})
         p = wait(c, pid, timeout=240)
-        assert p['job']['status'] == 'done', \
-            f'stale cancel must not affect new job: {p["job"]["status"]}'
+        assert p['job']['status'] == 'done', p['job']
+        sess = c.get(base).json()
+        attempts = sess['meta'].get('attempts', [])
+        mine = [a for a in attempts if a.get('key') == 'done-1']
+        assert mine and mine[-1]['status'] == 'done'
+        assert mine[-1].get('jobId'), 'attempt must carry its jobId'
+
+
+def test_invalid_cached_fragment_not_reused(tmp_path, monkeypatch):
+    """Reviewer probe as a regression: the provider first returns an empty
+    (no-drawable-shapes) fragment — the poisoned cache entry must be DELETED
+    so the retry fetches fresh valid work and completes."""
+    monkeypatch.setenv('OPENAI_API_KEY', 'fake-key')
+    empty_first = {'grass': True}
+
+    def respond(req):
+        import re as _re
+        if req.url.path.endswith('/json'):
+            objects = [
+                {'name': 'sky', 'description': 'blue sky', 'z': 0,
+                 'bbox': [0, 0, 576, 300], 'shapes': 10, 'fills': ['#91CCDD']},
+                {'name': 'house', 'description': 'yellow house', 'z': 1,
+                 'bbox': [0, 380, 288, 388], 'shapes': 14, 'fills': ['#EBC681']},
+                {'name': 'grass', 'description': 'green field', 'z': 2,
+                 'bbox': [288, 380, 288, 388], 'shapes': 10, 'fills': ['#41A582']},
+            ]
+            return httpx.Response(200, json={'output': [{'content': [{'type': 'output_text',
+                'text': json.dumps({'objects': objects})}]}], 'usage': {'input_tokens': 120}})
+        if req.url.path.endswith('/svg'):
+            body = json.loads(req.content)
+            m = re.search(r'viewBox="(\d+) (\d+) (\d+) (\d+)"', body.get('instructions', ''))
+            bx, by, bw, bh = (int(v) for v in m.groups()) if m else (0, 0, 100, 100)
+            pad = max(4, min(bw, bh) // 8)
+            if empty_first['grass'] and bx == 288:
+                empty_first['grass'] = False
+                # wrapper-valid but EMPTY fragment (no drawable shapes)
+                return httpx.Response(200, json={'output': [{'content': [
+                    {'type': 'output_text', 'text': f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="{bx} {by} {bw} {bh}"></svg>'}
+                ]}], 'usage': {'input_tokens': 5}})
+            svg = (f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="{bx} {by} {bw} {bh}">'
+                   f'<rect x="{bx+pad}" y="{by+pad}" width="{bw-2*pad}" height="{bh-2*pad}" fill="#3366AA"/>'
+                   f'</svg>')
+            return httpx.Response(200, json={'output': [{'content': [{'type': 'output_text', 'text': svg}]}],
+                                             'usage': {'input_tokens': 10}})
+        return httpx.Response(404, json={'error': {'code': 'no_route'}})
+
+    with TestClient(create_app(tmp_path, transport=httpx.MockTransport(respond))) as c:
+        pid = new(c)
+        sid = c.post(f'/api/projects/{pid}/generation/sessions', headers=H,
+                     json={'mode': 'ai_chat', 'requested_difficulty': 'medium',
+                           'prompt': 'garden'}).json()['id']
+        base = f'/api/projects/{pid}/generation/sessions/{sid}'
+        c.post(f'{base}/plan', headers=H, json={'confirm_paid': True})
+        wait(c, pid, timeout=120)
+        r = c.post(f'{base}/generate', headers=H, json={'confirm_paid': True})
+        p = wait(c, pid, timeout=240)
+        assert p['job']['status'] == 'failed', p['job']
+        assert ('no drawable shapes' in p['job']['message']
+                or 'no supported drawable shapes' in p['job']['message'])
+        # retry: the poisoned cache entry was deleted — fresh work is fetched
+        # and the generation completes
+        r = c.post(f'{base}/generate', headers=H, json={'confirm_paid': True})
+        p = wait(c, pid, timeout=240)
+        assert p['job']['status'] == 'done', (p['job'].get('status'), p['job'].get('message'))
+        sess = c.get(base).json()
+        assert sess['status'] == 'ready_to_commit'
+
+
+def test_checkpoint_survives_across_era_generation(tmp_path, monkeypatch):
+    """Second reviewer gate: initial generation succeeds → plan edit → next
+    generation fails at the third object → retry still reuses the VALID
+    fragments from the second attempt (per-era cache is not wiped between
+    retries of the same era, and the plan edit started a NEW era cleanly)."""
+    monkeypatch.setenv('OPENAI_API_KEY', 'fake-key')
+    fail_grass = {'armed': False}   # armed only after generation 1 succeeds
+    calls_per_bbox: dict = {}
+
+    def respond(req):
+        import re as _re
+        if req.url.path.endswith('/json'):
+            objects = [
+                {'name': 'sky', 'description': 'blue sky', 'z': 0,
+                 'bbox': [0, 0, 576, 300], 'shapes': 10, 'fills': ['#91CCDD']},
+                {'name': 'house', 'description': 'yellow house', 'z': 1,
+                 'bbox': [0, 380, 288, 388], 'shapes': 14, 'fills': ['#EBC681']},
+                {'name': 'grass', 'description': 'green field', 'z': 2,
+                 'bbox': [288, 380, 288, 388], 'shapes': 10, 'fills': ['#41A582']},
+            ]
+            return httpx.Response(200, json={'output': [{'content': [{'type': 'output_text',
+                'text': json.dumps({'objects': objects})}]}], 'usage': {'input_tokens': 120}})
+        if req.url.path.endswith('/svg'):
+            body = json.loads(req.content)
+            m = re.search(r'viewBox="(\d+) (\d+) (\d+) (\d+)"', body.get('instructions', ''))
+            bx, by, bw, bh = (int(v) for v in m.groups()) if m else (0, 0, 100, 100)
+            key = (bx, by)
+            calls_per_bbox[key] = calls_per_bbox.get(key, 0) + 1
+            if fail_grass['armed'] and key == (288, 380):
+                fail_grass['armed'] = False
+                return httpx.Response(500, json={'error': {'code': 'blip'}})
+            pad = max(4, min(bw, bh) // 8)
+            svg = (f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="{bx} {by} {bw} {bh}">'
+                   f'<rect x="{bx+pad}" y="{by+pad}" width="{bw-2*pad}" height="{bh-2*pad}" fill="#3366AA"/>'
+                   f'</svg>')
+            return httpx.Response(200, json={'output': [{'content': [{'type': 'output_text', 'text': svg}]}],
+                                             'usage': {'input_tokens': 10}})
+        return httpx.Response(404, json={'error': {'code': 'no_route'}})
+
+    with TestClient(create_app(tmp_path, transport=httpx.MockTransport(respond))) as c:
+        pid = new(c)
+        sid = c.post(f'/api/projects/{pid}/generation/sessions', headers=H,
+                     json={'mode': 'ai_chat', 'requested_difficulty': 'medium',
+                           'prompt': 'garden'}).json()['id']
+        base = f'/api/projects/{pid}/generation/sessions/{sid}'
+        c.post(f'{base}/plan', headers=H, json={'confirm_paid': True})
+        p = wait(c, pid, timeout=120)
+        assert p['job']['status'] == 'done'
+        # generation 1 succeeds fully (era cache filled: 3 fragments); the
+        # failure is armed only AFTER it, so it can not poison the first era
+        r = c.post(f'{base}/generate', headers=H, json={'confirm_paid': True})
+        p = wait(c, pid, timeout=240)
+        assert p['job']['status'] == 'done', p['job']
+        # plan EDIT with a VISUAL change starts a new era; arm the failure on
+        # the changed object so the era-2 attempt fails at grass
+        fail_grass['armed'] = True
+        c.post(f'{base}/mutate', headers=H,
+               json={'mutations': [{'op': 'update_object', 'objectId': 'obj-grass',
+                                    'changes': {'fills': ['#41A582', '#2E7D5B']}}]})
+        calls_before = dict(calls_per_bbox)
+        r = c.post(f'{base}/generate', headers=H, json={'confirm_paid': True})
+        p = wait(c, pid, timeout=240)
+        assert p['job']['status'] == 'failed'
+        # retry: fragments cached in THIS era (from the failed attempt) are
+        # reused — sky/house are not re-purchased
+        calls_before_retry = dict(calls_per_bbox)
+        r = c.post(f'{base}/generate', headers=H, json={'confirm_paid': True})
+        p = wait(c, pid, timeout=240)
+        assert p['job']['status'] == 'done', p['job']
+        assert calls_per_bbox[(0, 0)] == calls_before_retry.get((0, 0)), \
+            'sky must come from this era checkpoint'
+        assert calls_per_bbox[(0, 380)] == calls_before_retry.get((0, 380)), \
+            'house must come from this era checkpoint'

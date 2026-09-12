@@ -372,8 +372,10 @@ export const listProjects = (): Promise<Project[]> => api<Project[]>("/projects"
 
 export const getProject = (pid: string): Promise<Project> => api<Project>(`/projects/${pid}`);
 
-/** Task 31B — request cooperative cancellation of the running/queued job. */
-export const cancelProjectJob = (pid: string): Promise<Project> => post<Project>(`/projects/${pid}/job/cancel`, {});
+/** Task 31B — request cooperative cancellation. Sending the jobId makes a
+ *  LATE cancel (stale target) a no-op so it can never kill a newer attempt. */
+export const cancelProjectJob = (pid: string, jobId?: string): Promise<Project> =>
+  post<Project>(`/projects/${pid}/job/cancel`, jobId ? { jobId } : {});
 
 // --- Generation sessions (Task 28 shells; Tasks 29/30 fill the workspaces) ---
 
