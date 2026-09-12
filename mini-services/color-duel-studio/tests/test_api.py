@@ -1256,8 +1256,13 @@ def _task29_transport(seen):
             m = _re.search(r'viewBox="(\d+) (\d+) (\d+) (\d+)"', body['instructions'])
             bx, by, bw, bh = (int(v) for v in m.groups())
             pad = max(4, min(bw, bh) // 8)
+            # PER-CALL fill variation (same geometry): consecutive provider
+            # calls return visibly different fragments, so a broken
+            # keep/preserve mechanism cannot pass by comparing identical mock
+            # output — while never introducing new geometry cases.
+            marker = f'#00{len(seen) % 100:02X}{(len(seen) * 7) % 100:02X}'
             svg = (f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="{bx} {by} {bw} {bh}">'
-                   f'<rect x="{bx+pad}" y="{by+pad}" width="{bw-2*pad}" height="{bh-2*pad}" fill="#3366AA"/>'
+                   f'<rect x="{bx+pad}" y="{by+pad}" width="{bw-2*pad}" height="{bh-2*pad}" fill="{marker}"/>'
                    f'<path d="M {bx+pad},{by+pad} Q {bx+bw/2},{by+pad+(bh-2*pad)/2} {bx+bw-pad},{by+pad} Z" fill="#AA3355" fill-opacity="0.5"/>'
                    f'</svg>')
             return httpx.Response(200, json={'output': [{'content': [{'type': 'output_text', 'text': svg}]}],
@@ -1334,68 +1339,166 @@ def test_plan_chat_translates_to_structured_mutations(tmp_path, monkeypatch):
 
 
 def test_plan_edit_after_ready_marks_artwork_stale_then_compile(tmp_path, monkeypatch):
-    """'Continue editing the plan' after generation: the session returns to
-    draft_plan with artworkStale set; recompiling the (still valid) master
-    clears the stale flag and returns to ready_to_commit."""
+    """Visual plan changes stay PENDING until applied to the artwork: a plain
+    recompile of the old master cannot return the session to ready_to_commit
+    and commit is refused. A metadata-only edit (object name) never pends;
+    regenerating the changed object resolves exactly its own entry."""
     monkeypatch.setenv('OPENAI_API_KEY', 'fake-key')
     with TestClient(create_app(tmp_path, transport=_task29_transport([]))) as c:
         pid = new(c)
         sid = _plan_and_generate(c, pid, [])
-        # edit the plan after vectors exist
-        r = c.post(f'/api/projects/{pid}/generation/sessions/{sid}/mutate', headers=H,
+        base = f'/api/projects/{pid}/generation/sessions/{sid}'
+
+        # visual change: description edit on obj-flowers
+        r = c.post(f'{base}/mutate', headers=H,
                    json={'mutations': [{'op': 'update_object', 'objectId': 'obj-flowers',
                                         'changes': {'description': 'paler foreground flowers'}}]})
         assert r.status_code == 200, r.text
         sess = r.json()
         assert sess['status'] == 'draft_plan'
+        assert sess['meta']['pendingArtworkChanges'] == {'obj-flowers': ['description']}
         assert sess['meta']['artworkStale'] is True
-        # the compiled artwork still exists in the workspace: preview serves it
-        r = c.get(f'/api/projects/{pid}/generation/sessions/{sid}/preview/colored.svg')
+        # the compiled artwork still exists for preview
+        assert c.get(f'{base}/preview/colored.svg').status_code == 200
+
+        # a free recompile validates the OLD master but must NOT clear the
+        # pending visual change nor reach ready_to_commit
+        r = c.post(f'{base}/compile', headers=H, json={})
         assert r.status_code == 200
-        # recompile without paying: master unchanged, plan metadata refreshed
-        r = c.post(f'/api/projects/{pid}/generation/sessions/{sid}/compile', headers=H, json={})
-        assert r.status_code == 200, r.text
         p = wait(c, pid)
         assert p['job']['status'] == 'done', p['job']
-        sess = c.get(f'/api/projects/{pid}/generation/sessions/{sid}').json()
+        sess = c.get(base).json()
+        assert sess['status'] == 'draft_plan'
+        assert sess['meta']['pendingArtworkChanges'] == {'obj-flowers': ['description']}
+        assert sess['meta']['artworkStale'] is True
+        # commit refuses the visually-outdated bundle (status guard; the
+        # pending-specific message stays as defense-in-depth)
+        r = c.post(f'{base}/commit', headers=H, json={})
+        assert r.status_code == 400
+        assert 'does not reflect' in r.json()['detail'] or "must be 'ready_to_commit'" in r.json()['detail']
+
+        # metadata-only edit (rename) never pends — revert-free check on a
+        # second field: rename does not add a pending entry
+        r = c.post(f'{base}/mutate', headers=H,
+                   json={'mutations': [{'op': 'update_object', 'objectId': 'obj-sky',
+                                        'changes': {'name': 'Open sky'}}]})
+        sess = r.json()
+        assert 'obj-sky' not in (sess['meta'].get('pendingArtworkChanges') or {})
+
+        # regenerating the changed object resolves exactly its entry → ready
+        r = c.post(f'{base}/regenerate-object', headers=H,
+                   json={'objectId': 'obj-flowers', 'confirm_paid': True})
+        assert r.status_code == 200
+        p = wait(c, pid)
+        assert p['job']['status'] == 'done', p['job']
+        sess = c.get(base).json()
         assert sess['status'] == 'ready_to_commit'
-        assert 'artworkStale' not in sess.get('meta', {})
+        assert 'pendingArtworkChanges' not in sess['meta']
+        assert 'artworkStale' not in sess['meta']
 
 
-def test_locked_object_regenerate_guard_and_bulk_keep(tmp_path, monkeypatch):
-    """Lock semantics: a locked object refuses targeted regeneration; a bulk
-    regeneration re-generates the free objects but re-injects the locked
-    object's EXACT previous shapes; unlock re-enables targeted regeneration."""
+def test_two_visual_changes_regen_one_commit_blocked(tmp_path, monkeypatch):
+    """The reviewer's regression: after generation, change TWO objects
+    visually, regenerate only ONE — the session must not be committable until
+    the second object's change is applied (bulk regen resolves the rest)."""
     monkeypatch.setenv('OPENAI_API_KEY', 'fake-key')
     seen = []
     with TestClient(create_app(tmp_path, transport=_task29_transport(seen))) as c:
         pid = new(c)
         sid = _plan_and_generate(c, pid, seen)
-        objs_file = tmp_path / pid / 'sessions' / sid / 'bundle' / 'objects.json'
-        before = {o['id']: o['shapeIds'] for o in json.loads(objs_file.read_text())['objects']}
+        base = f'/api/projects/{pid}/generation/sessions/{sid}'
+        svg0 = sum(1 for x in seen if x.endswith('/svg'))
 
-        # lock obj-sky via the structured plan mutation
+        r = c.post(f'{base}/mutate', headers=H, json={'mutations': [
+            {'op': 'update_object', 'objectId': 'obj-tree',
+             'changes': {'bbox': [330, 190, 246, 370]}},
+            {'op': 'update_object', 'objectId': 'obj-flowers',
+             'changes': {'fills': ['#E8604C']}},
+        ]})
+        assert r.json()['meta']['pendingArtworkChanges'] == {
+            'obj-tree': ['bbox'], 'obj-flowers': ['fills']}
+
+        # regenerate ONLY the tree: its entry clears, flowers stay pending
+        r = c.post(f'{base}/regenerate-object', headers=H,
+                   json={'objectId': 'obj-tree', 'confirm_paid': True})
+        assert r.status_code == 200
+        p = wait(c, pid)
+        assert p['job']['status'] == 'done', p['job']
+        sess = c.get(base).json()
+        assert sess['status'] == 'draft_plan', 'one pending object must block ready'
+        assert sess['meta']['pendingArtworkChanges'] == {'obj-flowers': ['fills']}
+        r = c.post(f'{base}/commit', headers=H, json={})
+        assert r.status_code == 400, 'commit must be blocked while obj-flowers is pending'
+        detail = r.json()['detail']
+        assert 'obj-flowers' in detail or "must be 'ready_to_commit'" in detail
+
+        # bulk regeneration composes from the current plan → all pending gone
+        r = c.post(f'{base}/generate', headers=H, json={'confirm_paid': True})
+        assert r.status_code == 200
+        p = wait(c, pid)
+        assert p['job']['status'] == 'done', p['job']
+        sess = c.get(base).json()
+        assert sess['status'] == 'ready_to_commit'
+        assert 'pendingArtworkChanges' not in sess['meta']
+        r = c.post(f'{base}/commit', headers=H, json={})
+        assert r.status_code == 200, r.text
+        p = c.get(f'/api/projects/{pid}').json()
+        assert p['currentRevision'] and len(p['revisions']) == 1
+
+
+def test_locked_object_regenerate_guard_and_bulk_keep(tmp_path, monkeypatch):
+    """Lock semantics: a locked object refuses targeted regeneration; a bulk
+    regeneration spends NO provider call on it (locked-with-artwork is skipped
+    entirely) and re-injects its EXACT previous painted geometry — proven by a
+    before/after appearance snapshot against a mock whose output DIFFERS on
+    every call; free objects visibly change. Unlock re-enables regeneration."""
+    monkeypatch.setenv('OPENAI_API_KEY', 'fake-key')
+    seen = []
+    with TestClient(create_app(tmp_path, transport=_task29_transport(seen))) as c:
+        pid = new(c)
+        sid = _plan_and_generate(c, pid, seen)
+        sdir = tmp_path / pid / 'sessions' / sid
+
+        def object_appearance(oid):
+            """Identity + full painted appearance of one object's shapes:
+            membership via objects.json shapeIds, attributes from paint.json
+            (path d, fill, stroke, opacity, z). Never empty for a generated
+            object."""
+            objs = {o['id']: o['shapeIds'] for o in json.loads((sdir / 'bundle' / 'objects.json').read_text())['objects']}
+            sids = set(objs.get(oid) or [])
+            assert sids, f'{oid} owns no shapes — snapshot would prove nothing'
+            paint = json.loads((sdir / 'bundle' / 'paint.json').read_text())
+            entries = [p2 for p2 in paint['paths'] if p2.get('shapeId') in sids]
+            assert entries, f'{oid} has shapes but no painted paths'
+            return sorted(
+                (p2.get('shapeId'),
+                 tuple((k, p2.get(k)) for k in ('d', 'fill', 'stroke', 'strokeWidth', 'fillOpacity', 'opacity', 'z') if p2.get(k) is not None))
+                for p2 in entries)
+
+        # lock obj-sky via the structured plan mutation (metadata: no pending)
         r = c.post(f'/api/projects/{pid}/generation/sessions/{sid}/mutate', headers=H,
                    json={'mutations': [{'op': 'update_object', 'objectId': 'obj-sky',
                                         'changes': {'generation': {'locked': True}}}]})
         assert r.status_code == 200
         locked_rec = next(o for o in r.json()['scenePlan']['objects'] if o['id'] == 'obj-sky')
         assert locked_rec['generation']['locked'] is True
-        sess = c.get(f'/api/projects/{pid}/generation/sessions/{sid}').json()
-        assert sess['status'] == 'draft_plan'
 
         # targeted regeneration of the locked object fails without spending
-        svg_calls = sum(1 for s in seen if s.endswith('/svg'))
+        svg_calls = sum(1 for x in seen if x.endswith('/svg'))
         r = c.post(f'/api/projects/{pid}/generation/sessions/{sid}/regenerate-object', headers=H,
                    json={'objectId': 'obj-sky', 'confirm_paid': True})
         assert r.status_code == 200           # async: surfaces as a failed job
         p = wait(c, pid)
         assert p['job']['status'] == 'failed'
         assert 'locked' in p['job']['message']
-        assert sum(1 for s in seen if s.endswith('/svg')) == svg_calls
+        assert sum(1 for x in seen if x.endswith('/svg')) == svg_calls
 
-        # bulk regeneration keeps the locked object's EXACT shapes while the
-        # free objects are re-generated (new internal shape ids)
+        # snapshots BEFORE the bulk regeneration
+        sky_before = object_appearance('obj-sky')
+        house_before = object_appearance('obj-house')
+
+        # bulk regeneration: the locked object is SKIPPED (no provider call),
+        # free objects are re-generated with visibly different mock output
         r = c.post(f'/api/projects/{pid}/generation/sessions/{sid}/generate', headers=H,
                    json={'confirm_paid': True})
         assert r.status_code == 200
@@ -1404,18 +1507,12 @@ def test_locked_object_regenerate_guard_and_bulk_keep(tmp_path, monkeypatch):
         sess = c.get(f'/api/projects/{pid}/generation/sessions/{sid}').json()
         assert sess['status'] == 'ready_to_commit'
         assert sess['meta'].get('keptLockedObjects') == ['obj-sky']
-        after = {o['id']: o['shapeIds'] for o in json.loads(objs_file.read_text())['objects']}
-        assert after['obj-sky'] == before['obj-sky'], 'locked artwork must survive a bulk regen'
-        # every planned object got a fresh fragment call (bulk ran fully)
-        assert sum(1 for s2 in seen if s2.endswith('/svg')) == svg_calls + 6
-        # and the locked object's painted geometry is byte-identical
-        paint_file = tmp_path / pid / 'sessions' / sid / 'bundle' / 'paint.json'
-        def sky_shapes(pfile):
-            return [p2['d'] for p2 in json.loads(pfile.read_text())['paths']
-                    if p2.get('objectId') == 'obj-sky']
-        sky_before = sky_shapes(paint_file)
+        # 6 objects, sky locked-with-artwork → exactly 5 fragment calls
+        assert sum(1 for x in seen if x.endswith('/svg')) == svg_calls + 5
 
-        assert sky_before == sky_shapes(paint_file), 'locked paint must be identical after bulk regen'
+        # AFTER: locked identity + appearance byte-identical; free object changed
+        assert object_appearance('obj-sky') == sky_before, 'locked artwork must survive a bulk regen'
+        assert object_appearance('obj-house') != house_before, 'free objects must visibly change (mock varies per call)'
 
         # unlock -> targeted regeneration works again
         r = c.post(f'/api/projects/{pid}/generation/sessions/{sid}/mutate', headers=H,
@@ -1427,7 +1524,7 @@ def test_locked_object_regenerate_guard_and_bulk_keep(tmp_path, monkeypatch):
         assert r.status_code == 200
         p = wait(c, pid)
         assert p['job']['status'] == 'done', p['job']
-        assert sum(1 for s in seen if s.endswith('/svg')) == svg_calls + 6 + 1
+        assert sum(1 for x in seen if x.endswith('/svg')) == svg_calls + 5 + 1
 
 
 def test_session_preview_route_gated(tmp_path, monkeypatch):

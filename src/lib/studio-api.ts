@@ -443,6 +443,7 @@ export interface GenerationSessionFull extends GenerationSession {
     generationStages?: Record<string, unknown>;
     keptLockedObjects?: string[];
     artworkStale?: boolean;
+    pendingArtworkChanges?: Record<string, string[]>;
     qa?: QaReport;
     measuredDifficulty?: { rating: string; score: number; metrics: Record<string, unknown> };
     regionCount?: number;

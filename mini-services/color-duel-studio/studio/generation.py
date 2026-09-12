@@ -305,6 +305,41 @@ def apply_scene_mutations(plan: dict, mutations: list[dict]) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Plan-change classification (Task 29 review patch)
+# ---------------------------------------------------------------------------
+# Visual plan fields can only reach the artwork through generation (the
+# compiler reads shape/color from the master SVG; plan records merge metadata
+# only). Metadata fields (name, lock) and gameplay fields (difficulty,
+# subdivision budgets) need no AI work. Every visual field that differs from
+# the artwork-synced plan stays pending until THAT object is regenerated —
+# one successful regenerate never clears another object's pending change.
+VISUAL_PLAN_FIELDS = ('description', 'fills', 'bbox', 'z')
+
+
+def _pending_artwork_changes(old_objects: list, new_objects: list) -> dict:
+    """Diff two plan object lists into {objectId: [changed visual fields]}.
+
+    Added objects pend as ['added'] (no artwork exists yet); removed ones as
+    ['removed'] (the master still carries their shapes until a bulk
+    regeneration composes from the trimmed plan)."""
+    old_by_id = {o['id']: o for o in old_objects}
+    new_by_id = {o['id']: o for o in new_objects}
+    pending: dict = {}
+    for oid, old in old_by_id.items():
+        new = new_by_id.get(oid)
+        if new is None:
+            pending[oid] = ['removed']
+            continue
+        changed = [f for f in VISUAL_PLAN_FIELDS if old.get(f) != new.get(f)]
+        if changed:
+            pending[oid] = changed
+    for oid in new_by_id:
+        if oid not in old_by_id:
+            pending[oid] = ['added']
+    return pending
+
+
+# ---------------------------------------------------------------------------
 # Generation Session State Machine
 # ---------------------------------------------------------------------------
 
@@ -348,29 +383,40 @@ def _plan_objects_from_provider(raw: list, vw: float, vh: float) -> List[dict]:
 
 
 def _reinject_locked_objects(master_path: Path, old_master_text: str,
-                             locked_ids: list, names: dict) -> None:
+                             locked_ids: list, objects: list) -> None:
     """Carry locked objects' shapes from the previous session master into a
     freshly composed one (bulk regeneration must not redraw locked artwork).
 
-    Each locked object's sanitized shapes are extracted from the old master,
-    emitted as a standalone sanitized fragment and swapped into the new
-    master via replace_object_shapes — same objectId, same visual shapes."""
-    from .svg_master import MasterDoc, emit_master_svg, import_master
-    new_text = master_path.read_text(encoding='utf-8')
+    Doc-level merge, NOT shape replacement: the new master was composed
+    WITHOUT the locked objects (their fragments are never generated), so
+    there is nothing to replace. Each locked object's sanitized items are
+    inserted at their plan z-order position in the composed stream and the
+    whole stream is renumbered; gradients ride along."""
+    from .svg_master import emit_master_svg, import_master
+    new_doc = import_master(master_path.read_text(encoding='utf-8'))
     old_doc = import_master(old_master_text)
+    z_of = {o['id']: o.get('z', 0) for o in objects}
     for oid in locked_ids:
-        shapes = [s for s in old_doc.shapes if s.get('objectRef') == oid]
-        inks = [s for s in old_doc.ink_shapes if s.get('objectRef') == oid]
-        if not shapes and not inks:
+        items = [dict(sh) for sh in old_doc.shapes + old_doc.ink_shapes
+                 if sh.get('objectRef') == oid]
+        if not items:
             continue                    # nothing generated for it yet
-        sub = MasterDoc()
-        sub.view_box = old_doc.view_box
-        sub.shapes = shapes
-        sub.ink_shapes = inks
-        sub.gradients = old_doc.gradients
-        new_text = replace_object_shapes(new_text, oid, emit_master_svg(sub),
-                                         object_name=names.get(oid))
-    clean_svg(new_text.encode('utf-8'), master_path)
+        z0 = z_of.get(oid, 0)
+        stream = sorted(new_doc.shapes + new_doc.ink_shapes, key=lambda t: t['order'])
+        idx = len(stream)
+        for i, sh in enumerate(stream):
+            owner = sh.get('objectRef')
+            if owner is not None and owner != oid and z_of.get(owner, 0) > z0:
+                idx = i
+                break
+        stream[idx:idx] = items
+        for k, sh in enumerate(stream):
+            sh['order'] = k
+        new_doc.shapes = [sh for sh in stream if sh.get('kind') != 'ink']
+        new_doc.ink_shapes = [sh for sh in stream if sh.get('kind') == 'ink']
+        for gid, grad in old_doc.gradients.items():
+            new_doc.gradients.setdefault(gid, grad)
+    clean_svg(emit_master_svg(new_doc).encode('utf-8'), master_path)
 
 
 def replace_object_shapes(master_text: str, object_id: str, fragment_text: str,
@@ -760,20 +806,29 @@ class GenerationSessionManager:
                     pass
         return sorted(out, key=lambda s: s.get('createdAt', ''), reverse=True)
 
+# ---------------------------------------------------------------------------
     def mutate_plan(self, session_id: str, mutations: list[dict]) -> dict:
         """Apply mutations to the draft plan of an active session.
 
         Mutating a ready_to_commit session is allowed (Task 29: 'continue
-        editing the plan'): the session returns to draft_plan and the already
-        generated artwork is marked STALE — it still exists in the session
-        workspace, but reflects the older plan until a regenerate/compile
-        refreshes it."""
+        editing the plan'): the session returns to draft_plan. VISUAL changes
+        (description/fills/bbox/z, added or removed objects) are recorded in
+        meta.pendingArtworkChanges per object — the compiled artwork is not
+        considered in sync (and cannot reach ready_to_commit / commit) until
+        each pending object is regenerated (or a bulk regeneration re-composes
+        from the new plan). Metadata/gameplay-only edits never pend."""
         session = self.get_session(session_id)
         if session['status'] not in ('draft_plan', 'failed', 'ready_to_commit'):
             raise ValueError(f"Cannot mutate plan while session is {session['status']}.")
-        was_ready = session['status'] == 'ready_to_commit'
+        master_exists = (self.session_path(session_id) / 'source-master.svg').is_file()
 
+        old_objects = session['scenePlan'].get('objects') or []
         updated_plan = apply_scene_mutations(session['scenePlan'], mutations)
+        new_objects = updated_plan.get('objects') or []
+        pending = dict(session.get('meta', {}).get('pendingArtworkChanges') or {})
+        for oid, fields in _pending_artwork_changes(old_objects, new_objects).items():
+            merged = sorted(set(pending.get(oid, [])) | set(fields))
+            pending[oid] = merged
         session['scenePlan'] = updated_plan
         session['requestedDifficulty'] = updated_plan['requestedDifficulty']
         session['targetRegionRange'] = updated_plan['targetRegionRange']
@@ -781,8 +836,14 @@ class GenerationSessionManager:
         session['updatedAt'] = _now()
         session['status'] = 'draft_plan'
         session['error'] = None
-        if was_ready and (master_path := self.session_path(session_id) / 'source-master.svg').is_file():
-            session.setdefault('meta', {})['artworkStale'] = True
+        meta = session.setdefault('meta', {})
+        if pending and master_exists:
+            meta['pendingArtworkChanges'] = pending
+            meta['artworkStale'] = True
+        else:
+            # nothing visual is outstanding against the existing artwork
+            meta.pop('pendingArtworkChanges', None)
+            meta.pop('artworkStale', None)
 
         sdir = self.session_path(session_id)
         write_json(sdir / 'session.json', session)
@@ -886,28 +947,45 @@ class GenerationSessionManager:
         self.update_status(session_id, 'generating')
         sdir = self.session_path(session_id)
         try:
-            specs = [_fragment_spec(o) for o in objects]
-            # Locked objects (generation.locked) survive a bulk regeneration:
-            # keep the previous master around and re-inject their shapes after
-            # the fresh compose, so unlocking is the only way their artwork
-            # changes. A fresh session (no master yet) has nothing to keep.
-            old_master_text = None
             master_path = sdir / 'source-master.svg'
-            if master_path.is_file():
-                old_master_text = master_path.read_text(encoding='utf-8')
-            svg_text, stages = provider.svg_compose_from_objects(specs, session['aspect'], progress)
-            clean_svg(svg_text.encode('utf-8'), master_path)
-            locked_ids = [o['id'] for o in objects if (o.get('generation') or {}).get('locked')]
-            if locked_ids and old_master_text:
-                _reinject_locked_objects(master_path, old_master_text, locked_ids,
-                                         {o['id']: o['name'] for o in objects})
+            old_master_text = master_path.read_text(encoding='utf-8') if master_path.is_file() else None
+            # Locked objects (generation.locked) that ALREADY have artwork are
+            # skipped entirely — no provider call is spent on them; their
+            # exact previous shapes are re-injected after the fresh compose,
+            # so unlocking is the only way their artwork changes. Locked
+            # objects without artwork yet still generate (initial generation).
+            from .svg_master import import_master
+            old_doc = import_master(old_master_text) if old_master_text else None
+            def _has_artwork(oid: str) -> bool:
+                return bool(old_doc) and any(
+                    sh.get('objectRef') == oid for sh in old_doc.shapes + old_doc.ink_shapes)
+            locked_keep = [o['id'] for o in objects
+                           if (o.get('generation') or {}).get('locked') and _has_artwork(o['id'])]
+            spec_objects = [o for o in objects if o['id'] not in locked_keep]
+            stages = {}
+            if spec_objects:
+                specs = [_fragment_spec(o) for o in spec_objects]
+                svg_text, stages = provider.svg_compose_from_objects(specs, session['aspect'], progress)
+                clean_svg(svg_text.encode('utf-8'), master_path)
+                if locked_keep:
+                    _reinject_locked_objects(master_path, old_master_text, locked_keep, objects)
+                calls = len(specs)
+            else:
+                # everything is locked with existing artwork: the master IS
+                # the artwork to keep; zero provider calls this round.
+                calls = 0
+                stages = {'keptLocked': {'objects': locked_keep, 'usage': {}}}
             session = self.get_session(session_id)
             session.setdefault('meta', {})['generationStages'] = stages
-            if locked_ids:
-                session['meta']['keptLockedObjects'] = locked_ids
+            if locked_keep:
+                session['meta']['keptLockedObjects'] = locked_keep
+            # The composed master now reflects the CURRENT plan in full —
+            # every visual pending change is resolved by this bulk pass.
+            session['meta'].pop('pendingArtworkChanges', None)
+            session['meta'].pop('artworkStale', None)
             session['updatedAt'] = _now()
             write_json(sdir / 'session.json', session)
-            usage = {'kind': 'generation-synthesis', 'calls': len(specs), 'stages': stages}
+            usage = {'kind': 'generation-synthesis', 'calls': calls, 'stages': stages}
         except Exception as exc:
             self.update_status(session_id, 'failed', error=str(exc))
             raise
@@ -958,6 +1036,16 @@ class GenerationSessionManager:
             master_path.write_text(new_master, encoding='utf-8')
             session = self.get_session(session_id)
             session.setdefault('meta', {})[f'regenUsage:{object_id}'] = usage
+            # This object's artwork now matches the plan again — resolve ONLY
+            # its pending entry (other objects stay pending until their own
+            # regeneration; Task 29 review patch).
+            pending = session.get('meta', {}).get('pendingArtworkChanges') or {}
+            pending.pop(object_id, None)
+            if pending:
+                session['meta']['pendingArtworkChanges'] = pending
+            else:
+                session['meta'].pop('pendingArtworkChanges', None)
+                session['meta'].pop('artworkStale', None)
             session['updatedAt'] = _now()
             write_json(sdir / 'session.json', session)
             usage_out = {'kind': 'object-regeneration', 'objectId': object_id, **usage}
@@ -1242,19 +1330,30 @@ class GenerationSessionManager:
                 self.update_status(session_id, 'failed', error=err_msg)
                 raise ValueError(err_msg)
 
-            # Store measured difficulty and validation in session; a fresh
-            # successful compile always reflects the CURRENT plan, so the
-            # stale marker from plan-after-ready edits is cleared.
+            # Store measured difficulty and validation in session. A compile
+            # only marks the artwork READY when no visual plan change is
+            # pending: geometry QA passing proves the OLD master is valid, not
+            # that it matches the newest plan (Task 29 review patch).
             measured = {
                 'rating': result['manifest']['difficulty']['rating'],
                 'score': result['manifest']['difficulty']['score'],
                 'metrics': result['manifest']['difficulty']['metrics'],
             }
-            self.update_status(session_id, 'ready_to_commit', meta={
-                'qa': qa,
-                'measuredDifficulty': measured,
-                'regionCount': result['manifest']['regionCount'],
-            }, clear_meta=['artworkStale'])
+            pending = self.get_session(session_id).get('meta', {}).get('pendingArtworkChanges') or {}
+            if pending:
+                # The compiled bundle is valid but visually outdated — keep it
+                # for preview, stay in draft_plan with the pending list intact.
+                self.update_status(session_id, 'draft_plan', meta={
+                    'qa': qa,
+                    'measuredDifficulty': measured,
+                    'regionCount': result['manifest']['regionCount'],
+                })
+            else:
+                self.update_status(session_id, 'ready_to_commit', meta={
+                    'qa': qa,
+                    'measuredDifficulty': measured,
+                    'regionCount': result['manifest']['regionCount'],
+                }, clear_meta=['artworkStale'])
             return result
         except Exception as exc:
             self.update_status(session_id, 'failed', error=str(exc))
@@ -1274,6 +1373,11 @@ class GenerationSessionManager:
         session = self.get_session(session_id)
         if session['status'] != 'ready_to_commit':
             raise ValueError(f"Session cannot be committed in status '{session['status']}'. It must be 'ready_to_commit'.")
+        pending = session.get('meta', {}).get('pendingArtworkChanges') or {}
+        if pending:
+            pending_list = ', '.join(f'{oid} ({"/".join(fields)})' for oid, fields in sorted(pending.items()))
+            raise ValueError('The plan has visual changes the artwork does not reflect yet: '
+                             f'{pending_list}. Regenerate those objects (or bulk regenerate) before committing.')
 
         sdir = self.session_path(session_id)
         bundle_dir = sdir / 'bundle'

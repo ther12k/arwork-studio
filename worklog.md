@@ -1642,3 +1642,21 @@ Work Log:
 
 Stage Summary:
 - Task 29's golden path is real: blank project → committed AI artwork, all inside the studio shell, with every paid step individually confirmed, every mutation structured (never a resent conversation), every object identity preserved under targeted regeneration, and locks protecting artwork the artist is satisfied with. The remaining journey gap is Task 30 (image workspace: persist the Convert source image at the paid step — noted gap from Task 28 — plus reference/convert flows) and Task 31 (formal progress/cancel/retry state model).
+
+---
+Task ID: 30
+Agent: main (ZCode)
+Task: Task-29 review patch — plan/artwork consistency guard (pendingArtworkChanges), honest locked-geometry test with a VARYING mock, and zero provider spend for locked objects during bulk regeneration. No new backend architecture; scope stays inside Task 29.
+
+Work Log:
+- generation.py: VISUAL_PLAN_FIELDS ('description','fills','bbox','z') + _pending_artwork_changes() diff — metadata (name, lock) and gameplay (difficulty, subdivision budgets) changes never pend; visual fields, added objects ('added') and removed ones ('removed') pend PER OBJECT. mutate_plan accumulates pending entries across edits (merge + sort, deterministic).
+- compile_session guard: with pending entries the session stays draft_plan (QA/measured data still recorded, preview still served) — geometry QA passing proves the OLD master valid, not that it matches the newest plan. commit_session REFUSES with a per-object pending message (defense-in-depth on top of the status guard).
+- regenerate resolves exactly ITS object's pending entry (one success never clears another's); bulk generate composes from the current plan in full → clears every pending entry + artworkStale.
+- Locked objects with existing artwork are now SKIPPED in bulk generation entirely (no fragment call, no thrown-away AI work): svg_compose runs on the free objects only; locked shapes merge back doc-level at their PLAN z-order position into the composed stream (_reinject_locked_objects rewritten — replace_object_shapes cannot work because the new master has no shapes for the skipped object to replace; stream is renumbered, gradients ride along). All-locked sessions cost 0 calls. keptLockedObjects records what was preserved.
+- Tests: the mock now VARIES its fragment fill per call (same geometry) so a broken preservation mechanism cannot pass by comparing identical output; the lock test snapshots the locked object's full painted appearance BEFORE regeneration (membership via objects.json shapeIds; attributes d/fill/stroke/strokeWidth/fillOpacity/opacity/z from paint.json, non-empty asserted) and asserts identity+appearance identical after, while a free object's appearance visibly CHANGES (house before ≠ after); locked skip proven by call counts (6 objects, 1 locked → +5 fragment calls; +1 after unlock).
+- Tests: stale test rewritten per review — a visual change (description) pends and a FREE recompile cannot clear it (stays draft_plan, commit 400); a metadata rename never pends; regenerating the changed object resolves exactly its entry → ready. NEW reviewer regression: two visual changes (bbox + fills) after generation, regenerate ONE → still draft_plan with the other entry pending, commit blocked, bulk regen resolves the rest → committable.
+- UI: 'Needs regen' badge per pending object (with fields on hover), red banner listing pending object → fields, Recompile button now appears only when NO visual change is pending (its real use: difficulty/metadata edits) and is shown disabled with the reason while pending.
+- Suite: task-29 patch tests green (5), full suite in this run, tsc/lint/build green.
+
+Stage Summary:
+- 'Recompile without generating' can no longer declare visual changes applied: pendingArtworkChanges separates metadata/gameplay edits (free recompile is legitimate there) from visual edits (regeneration required, per object, until the artwork really matches the plan). The locked-preservation test now proves appearance preservation against a varying provider, and locked objects no longer cost provider usage in bulk runs. Ready for Task 30 with the reviewer's contract: session-persisted source images before any AI call, Reference reusing this workspace, a Convert review with both quality scores, and build-input identity invalidating stale results.

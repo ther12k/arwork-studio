@@ -109,6 +109,7 @@ function ObjectRow({
   obj,
   generated,
   regenBusy,
+  pendingFields,
   onEdit,
   onToggleLock,
   onRegenerate,
@@ -116,12 +117,14 @@ function ObjectRow({
   obj: ScenePlanObject;
   generated: boolean;
   regenBusy: boolean;
+  pendingFields?: string[];
   onEdit: (obj: ScenePlanObject) => void;
   onToggleLock: (obj: ScenePlanObject) => void;
   onRegenerate: (obj: ScenePlanObject) => void;
 }) {
   const [open, setOpen] = useState(false);
   const locked = !!obj.generation?.locked;
+  const pending = pendingFields?.length ?? 0;
   const Icon = ROLE_ICON[obj.role] ?? Layers;
   return (
     <li className="rounded-lg border border-[#e1e5df] bg-white">
@@ -141,6 +144,14 @@ function ObjectRow({
             {generated ? " · generated ✓" : ""}
           </span>
         </span>
+        {pending > 0 && (
+          <span
+            className="rounded-full border border-[#e8cfc7] bg-[#fdf3f1] px-1.5 py-0.5 text-[9px] font-semibold text-[#ba463f]"
+            title={`Artwork not updated yet: ${pendingFields!.join(", ")}`}
+          >
+            Needs regen
+          </span>
+        )}
         {locked && (
           <span className="flex items-center gap-1 rounded-full border border-[#e8d9b8] bg-[#fdf6e3] px-1.5 py-0.5 text-[9px] font-semibold text-[#957242]">
             <Lock className="size-3" aria-hidden /> Locked
@@ -308,7 +319,12 @@ export function AiWorkspace({ session }: { session: GenerationSessionFull }) {
   const job = project?.job ?? { status: undefined, message: undefined };
   const stage = stageOf(session, editingPlan);
   const lastChat = session.meta?.lastPlanChat;
-  const stale = session.meta?.artworkStale === true;
+  // Visual plan changes the artwork does not reflect yet (per object):
+  // the board cannot be committed until each entry is regenerated.
+  const pendingChanges: Record<string, string[]> =
+    (session.meta?.pendingArtworkChanges as Record<string, string[]> | undefined) ?? {};
+  const hasPending = Object.keys(pendingChanges).length > 0;
+  const stale = hasPending;
 
   // per-object progress from the job message ("Vectorizing object i/N: name")
   const progress = useMemo(() => {
@@ -430,9 +446,14 @@ export function AiWorkspace({ session }: { session: GenerationSessionFull }) {
                   </span>
                 </div>
                 {stale && (
-                  <p className="mt-2 rounded-lg border border-[#e8d9b8] bg-[#fdf6e3] px-3 py-2 text-[10px] leading-relaxed text-[#957242]">
-                    The generated artwork reflects an OLDER plan. Regenerate the objects you changed
-                    (or everything) afterwards — or just recompile if only names changed.
+                  <p className="mt-2 rounded-lg border border-[#e8cfc7] bg-[#fdf3f1] px-3 py-2 text-[10px] leading-relaxed text-[#ba463f]">
+                    The generated artwork does not reflect your latest plan yet:
+                    {Object.entries(pendingChanges).map(([oid, fields]) => (
+                      <span key={oid} className="block">
+                        • {objects.find((o) => o.id === oid)?.name ?? oid} — {fields.join(", ")}
+                      </span>
+                    ))}
+                    Regenerate those objects (or everything) before committing.
                   </p>
                 )}
                 <ul className="mt-2.5 space-y-1.5">
@@ -445,6 +466,7 @@ export function AiWorkspace({ session }: { session: GenerationSessionFull }) {
                       obj={o}
                       generated={hasArtwork}
                       regenBusy={busy}
+                      pendingFields={pendingChanges[o.id]}
                       onEdit={setEditObj}
                       onToggleLock={toggleLock}
                       onRegenerate={(target) => {
@@ -501,17 +523,29 @@ export function AiWorkspace({ session }: { session: GenerationSessionFull }) {
                   <Hammer className="size-3.5" aria-hidden />
                   Scene looks good — Generate artwork
                 </Button>
-                {stale && hasArtwork && (
+                {hasArtwork && !stale && (
                   <Button
                     variant="outline"
                     size="sm"
                     disabled={busy}
                     onClick={() => void recompileSessionArtwork().catch((e: Error) => toast(e.message))}
                     className="ml-2 mt-3 h-9 rounded-md border-[#e1e5df] bg-white text-[10px]"
-                    title="Rebuild the board from the existing artwork (free) — for name/label-only changes"
+                    title="Rebuild the board from the existing artwork (free) — applies difficulty/metadata changes without regenerating"
                   >
                     <RefreshCw className="size-3.5" aria-hidden />
                     Recompile without generating
+                  </Button>
+                )}
+                {stale && hasArtwork && (
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    disabled
+                    className="ml-2 mt-3 h-9 rounded-md border-[#e1e5df] bg-white text-[10px] opacity-50"
+                    title={`A plain recompile cannot apply visual changes: ${Object.keys(pendingChanges).join(", ")} still pending — regenerate them first.`}
+                  >
+                    <RefreshCw className="size-3.5" aria-hidden />
+                    Recompile (visual changes pending)
                   </Button>
                 )}
               </>
@@ -626,6 +660,7 @@ export function AiWorkspace({ session }: { session: GenerationSessionFull }) {
                   obj={o}
                   generated
                   regenBusy={busy}
+                  pendingFields={pendingChanges[o.id]}
                   onEdit={(target) => {
                     setEditingPlan(true);
                     setEditObj(target);
