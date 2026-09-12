@@ -2095,7 +2095,8 @@ def test_idempotent_same_key_collapses_and_replays(tmp_path, monkeypatch):
         body = {'confirm_paid': True, 'instruction': 'make the tree bigger', 'idempotency_key': 'op-1'}
         r1 = c.post(f'{base}/plan-chat', headers=H, json=body)
         r2 = c.post(f'{base}/plan-chat', headers=H, json=body)
-        assert r1.status_code == 200 and r2.status_code == 200
+        assert r1.status_code == 200 and r2.status_code == 200, \
+            f'r1={r1.status_code}:{r1.text[:160]} r2={r2.status_code}:{r2.text[:160]}'
         assert r1.json()['jobId'] == r2.json()['jobId']
         assert r2.json()['idempotentReplay'] is True
         wait(c, pid, timeout=120)
@@ -2580,7 +2581,7 @@ def test_frontend_lost_response_retries_same_key(tmp_path, monkeypatch):
         svg_before = sum(1 for x in seen if x.endswith('/svg'))
         body = {'confirm_paid': True, 'idempotency_key': 'fe-gen-lostresponse'}
         r1 = c.post(f'/api/projects/{pid}/generation/sessions/{sid}/generate', headers=H, json=body)
-        assert r1.status_code == 200
+        assert r1.status_code == 200, f'{r1.status_code}:{r1.text[:160]}'
         wait(c, pid, timeout=240)
         svg_after_first = sum(1 for x in seen if x.endswith('/svg'))
         # UI retries (lost-response scenario) 3 more times with same key

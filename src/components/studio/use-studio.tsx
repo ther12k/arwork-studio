@@ -17,6 +17,7 @@ import { toast } from "sonner";
 import { loadBundle, VectorBoard, type BoardMode, type BoardState, type Bundle } from "@/lib/detailed-board";
 import {
   activateRevision,
+  ApiError,
   buildDraft,
   cancelProjectJob as apiCancelProjectJob,
   createProject,
@@ -1019,6 +1020,7 @@ export function StudioProvider({ children }: { children: React.ReactNode }) {
   const PENDING_OP_KEY = "cd-pending-operation";
   type PendingOp = { operation: string; sessionId: string; key: string };
   const pendingOpRef = useRef<PendingOp | null>(null);
+  const pendingCommitRef = useRef<{ sessionId: string; key: string } | null>(null);
 
   const setPendingOp = useCallback((op: PendingOp | null) => {
     pendingOpRef.current = op;
@@ -1147,8 +1149,25 @@ export function StudioProvider({ children }: { children: React.ReactNode }) {
     if (!p) throw new Error("Create a project first.");
     if (isBusyProject(p)) throw new Error("Wait for the current job.");
     if (!activeSession) throw new Error("No active generation session.");
-    const commitKey = `commit:${activeSession.id}:${crypto.randomUUID()}`;
-    const res = await apiCommitSessionArtwork(p.id, activeSession.id, undefined, commitKey);
+    // Task 31 — commit uses the same identity retention: a lost response
+    // keeps the key so the resend returns the ALREADY-CREATED revision
+    // instead of a duplicate. A definite server rejection (e.g. pending
+    // visual changes) drops it so the next commit is a fresh attempt.
+    if (pendingCommitRef.current?.sessionId !== activeSession.id) {
+      pendingCommitRef.current = {
+        sessionId: activeSession.id,
+        key: `commit:${activeSession.id}:${crypto.randomUUID()}`,
+      };
+    }
+    const commitKey = pendingCommitRef.current.key;
+    let res;
+    try {
+      res = await apiCommitSessionArtwork(p.id, activeSession.id, undefined, commitKey);
+    } catch (err) {
+      if (err instanceof ApiError) pendingCommitRef.current = null;
+      throw err;
+    }
+    pendingCommitRef.current = null;
     const next = await getProject(p.id);
     setProjectSync(next);
     syncFields(next);
