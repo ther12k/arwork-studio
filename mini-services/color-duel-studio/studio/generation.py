@@ -944,23 +944,33 @@ class GenerationSessionManager:
         objects = session['scenePlan'].get('objects') or []
         if not objects:
             raise ValueError('The ScenePlan has no objects yet. Run the AI planning step (or add objects) first.')
-        self.update_status(session_id, 'generating')
         sdir = self.session_path(session_id)
+        master_path = sdir / 'source-master.svg'
+        old_master_text = master_path.read_text(encoding='utf-8') if master_path.is_file() else None
+        # Locked objects (generation.locked) that ALREADY have artwork are
+        # skipped entirely — no provider call is spent on them; their exact
+        # previous shapes are merged back after the fresh compose, so
+        # unlocking is the only way their artwork changes. Locked objects
+        # without artwork yet still generate (initial generation).
+        from .svg_master import emit_master_svg, import_master
+        old_doc = import_master(old_master_text) if old_master_text else None
+        def _has_artwork(oid: str) -> bool:
+            return bool(old_doc) and any(
+                sh.get('objectRef') == oid for sh in old_doc.shapes + old_doc.ink_shapes)
+        locked_keep = [o['id'] for o in objects
+                       if (o.get('generation') or {}).get('locked') and _has_artwork(o['id'])]
+        # Guard BEFORE any provider spend: a locked object with unapplied
+        # visual changes would keep its OLD artwork while its pending entry
+        # was cleared with the rest — silently declaring the change applied.
+        pending = session.get('meta', {}).get('pendingArtworkChanges') or {}
+        names = {o['id']: o['name'] for o in objects}
+        blocked = [(oid, pending[oid]) for oid in locked_keep if oid in pending]
+        if blocked:
+            oid, fields = blocked[0]
+            raise ValueError(f'"{names[oid]}" has unapplied visual changes ({", ".join(fields)}). '
+                             'Unlock it before regenerating.')
+        self.update_status(session_id, 'generating')
         try:
-            master_path = sdir / 'source-master.svg'
-            old_master_text = master_path.read_text(encoding='utf-8') if master_path.is_file() else None
-            # Locked objects (generation.locked) that ALREADY have artwork are
-            # skipped entirely — no provider call is spent on them; their
-            # exact previous shapes are re-injected after the fresh compose,
-            # so unlocking is the only way their artwork changes. Locked
-            # objects without artwork yet still generate (initial generation).
-            from .svg_master import import_master
-            old_doc = import_master(old_master_text) if old_master_text else None
-            def _has_artwork(oid: str) -> bool:
-                return bool(old_doc) and any(
-                    sh.get('objectRef') == oid for sh in old_doc.shapes + old_doc.ink_shapes)
-            locked_keep = [o['id'] for o in objects
-                           if (o.get('generation') or {}).get('locked') and _has_artwork(o['id'])]
             spec_objects = [o for o in objects if o['id'] not in locked_keep]
             stages = {}
             if spec_objects:
@@ -971,16 +981,31 @@ class GenerationSessionManager:
                     _reinject_locked_objects(master_path, old_master_text, locked_keep, objects)
                 calls = len(specs)
             else:
-                # everything is locked with existing artwork: the master IS
-                # the artwork to keep; zero provider calls this round.
+                # Everything is locked with existing artwork: zero provider
+                # calls — but the CURRENT plan is still applied LOCALLY:
+                # objects removed from the plan are pruned from the master
+                # and the stream re-sorted to the plan z order. Removed
+                # objects' pending entries only clear once this prune ran.
+                plan_ids = {o['id'] for o in objects}
+                if old_doc is not None:
+                    stream = sorted(old_doc.shapes + old_doc.ink_shapes, key=lambda t: t['order'])
+                    stream = [sh for sh in stream
+                              if sh.get('objectRef') is None or sh.get('objectRef') in plan_ids]
+                    z_of = {o['id']: o.get('z', 0) for o in objects}
+                    for k, sh in enumerate(stream):
+                        sh['order'] = k
+                    old_doc.shapes = [sh for sh in stream if sh.get('kind') != 'ink']
+                    old_doc.ink_shapes = [sh for sh in stream if sh.get('kind') == 'ink']
+                    clean_svg(emit_master_svg(old_doc).encode('utf-8'), master_path)
                 calls = 0
                 stages = {'keptLocked': {'objects': locked_keep, 'usage': {}}}
             session = self.get_session(session_id)
             session.setdefault('meta', {})['generationStages'] = stages
             if locked_keep:
                 session['meta']['keptLockedObjects'] = locked_keep
-            # The composed master now reflects the CURRENT plan in full —
-            # every visual pending change is resolved by this bulk pass.
+            # The master now reflects the CURRENT plan in full (composed from
+            # it, or locally pruned to it) — every visual pending change is
+            # resolved by this pass.
             session['meta'].pop('pendingArtworkChanges', None)
             session['meta'].pop('artworkStale', None)
             session['updatedAt'] = _now()
@@ -1097,6 +1122,109 @@ class GenerationSessionManager:
         sdir = self.session_path(session_id)
         write_json(sdir / 'session.json', session)
         return session, usage
+
+    # -----------------------------------------------------------------------
+    # Task 30 — image session source asset + build-input identity
+    # -----------------------------------------------------------------------
+
+    def set_session_source(self, session_id: str, data: bytes, display_name: str) -> dict:
+        """Free, AI-less: validate + store the session's source image.
+
+        clean_image() validates BEFORE anything is replaced, so a failed
+        upload never removes the previous source. The draft never touches the
+        project master."""
+        from .pipeline import clean_image
+        session = self.get_session(session_id)
+        if session['status'] == 'committed':
+            raise ValueError('This session is already committed.')
+        if session['mode'] not in ('image_reference', 'image_convert'):
+            raise ValueError('Only image sessions carry a source asset.')
+        sdir = self.session_path(session_id)
+        target = sdir / 'source.png'
+        tmp = sdir / 'source.tmp.png'
+        try:
+            info = clean_image(data, tmp)          # validates + normalizes first
+        except Exception:
+            tmp.unlink(missing_ok=True)
+            raise
+        tmp.replace(target)
+        session = self.get_session(session_id)
+        session.setdefault('meta', {})['source'] = {
+            'file': 'source.png', 'sha256': info['sha256'],
+            'width': info['width'], 'height': info['height'],
+            'name': (display_name or 'source image')[:120], 'at': _now(),
+        }
+        # The stored source is a BUILD INPUT: any previously built result now
+        # mismatches the active inputs — commit refuses until a new convert
+        # run (the snapshot is kept; the comparison is the guard, so
+        # re-uploading the SAME source re-enables commit honestly). The flag
+        # surfaces the mismatch to the UI immediately.
+        if session['status'] == 'ready_to_commit':
+            session['meta']['buildInputsStale'] = True
+        session['updatedAt'] = _now()
+        write_json(sdir / 'session.json', session)
+        return session
+
+    def update_session_settings(self, session_id: str, fidelity: str | None = None,
+                                requested_difficulty: str | None = None) -> dict:
+        """Free settings change for image sessions (Task 30C/30D).
+
+        Changing the reconstruction fidelity or the gameplay tier makes any
+        existing build result mismatch the active inputs (commit refuses
+        until a new convert run) — without auto-running paid work and without
+        deleting the result. Restoring the previous settings re-enables
+        commit, because the identity comparison is the guard."""
+        session = self.get_session(session_id)
+        if session['status'] == 'committed':
+            raise ValueError('This session is already committed.')
+        if session['mode'] != 'image_convert':
+            raise ValueError('Settings edits apply to image_convert sessions.')
+        if session.get('job') and session.get('status') in ('generating', 'compiling'):
+            raise ValueError('Wait for the running job before changing settings.')
+        changed = False
+        if fidelity and fidelity in CONVERT_POLICIES and fidelity != session.get('fidelity'):
+            session['fidelity'] = fidelity
+            changed = True
+        if requested_difficulty and requested_difficulty in DIFFICULTY_RANGES \
+                and requested_difficulty != session.get('requestedDifficulty'):
+            session['requestedDifficulty'] = requested_difficulty
+            session['targetRegions'] = DIFFICULTY_INITIAL_TARGETS[requested_difficulty]
+            plan = session.get('scenePlan') or {}
+            if plan:
+                plan['requestedDifficulty'] = requested_difficulty
+                plan['targetRegionRange'] = list(DIFFICULTY_RANGES[requested_difficulty])
+                plan['targetRegions'] = session['targetRegions']
+                session['scenePlan'] = plan
+            changed = True
+        if changed:
+            # fidelity/difficulty are build inputs: the snapshot stays (the
+            # commit-time comparison refuses the mismatched result) and the
+            # flag surfaces the mismatch to the UI immediately.
+            if session['status'] == 'ready_to_commit':
+                session.setdefault('meta', {})['buildInputsStale'] = True
+            session['updatedAt'] = _now()
+            write_json(self.session_path(session_id) / 'session.json', session)
+        return session
+
+    def _build_inputs(self, session: dict) -> dict:
+        """Identity of everything a convert RESULT depends on (Task 30D):
+        source hash, mode, resolved fidelity policy, a CONTENT fingerprint of
+        the plan objects and the gameplay settings. Takes the session dict
+        (the caller's freshest state); commit re-checks this snapshot against
+        the active session state."""
+        policy = resolve_convert_policy(session.get('fidelity') or 'balanced')
+        plan = session.get('scenePlan') or {}
+        plan_rev = hashlib.sha256(json.dumps(
+            plan.get('objects') or [], sort_keys=True, ensure_ascii=False).encode()).hexdigest()[:16]
+        return {
+            'sourceSha256': (session.get('meta', {}).get('source') or {}).get('sha256'),
+            'mode': session['mode'],
+            'fidelity': session.get('fidelity') or 'balanced',
+            'policy': {k: policy[k] for k in sorted(policy)},
+            'planRev': plan_rev,
+            'targetRegions': session.get('targetRegions'),
+            'requestedDifficulty': session.get('requestedDifficulty'),
+        }
 
     def convert_session_image(self, session_id: str, provider, source_png: Path,
                               policy_overrides: dict | None = None,
@@ -1259,6 +1387,10 @@ class GenerationSessionManager:
         session['meta']['qa'] = read_json(bundle_dir / 'validation.json')
         session['meta']['conversionScores'] = post_scores
         session['meta']['difficultyOptimization'] = diff_report
+        # Task 30D — record WHICH build inputs produced this result; commit
+        # re-checks the snapshot against the active session state.
+        session['meta']['activeBuildInputs'] = self._build_inputs(session)
+        session['meta'].pop('buildInputsStale', None)
         session['status'] = 'ready_to_commit'
         session['updatedAt'] = _now()
         write_json(sdir / 'session.json', session)
@@ -1378,6 +1510,18 @@ class GenerationSessionManager:
             pending_list = ', '.join(f'{oid} ({"/".join(fields)})' for oid, fields in sorted(pending.items()))
             raise ValueError('The plan has visual changes the artwork does not reflect yet: '
                              f'{pending_list}. Regenerate those objects (or bulk regenerate) before committing.')
+        if session['mode'] == 'image_convert':
+            # Task 30D — a convert result may only be committed while it was
+            # built from the ACTIVE inputs (source, fidelity policy, plan,
+            # gameplay settings). A stale result is never silently committed.
+            active = session.get('meta', {}).get('activeBuildInputs')
+            if not active:
+                raise ValueError('This convert result was built from different inputs '
+                                 '(the source or settings changed). Run Convert again.')
+            current = self._build_inputs(session)
+            if active != current:
+                raise ValueError('This convert result was built from different inputs '
+                                 '(the source or settings changed). Run Convert again.')
 
         sdir = self.session_path(session_id)
         bundle_dir = sdir / 'bundle'

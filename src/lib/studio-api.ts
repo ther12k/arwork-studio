@@ -444,6 +444,25 @@ export interface GenerationSessionFull extends GenerationSession {
     keptLockedObjects?: string[];
     artworkStale?: boolean;
     pendingArtworkChanges?: Record<string, string[]>;
+    source?: { file: string; sha256: string; width: number; height: number; name: string };
+    activeBuildInputs?: Record<string, unknown>;
+    buildInputsStale?: boolean;
+    convertPolicy?: Record<string, unknown>;
+    conversionScores?: {
+      visualFidelity: number;
+      gameReadiness: number;
+      passed: boolean;
+      gates: { visualGate: number; gameReadinessGate: number };
+      metrics?: Record<string, unknown>;
+      notes?: string[];
+    };
+    difficultyOptimization?: {
+      requestedTier?: string;
+      outcome?: string;
+      achieved?: { rating: string; score: number; regionCount: number };
+      reasons?: string[];
+      [key: string]: unknown;
+    };
     qa?: QaReport;
     measuredDifficulty?: { rating: string; score: number; metrics: Record<string, unknown> };
     regionCount?: number;
@@ -483,8 +502,55 @@ export const commitSessionArtwork = (pid: string, sid: string, title?: string): 
   post(`/projects/${pid}/generation/sessions/${sid}/commit`, { title });
 
 /** Read-only preview of the session's compiled artwork (review stage). */
-export const sessionPreviewUrl = (pid: string, sid: string, name: "colored.svg" | "numbered.svg" | "colored-preview.png" | "numbered-preview.png"): string =>
+export const sessionPreviewUrl = (pid: string, sid: string, name: "colored.svg" | "numbered.svg" | "colored-preview.png" | "numbered-preview.png" | "source.png"): string =>
   studioUrl(`/projects/${pid}/generation/sessions/${sid}/preview/${name}`);
+
+/** Task 30A — FREE: validate + store the session's source image (no AI). */
+export const uploadSessionSource = (pid: string, sid: string, file: File): Promise<GenerationSessionFull> => {
+  const form = new FormData();
+  form.append("file", file);
+  return api<GenerationSessionFull>(`/projects/${pid}/generation/sessions/${sid}/source`, {
+    method: "POST",
+    body: form,
+  });
+};
+
+/** Task 30C — FREE: fidelity / difficulty change (invalidates the previous
+ *  result's commit eligibility via the input-identity comparison). */
+export const updateSessionSettings = (
+  pid: string,
+  sid: string,
+  body: { fidelity?: "stylized" | "balanced" | "faithful"; requested_difficulty?: SessionTier }
+): Promise<GenerationSessionFull> => post(`/projects/${pid}/generation/sessions/${sid}/settings`, body);
+
+/** Task 30C — paid Convert run against the STORED session source. */
+export const convertSession = (pid: string, sid: string, confirm_paid: boolean): Promise<{ jobId: string }> => {
+  const form = new FormData();
+  form.append("body", JSON.stringify({ confirm_paid }));
+  return api<{ jobId: string }>(`/projects/${pid}/generation/sessions/${sid}/convert`, {
+    method: "POST",
+    body: form,
+  });
+};
+
+/** Task 30B — paid vision analysis of the STORED session reference. */
+export const analyzeSessionReference = (
+  pid: string,
+  sid: string,
+  confirm_paid: boolean,
+  instructions = ""
+): Promise<{ jobId: string }> => {
+  const form = new FormData();
+  form.append("body", JSON.stringify({ confirm_paid, instructions }));
+  return api<{ jobId: string }>(`/projects/${pid}/generation/sessions/${sid}/reference-plan`, {
+    method: "POST",
+    body: form,
+  });
+};
+
+/** Read-only preview of the session's STORED SOURCE image. */
+export const sessionSourceUrl = (pid: string, sid: string): string =>
+  studioUrl(`/projects/${pid}/generation/sessions/${sid}/preview/source.png`);
 
 export const createProject = (title: string, brief?: string): Promise<Project> =>
   post<Project>("/projects", { title, ...(brief ? { brief } : {}) });

@@ -293,12 +293,13 @@ function ObjectEditor({
   );
 }
 
-export function AiWorkspace({ session }: { session: GenerationSessionFull }) {
+export function AiWorkspace({ session, planMode = "chat" }: { session: GenerationSessionFull; planMode?: "chat" | "reference" }) {
   const studio = useStudioContext();
   const {
     busy,
     project,
     planSceneWithAi,
+    analyzeReference,
     revisePlanWithAi,
     editScenePlan,
     generateArtwork,
@@ -425,7 +426,10 @@ export function AiWorkspace({ session }: { session: GenerationSessionFull }) {
             {objects.length === 0 ? (
               <>
                 <p className="mt-3 flex items-center gap-1.5 text-[11px] italic text-[#778481]">
-                  <Clock className="size-3.5" aria-hidden /> Scene hasn't been planned yet.
+                  <Clock className="size-3.5" aria-hidden />
+                  {planMode === "reference"
+                    ? "The scene hasn't been planned yet — analyze your reference to draft it."
+                    : "Scene hasn't been planned yet."}
                 </p>
                 <Button
                   size="sm"
@@ -434,7 +438,7 @@ export function AiWorkspace({ session }: { session: GenerationSessionFull }) {
                   className="mt-3 h-9 w-full rounded-md bg-[#0e554e] text-[11px] font-semibold text-white hover:bg-[#0a423d] sm:w-auto sm:px-6"
                 >
                   <Sparkles className="size-3.5" aria-hidden />
-                  Plan scene with AI
+                  {planMode === "reference" ? "Analyze reference with AI" : "Plan scene with AI"}
                 </Button>
               </>
             ) : (
@@ -683,10 +687,13 @@ export function AiWorkspace({ session }: { session: GenerationSessionFull }) {
       <AlertDialog open={dialog === "plan"} onOpenChange={(open) => !open && setDialog(null)}>
         <AlertDialogContent className="rounded-xl border-[#cfe6db] sm:max-w-md">
           <AlertDialogHeader>
-            <AlertDialogTitle className="text-left text-sm text-[#183837]">Plan this scene with AI?</AlertDialogTitle>
+            <AlertDialogTitle className="text-left text-sm text-[#183837]">
+              {planMode === "reference" ? "Analyze your reference with AI?" : "Plan this scene with AI?"}
+            </AlertDialogTitle>
             <AlertDialogDescription className="text-left text-[11px] leading-relaxed text-[#657671]">
-              This sends your brief to the configured AI provider and may incur provider usage. It
-              drafts a revisable object plan — no artwork is generated yet.
+              {planMode === "reference"
+                ? "This sends your STORED reference image to the configured AI provider for vision analysis and may incur provider usage. It drafts a revisable object plan for a NEW original scene — no artwork is generated yet."
+                : "This sends your brief to the configured AI provider and may incur provider usage. It drafts a revisable object plan — no artwork is generated yet."}
             </AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter className="gap-2 sm:justify-end">
@@ -696,11 +703,12 @@ export function AiWorkspace({ session }: { session: GenerationSessionFull }) {
               disabled={busy}
               onClick={() => {
                 setDialog(null);
-                void planSceneWithAi(true).catch((e: Error) => toast(e.message));
+                const step = planMode === "reference" ? analyzeReference(true) : planSceneWithAi(true);
+                void step.catch((e: Error) => toast(e.message));
               }}
             >
               <Sparkles className="size-3.5" aria-hidden />
-              Confirm & Plan
+              {planMode === "reference" ? "Confirm & Analyze" : "Confirm & Plan"}
             </AlertDialogAction>
           </AlertDialogFooter>
         </AlertDialogContent>

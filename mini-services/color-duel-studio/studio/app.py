@@ -598,6 +598,40 @@ def create_app(workspace: Path|None=None, transport=None):
 
         return start(pid, 'session vector compilation', run)
 
+    @app.post('/api/projects/{pid}/generation/sessions/{sid}/source')
+    async def session_source_route(pid: str, sid: str, file: UploadFile = File(...)):
+        # Task 30A — FREE: validate + store the session's source image. No AI
+        # provider is called; a failed upload never removes the old source;
+        # the draft never touches the project master.
+        with lock:
+            p = project(pid)
+            editable(p)
+            sm = GenerationSessionManager(folder(pid), pid)
+        raw = await file.read(12 * 1024 * 1024 + 1)
+        if len(raw) >= 12 * 1024 * 1024:
+            raise HTTPException(400, 'Use a source image under 12 MB.')
+        try:
+            return sm.set_session_source(sid, raw, file.filename or 'source image')
+        except (ValueError, FileNotFoundError) as exc:
+            raise HTTPException(400, str(exc))
+
+    @app.post('/api/projects/{pid}/generation/sessions/{sid}/settings')
+    def session_settings_route(pid: str, sid: str, body: dict = {}):
+        # Task 30C/D — FREE: fidelity / difficulty change. Any previously
+        # built result stops matching the active inputs (commit refuses until
+        # a new convert run) — paid work is never auto-started.
+        with lock:
+            p = project(pid)
+            editable(p)
+            sm = GenerationSessionManager(folder(pid), pid)
+            try:
+                return sm.update_session_settings(
+                    sid,
+                    fidelity=str((body or {}).get('fidelity') or '') or None,
+                    requested_difficulty=str((body or {}).get('requested_difficulty') or '') or None)
+            except (ValueError, FileNotFoundError) as exc:
+                raise HTTPException(400, str(exc))
+
     @app.post('/api/projects/{pid}/generation/sessions/{sid}/commit')
     def commit_session_route(pid: str, sid: str, body: CommitSessionRequest = CommitSessionRequest()):
         with lock:
@@ -697,7 +731,7 @@ def create_app(workspace: Path|None=None, transport=None):
         # review stage before commit). Restricted to known artifact names.
         safe = {'colored.svg': 'image/svg+xml', 'numbered.svg': 'image/svg+xml',
                 'colored-preview.png': 'image/png', 'numbered-preview.png': 'image/png',
-                'source-master.svg': 'image/svg+xml'}
+                'source-master.svg': 'image/svg+xml', 'source.png': 'image/png'}
         if name not in safe:
             raise HTTPException(404, 'Unknown preview artifact.')
         sm = GenerationSessionManager(folder(pid), pid)
@@ -705,7 +739,8 @@ def create_app(workspace: Path|None=None, transport=None):
             sdir = sm.session_path(sid)
         except ValueError as exc:
             raise HTTPException(400, str(exc))
-        for rel in (Path('bundle') / name, name):
+        for rel in (Path('bundle') / name, name,
+                    Path('source.png') if name == 'source.png' else Path('bundle') / name):
             f = sdir / rel
             if f.is_file():
                 return FileResponse(f, media_type=safe[name])
@@ -756,7 +791,7 @@ def create_app(workspace: Path|None=None, transport=None):
         return start(pid, 'targeted object regeneration', run)
 
     @app.post('/api/projects/{pid}/generation/sessions/{sid}/reference-plan')
-    async def reference_plan_session_route(pid: str, sid: str, file: UploadFile = File(...), body: str = Form('{}')):
+    async def reference_plan_session_route(pid: str, sid: str, file: UploadFile | None = File(None), body: str = Form('{}')):
         # Phase 2C — Use as Reference (paid): vision scene understanding of the
         # uploaded image drafts the session's ScenePlan; artwork itself is then
         # generated as native vectors via the normal /generate step. The source
@@ -771,7 +806,13 @@ def create_app(workspace: Path|None=None, transport=None):
                 raise HTTPException(503, 'AI not configured. Add OPENAI_API_KEY to .env. Upload-to-vector works without it.')
             sm = GenerationSessionManager(folder(pid), pid)
             sdir = sm.session_path(sid)
-            raw = await file.read(12 * 1024 * 1024 + 1)
+            if file is None:
+                stored = sdir / 'source.png'
+                if not stored.is_file():
+                    raise HTTPException(400, 'Upload the reference image first.')
+                raw = stored.read_bytes()
+            else:
+                raw = await file.read(12 * 1024 * 1024 + 1)
             if len(raw) >= 12 * 1024 * 1024:
                 raise HTTPException(400, 'Use a reference image under 12 MB.')
             ref_path = sdir / 'reference-image'
@@ -790,7 +831,7 @@ def create_app(workspace: Path|None=None, transport=None):
         return start(pid, 'reference scene planning', run)
 
     @app.post('/api/projects/{pid}/generation/sessions/{sid}/convert')
-    async def convert_session_route(pid: str, sid: str, file: UploadFile = File(...), body: str = Form('{}')):
+    async def convert_session_route(pid: str, sid: str, file: UploadFile | None = File(None), body: str = Form('{}')):
         # Phase 2D — Convert Artwork (paid): clean_image() is the entrance gate
         # (format/size/EXIF/animation checks, normalized PNG), then vision
         # semantics + deterministic CV run inside the session sandbox.
@@ -804,7 +845,15 @@ def create_app(workspace: Path|None=None, transport=None):
                 raise HTTPException(503, 'AI not configured. Add OPENAI_API_KEY to .env. Upload-to-vector works without it.')
             sm = GenerationSessionManager(folder(pid), pid)
             sdir = sm.session_path(sid)
-            raw = await file.read(12 * 1024 * 1024 + 1)
+            if file is None:
+                source_png = sdir / 'source.png'
+                if not source_png.is_file():
+                    raise HTTPException(400, 'Upload the source image first.')
+                raw = source_png.read_bytes()
+            else:
+                raw = await file.read(12 * 1024 * 1024 + 1)
+                if len(raw) >= 12 * 1024 * 1024:
+                    raise HTTPException(400, 'Use a source image under 12 MB.')
             source_png = sdir / 'source.png'
             try:
                 clean_image(raw, source_png)     # entrance gate + normalized pixels

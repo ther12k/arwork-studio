@@ -31,6 +31,7 @@ import { Textarea } from "@/components/ui/textarea";
 import type { GenerationSessionFull, SessionTier } from "@/lib/studio-api";
 import { useStudioContext } from "./use-studio";
 import { AiWorkspace } from "./ai-workspace";
+import { ImageWorkspace } from "./image-workspace";
 import { DIFFICULTY_TIERS } from "./difficulty";
 
 const TIERS_ONLY: Array<{ key: SessionTier; label: string; color: string }> =
@@ -305,12 +306,14 @@ function ImageShell() {
     setPreview(f ? URL.createObjectURL(f) : null);
   };
   const start = () => {
-    if (path === "reference" && !file) {
-      toast("Choose an image to use as reference first.");
+    // Task 30A: the image is REQUIRED for both paths — it is stored with the
+    // session (free) before any paid call, so refreshes never lose it.
+    if (!file) {
+      toast(path === "reference" ? "Choose an image to use as reference first." : "Choose the artwork to convert first.");
       return;
     }
     setStarting(true);
-    void startImageCreation(path, tier, fidelity, path === "reference" ? file ?? undefined : undefined)
+    void startImageCreation(path, tier, fidelity, file)
       .catch((e: Error) => toast(e.message))
       .finally(() => setStarting(false));
   };
@@ -431,8 +434,9 @@ function ImageShell() {
         </div>
       </div>
       <p className="mt-3 text-[10px] leading-relaxed text-[#778481]">
-        Starting is free. For “Use as Reference” the image is stored with the project; every paid AI
-        step asks for explicit confirmation inside the workspace before it runs.
+        Starting is free: your image is validated and stored with the session (it survives page
+        reloads) before anything runs. Every paid AI step asks for explicit confirmation inside the
+        workspace.
       </p>
       <Button
         size="sm"
@@ -635,8 +639,14 @@ export function CreateArtwork() {
         <AiShell />
       );
   } else if (creationMode === "image") {
-    // Task 30 will replace this with the image workspace.
-    shell = <ImageShell />;
+    // Task 30: image sessions open their own workspace (Reference reuses the
+    // AI workspace; Convert has its dual review).
+    shell =
+      activeSession?.mode === "image_reference" || activeSession?.mode === "image_convert" ? (
+        <ImageWorkspace session={activeSession as GenerationSessionFull} />
+      ) : (
+        <ImageShell />
+      );
   }
   // A resumed/opened shell wins; otherwise the landing (which itself shows
   // the resume card when a session exists).

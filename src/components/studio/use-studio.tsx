@@ -29,13 +29,17 @@ import {
   loadSample,
   loadSvgSample,
   listGenerationSessions,
+  analyzeSessionReference as apiAnalyzeSessionReference,
   commitSessionArtwork as apiCommitSessionArtwork,
   compileSession as apiCompileSession,
+  convertSession as apiConvertSession,
   generateSessionArtwork as apiGenerateSessionArtwork,
   mutateSessionPlan as apiMutateSessionPlan,
   planChatSession as apiPlanChatSession,
   planSession as apiPlanSession,
   regenerateSessionObject as apiRegenerateSessionObject,
+  updateSessionSettings as apiUpdateSessionSettings,
+  uploadSessionSource as apiUploadSessionSource,
   patchProject,
   promoteReference as promoteReferenceApi,
   recordPlaytest as apiRecordPlaytest,
@@ -221,6 +225,12 @@ export interface StudioApi {
   generateArtwork: (confirmPaid: boolean) => Promise<void>;
   regenerateObject: (objectId: string, instructions: string, confirmPaid: boolean) => Promise<void>;
   recompileSessionArtwork: () => Promise<void>;
+  convertImage: (confirmPaid: boolean) => Promise<void>;
+  analyzeReference: (confirmPaid: boolean) => Promise<void>;
+  changeImageSettings: (settings: {
+    fidelity?: "stylized" | "balanced" | "faithful";
+    requested_difficulty?: SessionTier;
+  }) => Promise<void>;
   commitArtworkToEditor: () => Promise<void>;
   clearSelection: () => void;
   startPlacing: () => void;
@@ -935,9 +945,10 @@ export function StudioProvider({ children }: { children: React.ReactNode }) {
     [ensureProject, refreshSessions, saveBrief]
   );
 
-  /** Create from Image: stores the image as the project reference when the
-   *  path needs one (free), then creates the matching session. The paid
-   *  planning/conversion steps are NOT called here. */
+  /** Create from Image (Task 30A): create the matching session, then store
+   *  the image as the SESSION source (free, validated, refresh-proof) —
+   *  BEFORE any paid call. The visible source is always the server asset;
+   *  the project master is never touched by the draft. */
   const startImageCreation = useCallback(
     async (
       path: "reference" | "convert",
@@ -945,18 +956,19 @@ export function StudioProvider({ children }: { children: React.ReactNode }) {
       fidelity: "stylized" | "balanced" | "faithful",
       file?: File
     ) => {
-      if (file && path === "reference") await uploadFile(file, "reference");
+      if (!file) throw new Error("Choose an image first — it is stored with the session before anything runs.");
       const p = projectRef.current ?? (await ensureProject());
-      await createGenerationSession(p.id, {
+      const session = await createGenerationSession(p.id, {
         mode: path === "reference" ? "image_reference" : "image_convert",
         requested_difficulty: tier,
         fidelity,
       });
+      await apiUploadSessionSource(p.id, session.id, file);
       await refreshSessions(p.id);
       setCreationMode("image");
       setShowCreateWorkspace(true);
     },
-    [ensureProject, refreshSessions, uploadFile]
+    [ensureProject, refreshSessions]
   );
 
   /** Start over: discard the draft session entirely (nothing was generated,
@@ -1039,6 +1051,29 @@ export function StudioProvider({ children }: { children: React.ReactNode }) {
   const recompileSessionArtwork = useCallback(
     () => runSessionStep(() => apiCompileSession(projectRef.current!.id, activeSession!.id)),
     [runSessionStep]
+  );
+
+  // Task 30 — image session steps
+  const convertImage = useCallback(
+    (confirmPaid: boolean) =>
+      runSessionStep(() => apiConvertSession(projectRef.current!.id, activeSession!.id, confirmPaid)),
+    [runSessionStep]
+  );
+
+  const analyzeReference = useCallback(
+    (confirmPaid: boolean) =>
+      runSessionStep(() => apiAnalyzeSessionReference(projectRef.current!.id, activeSession!.id, confirmPaid)),
+    [runSessionStep]
+  );
+
+  const changeImageSettings = useCallback(
+    async (settings: { fidelity?: "stylized" | "balanced" | "faithful"; requested_difficulty?: SessionTier }) => {
+      const p = projectRef.current;
+      if (!p || !activeSession) throw new Error("No active generation session.");
+      await apiUpdateSessionSettings(p.id, activeSession.id, settings);
+      await refreshSessions(p.id);
+    },
+    [activeSession, refreshSessions]
   );
 
   /** Commit the verified session bundle: session → immutable revision → the
@@ -1396,6 +1431,9 @@ export function StudioProvider({ children }: { children: React.ReactNode }) {
     generateArtwork,
     regenerateObject,
     recompileSessionArtwork,
+    convertImage,
+    analyzeReference,
+    changeImageSettings,
     commitArtworkToEditor,
     clearSelection,
     startPlacing,
