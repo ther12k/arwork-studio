@@ -948,6 +948,16 @@ class GenerationSessionManager:
         objects = session['scenePlan'].get('objects') or []
         if not objects:
             raise ValueError('The ScenePlan has no objects yet. Run the AI planning step (or add objects) first.')
+        # Task 31 provenance (per-stage): the plan belongs to the image that
+        # was ANALYZED. If the active source differs, generation would stamp
+        # a plan from A with an origin from B — refuse and ask for re-analysis.
+        if session['mode'] == 'image_reference':
+            plan_origin = (session.get('meta', {}) or {}).get('planOriginSourceSha256')
+            active_sha = ((session.get('meta', {}) or {}).get('source') or {}).get('sha256')
+            if plan_origin and active_sha and plan_origin != active_sha:
+                raise ValueError('The active source changed after the reference was analyzed. '
+                                 'Re-analyze the reference to apply the new source — the current '
+                                 'plan belongs to the previous image.')
         sdir = self.session_path(session_id)
         master_path = sdir / 'source-master.svg'
         old_master_text = master_path.read_text(encoding='utf-8') if master_path.is_file() else None
@@ -979,7 +989,8 @@ class GenerationSessionManager:
             stages = {}
             if spec_objects:
                 specs = [_fragment_spec(o) for o in spec_objects]
-                svg_text, stages = provider.svg_compose_from_objects(specs, session['aspect'], progress)
+                svg_text, stages = provider.svg_compose_from_objects(
+                    specs, session['aspect'], progress, cache_dir=sdir / 'fragments')
                 clean_svg(svg_text.encode('utf-8'), master_path)
                 if locked_keep:
                     _reinject_locked_objects(master_path, old_master_text, locked_keep, objects)
@@ -1016,10 +1027,21 @@ class GenerationSessionManager:
             # Compile inherits this; it must never restamp provenance from
             # the session's CURRENT state (a later source change would
             # otherwise 're-validate' the old master).
-            session['meta']['masterOrigin'] = {
+            new_origin = {
                 'sourceSha256': (session.get('meta', {}).get('source') or {}).get('sha256'),
                 'planRev': self._plan_fingerprint(session.get('scenePlan') or {}),
             }
+            old_origin = session.get('meta', {}).get('masterOrigin')
+            session['meta']['masterOrigin'] = new_origin
+            # Task 31 checkpoint scoping: the fragment cache serves RETRIES of
+            # the same master era (same origin). Once a NEW origin is about to
+            # be stamped, prior-era fragments must not leak into it — clear
+            # the cache so the next retry of THIS era still hits, but a later
+            # unrelated era starts fresh.
+            if old_origin != new_origin:
+                frags = sdir / 'fragments'
+                if frags.is_dir():
+                    shutil.rmtree(frags, ignore_errors=True)
             session['updatedAt'] = _now()
             write_json(sdir / 'session.json', session)
             usage = {'kind': 'generation-synthesis', 'calls': calls, 'stages': stages}
@@ -1239,14 +1261,17 @@ class GenerationSessionManager:
         (the caller's freshest state); commit re-checks this snapshot against
         the active session state."""
         policy = resolve_convert_policy(session.get('fidelity') or 'balanced')
-        plan = session.get('scenePlan') or {}
-        plan_rev = self._plan_fingerprint(plan)
         return {
             'sourceSha256': (session.get('meta', {}).get('source') or {}).get('sha256'),
             'mode': session['mode'],
             'fidelity': session.get('fidelity') or 'balanced',
             'policy': {k: policy[k] for k in sorted(policy)},
-            'planRev': plan_rev,
+            # NOTE: plan content is deliberately NOT part of the identity
+            # equality. Visual plan drift is tracked per-object by
+            # meta.pendingArtworkChanges (cleared only by regeneration), and
+            # metadata-only edits (rename/lock) must never invalidate a
+            # healthy result. masterOrigin.planRev is still recorded for
+            # provenance/audit.
             'targetRegions': session.get('targetRegions'),
             'requestedDifficulty': session.get('requestedDifficulty'),
         }
@@ -1548,6 +1573,11 @@ class GenerationSessionManager:
                         write_json(self.session_path(session_id) / 'session.json', fresh)
                 else:
                     policy = resolve_convert_policy(fresh.get('fidelity') or 'balanced')
+                    # identity = WHERE the artwork came from (origin source) +
+                    # the gameplay settings now applied. planRev is inherited
+                    # as provenance but excluded from the equality: visual
+                    # drift is guarded per-object by pendingArtworkChanges,
+                    # and metadata edits must not invalidate healthy artwork.
                     identity = {
                         'sourceSha256': origin.get('sourceSha256'),
                         'mode': fresh['mode'],
@@ -1558,7 +1588,9 @@ class GenerationSessionManager:
                         'requestedDifficulty': fresh.get('requestedDifficulty'),
                     }
                     fresh.setdefault('meta', {})['activeBuildInputs'] = identity
-                    fresh['meta']['buildInputsStale'] = identity != self._build_inputs(fresh)
+                    comparable = {k: v for k, v in identity.items() if k != 'planRev'}
+                    current = {k: v for k, v in self._build_inputs(fresh).items() if k != 'planRev'}
+                    fresh['meta']['buildInputsStale'] = comparable != current
                     write_json(self.session_path(session_id) / 'session.json', fresh)
             return result
         except Exception as exc:
@@ -1585,13 +1617,14 @@ class GenerationSessionManager:
             raise ValueError('The plan has visual changes the artwork does not reflect yet: '
                              f'{pending_list}. Regenerate those objects (or bulk regenerate) before committing.')
         if session['mode'] in ('image_convert', 'image_reference'):
-            # Task 30D — an image-session result may only be committed while
-            # it was built from the ACTIVE inputs (source, fidelity policy,
-            # plan, gameplay settings). A stale result is never silently
-            # committed — including a Reference result whose source changed
-            # after generation.
+            # Task 30D + 31 — an image-session result may only be committed
+            # while it was built from the ACTIVE inputs. planRev is excluded:
+            # visual drift is guarded per-object by pendingArtworkChanges and
+            # metadata edits never invalidate healthy artwork.
             active = session.get('meta', {}).get('activeBuildInputs')
-            if not active or active != self._build_inputs(session):
+            comparable = {k: v for k, v in (active or {}).items() if k != 'planRev'}
+            current = {k: v for k, v in self._build_inputs(session).items() if k != 'planRev'}
+            if not active or comparable != current:
                 raise ValueError('This result was built from different inputs '
                                  '(the source or settings changed). Run the build step again.')
 

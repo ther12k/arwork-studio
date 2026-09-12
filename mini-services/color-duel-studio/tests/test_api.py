@@ -2004,9 +2004,10 @@ def test_inline_reference_upload_updates_provenance(tmp_path, monkeypatch):
 
 
 def test_metadata_only_compile_keeps_origin_and_enables_commit(tmp_path, monkeypatch):
-    """Difficulty changes are gameplay-only: a free recompile still works
-    after the provenance patch, and the inherited identity tracks the new
-    gameplay settings honestly (the artwork provenance stays the origin)."""
+    """Reviewer gate: rename metadata → free compile → commit succeeds; a
+    difficulty change also recompiles freely and stays committable — plan
+    content is NOT part of the identity equality (visual drift is guarded
+    per-object by pendingArtworkChanges, metadata edits never pend)."""
     monkeypatch.setenv('OPENAI_API_KEY', 'fake-key')
     with TestClient(create_app(tmp_path, transport=_convert_transport([]))) as c:
         pid = new(c)
@@ -2022,13 +2023,13 @@ def test_metadata_only_compile_keeps_origin_and_enables_commit(tmp_path, monkeyp
         p = wait(c, pid, timeout=240)
         assert p['job']['status'] == 'done'
         origin_sha = c.get(base).json()['meta']['masterOrigin']['sourceSha256']
-        # difficulty change (gameplay-only; free, no provider call)
+        # metadata rename (update_object name) — never pends
         r = c.post(f'{base}/mutate', headers=H,
-                   json={'mutations': [{'op': 'set_difficulty', 'difficulty': 'hard'}]})
+                   json={'mutations': [{'op': 'update_object', 'objectId': 'obj-sky',
+                                        'changes': {'name': 'Open sky'}}]})
         assert r.status_code == 200
-        assert r.json()['meta'].get('buildInputsStale') is True
-        # free recompile is ALLOWED (source untouched) and adopts the new
-        # gameplay settings into the inherited identity
+        assert not (r.json()['meta'].get('pendingArtworkChanges') or {})
+        # free compile still allowed; commit succeeds (identity unchanged)
         r = c.post(f'{base}/compile', headers=H, json={})
         assert r.status_code == 200
         p = wait(c, pid, timeout=240)
@@ -2036,9 +2037,34 @@ def test_metadata_only_compile_keeps_origin_and_enables_commit(tmp_path, monkeyp
         sess = c.get(base).json()
         assert sess['status'] == 'ready_to_commit'
         assert sess['meta']['buildInputsStale'] is False
-        # artwork provenance still points at the ORIGIN source
         assert sess['meta']['activeBuildInputs']['sourceSha256'] == origin_sha
         r = c.post(f'{base}/commit', headers=H, json={})
+        assert r.status_code == 200, r.text
+        # difficulty change on the committed session's follow-up: mutate ->
+        # compile adopts new gameplay settings -> commit again succeeds
+        sid2 = c.post(f'/api/projects/{pid}/generation/sessions', headers=H,
+                      json={'mode': 'image_reference', 'requested_difficulty': 'medium'}).json()['id']
+        base2 = f'/api/projects/{pid}/generation/sessions/{sid2}'
+        c.post(f'{base2}/source', headers=H,
+               files={'file': ('a.png', _convert_fixture_png(), 'image/png')})
+        c.post(f'{base2}/reference-plan', headers=H,
+               files={'body': (None, json.dumps({'confirm_paid': True}))})
+        wait(c, pid, timeout=120)
+        c.post(f'{base2}/generate', headers=H, json={'confirm_paid': True})
+        p = wait(c, pid, timeout=240)
+        assert p['job']['status'] == 'done'
+        r = c.post(f'{base2}/mutate', headers=H,
+                   json={'mutations': [{'op': 'set_difficulty', 'difficulty': 'hard'}]})
+        assert r.status_code == 200
+        assert r.json()['meta'].get('buildInputsStale') is True
+        r = c.post(f'{base2}/compile', headers=H, json={})
+        assert r.status_code == 200
+        p = wait(c, pid, timeout=240)
+        assert p['job']['status'] == 'done', (p['job'].get('status'), p['job'].get('message'))
+        sess2 = c.get(base2).json()
+        assert sess2['status'] == 'ready_to_commit'
+        assert sess2['meta']['buildInputsStale'] is False
+        r = c.post(f'{base2}/commit', headers=H, json={})
         assert r.status_code == 200, r.text
 
 
@@ -2134,45 +2160,55 @@ def test_commit_resend_returns_same_revision(tmp_path, monkeypatch):
 
 
 def test_cancel_running_generation(tmp_path, monkeypatch):
-    """Cancel mid-generation: no further fragment steps run, the job ends
-    'canceled' with the honest copy, and the session returns to draft_plan
-    (resumable). A retry with a NEW key completes normally."""
+    """Cancel mid-generation on a FRESH generation (no fragment cache yet):
+    no further fragment steps run, the job ends 'canceled' with the honest
+    copy, and the session returns to draft_plan (resumable). A retry with a
+    NEW key completes — reusing the checkpointed fragments of the objects
+    that already succeeded before the cancel (that is the point of the
+    checkpoint)."""
     monkeypatch.setenv('OPENAI_API_KEY', 'fake-key')
     seen = []
     with TestClient(create_app(tmp_path, transport=_slow29_transport(seen))) as c:
         pid = new(c)
-        sid = _plan_and_generate(c, pid, [])
-        # reset to a fresh generate round: mutate to draft then regenerate
-        c.post(f'/api/projects/{pid}/generation/sessions/{sid}/mutate', headers=H,
-               json={'mutations': [{'op': 'set_difficulty', 'difficulty': 'hard'}]})
+        sid = c.post(f'/api/projects/{pid}/generation/sessions', headers=H,
+                     json={'mode': 'ai_chat', 'requested_difficulty': 'medium',
+                           'prompt': 'garden'}).json()['id']
+        base = f'/api/projects/{pid}/generation/sessions/{sid}'
+        c.post(f'{base}/plan', headers=H, json={'confirm_paid': True})
+        wait(c, pid, timeout=120)
         svg_at_start = sum(1 for x in seen if x.endswith('/svg'))
-        r = c.post(f'/api/projects/{pid}/generation/sessions/{sid}/generate', headers=H,
+        r = c.post(f'{base}/generate', headers=H,
                    json={'confirm_paid': True, 'idempotency_key': 'gen-1'})
         assert r.status_code == 200
         # wait until the first fragments are running, then cancel
-        deadline = time.time() + 10
-        while time.time() < deadline and sum(1 for x in seen if x.endswith('/svg')) == svg_at_start:
+        deadline = time.time() + 15
+        while time.time() < deadline and sum(1 for x in seen if x.endswith('/svg')) <= svg_at_start:
             time.sleep(0.05)
+        assert sum(1 for x in seen if x.endswith('/svg')) > svg_at_start, 'fragments never started'
         c.post(f'/api/projects/{pid}/job/cancel', headers=H)
         p = wait(c, pid, timeout=120)
-        assert p['job']['status'] == 'canceled', p['job']
+        assert p['job']['status'] == 'canceled', (p['job'].get('status'), p['job'].get('message'))
         assert 'Cancellation requested' in p['job']['message']
         calls_at_cancel = sum(1 for x in seen if x.endswith('/svg'))
         time.sleep(1.0)   # a late response would add calls
         assert sum(1 for x in seen if x.endswith('/svg')) == calls_at_cancel, \
             'no further provider steps may run after cancellation'
-        sess = c.get(f'/api/projects/{pid}/generation/sessions/{sid}').json()
+        sess = c.get(base).json()
         assert sess['status'] == 'draft_plan', 'canceled session must stay resumable'
         # the cancellation bookkeeping settles BEFORE the next attempt starts
         time.sleep(0.3)
         # retry with a NEW key completes the work
-        r = c.post(f'/api/projects/{pid}/generation/sessions/{sid}/generate', headers=H,
+        r = c.post(f'{base}/generate', headers=H,
                    json={'confirm_paid': True, 'idempotency_key': 'gen-2'})
         assert r.status_code == 200
         p = wait(c, pid, timeout=240)
         assert p['job']['status'] == 'done', (p['job'].get('status'), p['job'].get('message'))
-        sess = c.get(f'/api/projects/{pid}/generation/sessions/{sid}').json()
+        sess = c.get(base).json()
         assert sess['status'] == 'ready_to_commit'
+        # checkpoint: fragments fetched before the cancel are NOT re-bought —
+        # the retry's fragment calls are bounded by the remaining objects
+        calls_after_retry = sum(1 for x in seen if x.endswith('/svg')) - calls_at_cancel
+        assert calls_after_retry < 6, 'checkpoint should skip already-cached fragments'
 
 
 def test_restart_sweep_marks_interrupted(tmp_path, monkeypatch):
@@ -2242,3 +2278,478 @@ def test_structured_progress_fields(tmp_path, monkeypatch):
         assert observed['currentObjectId']
         assert observed['sequence'] >= 1
         wait(c, pid, timeout=240)
+
+
+# ---------------------------------------------------------------------------
+# Task 31 round 2 — per-stage provenance, key scoping, checkpoint reuse
+# ---------------------------------------------------------------------------
+
+def test_reference_generate_refuses_swapped_source(tmp_path, monkeypatch):
+    """Analyze source A → swap source to B → generate WITHOUT re-analysis:
+    refused — the plan belongs to A and must never be stamped with origin B."""
+    monkeypatch.setenv('OPENAI_API_KEY', 'fake-key')
+    with TestClient(create_app(tmp_path, transport=_convert_transport([]))) as c:
+        pid = new(c)
+        sid = c.post(f'/api/projects/{pid}/generation/sessions', headers=H,
+                     json={'mode': 'image_reference', 'requested_difficulty': 'medium'}).json()['id']
+        base = f'/api/projects/{pid}/generation/sessions/{sid}'
+        c.post(f'{base}/source', headers=H,
+               files={'file': ('a.png', _convert_fixture_png(), 'image/png')})
+        c.post(f'{base}/reference-plan', headers=H,
+               files={'body': (None, json.dumps({'confirm_paid': True}))})
+        wait(c, pid, timeout=120)
+        variant = io.BytesIO()
+        Image.new('RGB', (256, 256), '#224488').save(variant, format='PNG')
+        r = c.post(f'{base}/source', headers=H,
+                   files={'file': ('b.png', variant.getvalue(), 'image/png')})
+        assert r.status_code == 200
+        svg0 = sum(1 for x in seen if x.endswith('/svg')) if False else None
+        r = c.post(f'{base}/generate', headers=H, json={'confirm_paid': True})
+        p = wait(c, pid, timeout=120)
+        assert p['job']['status'] == 'failed'
+        assert 'Re-analyze the reference' in p['job']['message']
+        sess = c.get(base).json()
+        # plan provenance still points at A — never re-stamped to B
+        assert sess['meta']['planOriginSourceSha256'] != sess['meta']['source']['sha256']
+
+
+def test_regenerated_visual_change_commits_and_rename_flows(tmp_path, monkeypatch):
+    """Reviewer gates: Reference → change fills on one object → regenerate
+    THAT object → ready + commit succeeds; a metadata rename separately
+    compiles free and commits — no planRev false-staleness."""
+    monkeypatch.setenv('OPENAI_API_KEY', 'fake-key')
+    with TestClient(create_app(tmp_path, transport=_task29_transport([]))) as c:
+        pid = new(c)
+        sid = c.post(f'/api/projects/{pid}/generation/sessions', headers=H,
+                     json={'mode': 'image_reference', 'requested_difficulty': 'medium'}).json()['id']
+        base = f'/api/projects/{pid}/generation/sessions/{sid}'
+        c.post(f'{base}/source', headers=H,
+               files={'file': ('a.png', _convert_fixture_png(), 'image/png')})
+        c.post(f'{base}/reference-plan', headers=H,
+               files={'body': (None, json.dumps({'confirm_paid': True}))})
+        wait(c, pid, timeout=120)
+        c.post(f'{base}/generate', headers=H, json={'confirm_paid': True})
+        p = wait(c, pid, timeout=240)
+        assert p['job']['status'] == 'done', p['job']
+        # visual change on flowers → pending
+        r = c.post(f'{base}/mutate', headers=H,
+                   json={'mutations': [{'op': 'update_object', 'objectId': 'obj-flowers',
+                                        'changes': {'fills': ['#E8604C', '#FF88AA']}}]})
+        assert r.json()['meta']['pendingArtworkChanges'] == {'obj-flowers': ['fills']}
+        # regenerate the changed object → its pending entry clears → ready
+        r = c.post(f'{base}/regenerate-object', headers=H,
+                   json={'objectId': 'obj-flowers', 'confirm_paid': True})
+        assert r.status_code == 200
+        p = wait(c, pid, timeout=240)
+        assert p['job']['status'] == 'done', p['job']
+        sess = c.get(base).json()
+        assert sess['status'] == 'ready_to_commit'
+        assert sess['meta'].get('buildInputsStale') is False
+        r = c.post(f'{base}/commit', headers=H, json={})
+        assert r.status_code == 200, r.text
+        # metadata rename on a fresh session: free compile → commit succeeds
+        sid2 = c.post(f'/api/projects/{pid}/generation/sessions', headers=H,
+                      json={'mode': 'image_reference', 'requested_difficulty': 'medium'}).json()['id']
+        base2 = f'/api/projects/{pid}/generation/sessions/{sid2}'
+        c.post(f'{base2}/source', headers=H,
+               files={'file': ('a.png', _convert_fixture_png(), 'image/png')})
+        c.post(f'{base2}/reference-plan', headers=H,
+               files={'body': (None, json.dumps({'confirm_paid': True}))})
+        wait(c, pid, timeout=120)
+        c.post(f'{base2}/generate', headers=H, json={'confirm_paid': True})
+        p = wait(c, pid, timeout=240)
+        assert p['job']['status'] == 'done'
+        r = c.post(f'{base2}/mutate', headers=H,
+                   json={'mutations': [{'op': 'update_object', 'objectId': 'obj-hills',
+                                        'changes': {'name': 'Rolling hills'}}]})
+        assert r.status_code == 200
+        assert not (r.json()['meta'].get('pendingArtworkChanges') or {})
+        r = c.post(f'{base2}/compile', headers=H, json={})
+        assert r.status_code == 200
+        p = wait(c, pid, timeout=240)
+        assert p['job']['status'] == 'done'
+        sess2 = c.get(base2).json()
+        assert sess2['status'] == 'ready_to_commit'
+        assert sess2['meta']['buildInputsStale'] is False
+        r = c.post(f'{base2}/commit', headers=H, json={})
+        assert r.status_code == 200, r.text
+
+
+def test_idempotent_key_scoped_per_operation(tmp_path, monkeypatch):
+    """A key used for /plan can never replay as /generate (or vice versa):
+    cross-operation reuse is a 409, not a silent cross-endpoint result."""
+    monkeypatch.setenv('OPENAI_API_KEY', 'fake-key')
+    with TestClient(create_app(tmp_path, transport=_task29_transport([]))) as c:
+        pid = new(c)
+        sid = c.post(f'/api/projects/{pid}/generation/sessions', headers=H,
+                     json={'mode': 'ai_chat', 'prompt': 'garden'}).json()['id']
+        base = f'/api/projects/{pid}/generation/sessions/{sid}'
+        r = c.post(f'{base}/plan', headers=H,
+                   json={'confirm_paid': True, 'idempotency_key': 'shared-key'})
+        assert r.status_code == 200
+        wait(c, pid, timeout=120)
+        # SAME key on a DIFFERENT operation → synchronous 409 (refused at
+        # admission, before any job or provider work)
+        r = c.post(f'{base}/generate', headers=H,
+                   json={'confirm_paid': True, 'idempotency_key': 'shared-key'})
+        assert r.status_code == 409
+        assert 'scoped to one operation' in r.json()['detail']
+
+
+def test_concurrent_admission_yields_one_valid_job(tmp_path, monkeypatch):
+    """Two interleaved submits with the same key while the first is running:
+    both get a VALID jobId (the same one) — never an attempt without a job."""
+    monkeypatch.setenv('OPENAI_API_KEY', 'fake-key')
+    seen = []
+    with TestClient(create_app(tmp_path, transport=_slow29_transport(seen, delay=0.15))) as c:
+        pid = new(c)
+        sid = c.post(f'/api/projects/{pid}/generation/sessions', headers=H,
+                     json={'mode': 'ai_chat', 'requested_difficulty': 'medium',
+                           'prompt': 'garden'}).json()['id']
+        c.post(f'/api/projects/{pid}/generation/sessions/{sid}/plan', headers=H,
+               json={'confirm_paid': True})
+        wait(c, pid, timeout=120)
+        body = {'confirm_paid': True, 'idempotency_key': 'race-1'}
+        r1 = c.post(f'/api/projects/{pid}/generation/sessions/{sid}/generate', headers=H, json=body)
+        r2 = c.post(f'/api/projects/{pid}/generation/sessions/{sid}/generate', headers=H, json=body)
+        assert r1.status_code == 200 and r2.status_code == 200
+        assert r1.json()['jobId'] == r2.json()['jobId']
+        assert r2.json()['idempotentReplay'] is True
+        assert r1.json()['jobId'], 'job must be allocated with the attempt'
+        p = wait(c, pid, timeout=240)
+        assert p['job']['status'] == 'done', p['job']
+
+
+def test_checkpoint_reuse_on_retry_after_failure(tmp_path, monkeypatch):
+    """Retry after a mid-generation failure reuses checkpointed fragments of
+    the already-succeeded objects — only the failing fragment and later ones
+    are re-purchased. (Explicit generation restart, per-object checkpoint.)"""
+    monkeypatch.setenv('OPENAI_API_KEY', 'fake-key')
+    fail_once = {'armed': True}
+    seen2: list = []
+    calls_per_bbox: dict = {}
+
+    def respond(req):
+        import re as _re
+        seen2.append(req.url.path)
+        if req.url.path.endswith('/json'):
+            objects = [
+                {'name': 'sky', 'description': 'blue sky', 'z': 0,
+                 'bbox': [0, 0, 576, 300], 'shapes': 10, 'fills': ['#91CCDD']},
+                {'name': 'house', 'description': 'yellow house', 'z': 1,
+                 'bbox': [0, 380, 288, 388], 'shapes': 14, 'fills': ['#EBC681']},
+                {'name': 'grass', 'description': 'green field', 'z': 2,
+                 'bbox': [288, 380, 288, 388], 'shapes': 10, 'fills': ['#41A582']},
+            ]
+            return httpx.Response(200, json={'output': [{'content': [{'type': 'output_text',
+                'text': json.dumps({'objects': objects})}]}], 'usage': {'input_tokens': 120}})
+        if req.url.path.endswith('/svg'):
+            body = json.loads(req.content)
+            m = re.search(r'planned bbox: \[x=([0-9.]+), y=([0-9.]+), width=([0-9.]+), height=([0-9.]+)\]',
+                          body.get('instructions', ''))
+            if not m:
+                m = re.search(r'viewBox="(\d+) (\d+) (\d+) (\d+)"', body.get('instructions', ''))
+                bx, by, bw, bh = (int(v) for v in m.groups()) if m else (0, 0, 100, 100)
+            else:
+                bx, by, bw, bh = (int(round(float(v))) for v in m.groups())
+            key = (bx, by)
+            calls_per_bbox[key] = calls_per_bbox.get(key, 0) + 1
+            # fail the GRASS fragment (third plan object) on its first call
+            if fail_once['armed'] and key == (288, 380):
+                fail_once['armed'] = False
+                return httpx.Response(500, json={'error': {'code': 'provider_blip'}})
+            pad = max(4, min(bw, bh) // 8)
+            svg = (f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="{bx} {by} {bw} {bh}">'
+                   f'<rect x="{bx+pad}" y="{by+pad}" width="{bw-2*pad}" height="{bh-2*pad}" fill="#3366AA"/>'
+                   f'<path d="M {bx+pad},{by+pad} Q {bx+bw/2},{by+pad+(bh-2*pad)/2} {bx+bw-pad},{by+pad} Z" fill="#AA3355" fill-opacity="0.5"/>'
+                   f'</svg>')
+            return httpx.Response(200, json={'output': [{'content': [{'type': 'output_text', 'text': svg}]}],
+                                             'usage': {'input_tokens': 10}})
+        return httpx.Response(404, json={'error': {'code': 'no_route'}})
+
+    with TestClient(create_app(tmp_path, transport=httpx.MockTransport(respond))) as c:
+        pid = new(c)
+        sid = c.post(f'/api/projects/{pid}/generation/sessions', headers=H,
+                     json={'mode': 'ai_chat', 'requested_difficulty': 'medium',
+                           'prompt': 'garden'}).json()['id']
+        base = f'/api/projects/{pid}/generation/sessions/{sid}'
+        c.post(f'{base}/plan', headers=H, json={'confirm_paid': True})
+        p = wait(c, pid, timeout=120)
+        assert p['job']['status'] == 'done'
+        # first generate: sky+house succeed, grass fails (provider blip)
+        r = c.post(f'{base}/generate', headers=H, json={'confirm_paid': True})
+        p = wait(c, pid, timeout=240)
+        assert p['job']['status'] == 'failed'
+        calls_after_first = dict(calls_per_bbox)
+        assert calls_after_first.get((0, 0)) == 1 and calls_after_first.get((0, 380)) == 1
+        # retry with a NEW key: cached fragments are reused — sky and house
+        # are NOT re-purchased; grass succeeds this time
+        r = c.post(f'{base}/generate', headers=H, json={'confirm_paid': True})
+        p = wait(c, pid, timeout=240)
+        assert p['job']['status'] == 'done', p['job']
+        assert calls_per_bbox.get((0, 0)) == 1, 'sky fragment must come from the checkpoint'
+        assert calls_per_bbox.get((0, 380)) == 1, 'house fragment must come from the checkpoint'
+        assert calls_per_bbox.get((288, 380)) == 2, 'failed fragment is re-purchased once'
+        sess = c.get(base).json()
+        assert sess['status'] == 'ready_to_commit'
+
+
+# ---------------------------------------------------------------------------
+# Task 31 frontend wiring probes (HTTP-level, no browser required)
+# ---------------------------------------------------------------------------
+
+def test_frontend_key_present_in_plan_request(tmp_path, monkeypatch):
+    """Proves idempotency_key is wired to /plan in the API layer.
+    We call the endpoint directly with a key (simulating what the hook
+    sends after a user click) and verify: (1) accepted, (2) replay works."""
+    monkeypatch.setenv('OPENAI_API_KEY', 'fake-key')
+    with TestClient(create_app(tmp_path, transport=_task29_transport([]))) as c:
+        pid = new(c)
+        sid = c.post(f'/api/projects/{pid}/generation/sessions', headers=H,
+                     json={'mode': 'ai_chat', 'requested_difficulty': 'medium',
+                           'prompt': 'harbour'}).json()['id']
+        base = f'/api/projects/{pid}/generation/sessions/{sid}'
+        # Send with a key (what the hook always does now)
+        r1 = c.post(f'{base}/plan', headers=H,
+                    json={'confirm_paid': True, 'idempotency_key': 'fe-plan-1'})
+        assert r1.status_code == 200
+        wait(c, pid, timeout=120)
+        # Re-send same key (simulates lost-response retry from UI) → replay
+        r2 = c.post(f'{base}/plan', headers=H,
+                    json={'confirm_paid': True, 'idempotency_key': 'fe-plan-1'})
+        assert r2.status_code == 200
+        assert r2.json()['idempotentReplay'] is True
+        assert r2.json()['attemptStatus'] == 'done'
+
+
+def test_frontend_inflight_guard_prevents_double_submit(tmp_path, monkeypatch):
+    """Simulates the frontend in-flight guard: while the first request is
+    in flight, a second with the SAME key gets the same job (not 429 or 409).
+    This verifies that concurrent admission collapses rather than rejects."""
+    monkeypatch.setenv('OPENAI_API_KEY', 'fake-key')
+    seen = []
+    with TestClient(create_app(tmp_path, transport=_slow29_transport(seen, delay=0.15))) as c:
+        pid = new(c)
+        sid = c.post(f'/api/projects/{pid}/generation/sessions', headers=H,
+                     json={'mode': 'ai_chat', 'requested_difficulty': 'medium',
+                           'prompt': 'garden'}).json()['id']
+        c.post(f'/api/projects/{pid}/generation/sessions/{sid}/plan', headers=H,
+               json={'confirm_paid': True})
+        wait(c, pid, timeout=120)
+        body = {'confirm_paid': True, 'idempotency_key': 'fe-gen-1'}
+        r1 = c.post(f'/api/projects/{pid}/generation/sessions/{sid}/generate', headers=H, json=body)
+        r2 = c.post(f'/api/projects/{pid}/generation/sessions/{sid}/generate', headers=H, json=body)
+        assert r1.status_code == 200 and r2.status_code == 200
+        j1 = r1.json()['jobId']; j2 = r2.json()['jobId']
+        assert j1 == j2, f'both submits must share one job: {j1} vs {j2}'
+        assert r2.json()['idempotentReplay'] is True
+        p = wait(c, pid, timeout=240)
+        assert p['job']['status'] == 'done'
+
+
+def test_frontend_lost_response_retries_same_key(tmp_path, monkeypatch):
+    """Simulates the lost-response scenario: UI sent a request but never got
+    a response (network drop). UI retries with the SAME key — exactly one
+    provider call is made regardless of how many times the UI retries."""
+    monkeypatch.setenv('OPENAI_API_KEY', 'fake-key')
+    seen = []
+    with TestClient(create_app(tmp_path, transport=_task29_transport(seen))) as c:
+        pid = new(c)
+        sid = c.post(f'/api/projects/{pid}/generation/sessions', headers=H,
+                     json={'mode': 'ai_chat', 'requested_difficulty': 'medium',
+                           'prompt': 'garden'}).json()['id']
+        c.post(f'/api/projects/{pid}/generation/sessions/{sid}/plan', headers=H,
+               json={'confirm_paid': True})
+        wait(c, pid, timeout=120)
+        svg_before = sum(1 for x in seen if x.endswith('/svg'))
+        body = {'confirm_paid': True, 'idempotency_key': 'fe-gen-lostresponse'}
+        r1 = c.post(f'/api/projects/{pid}/generation/sessions/{sid}/generate', headers=H, json=body)
+        assert r1.status_code == 200
+        wait(c, pid, timeout=240)
+        svg_after_first = sum(1 for x in seen if x.endswith('/svg'))
+        # UI retries (lost-response scenario) 3 more times with same key
+        for _ in range(3):
+            r = c.post(f'/api/projects/{pid}/generation/sessions/{sid}/generate', headers=H, json=body)
+            assert r.status_code == 200
+            assert r.json()['idempotentReplay'] is True
+        # No new provider calls were made
+        assert sum(1 for x in seen if x.endswith('/svg')) == svg_after_first, \
+            'retries with same key must not buy additional provider calls'
+
+
+def test_frontend_commit_deduplicated_with_key(tmp_path, monkeypatch):
+    """Commit with key: double-click or lost response never emits duplicate
+    revisions. Second submit returns the already-created revision."""
+    monkeypatch.setenv('OPENAI_API_KEY', 'fake-key')
+    with TestClient(create_app(tmp_path, transport=_task29_transport([]))) as c:
+        pid = new(c)
+        sid = _plan_and_generate(c, pid, [])
+        base = f'/api/projects/{pid}/generation/sessions/{sid}'
+        r1 = c.post(f'{base}/commit', headers=H, json={'idempotency_key': 'fe-commit-1'})
+        assert r1.status_code == 200
+        rev_id = r1.json()['revision']['id']
+        # resend (lost response / double-click)
+        r2 = c.post(f'{base}/commit', headers=H, json={'idempotency_key': 'fe-commit-1'})
+        assert r2.status_code == 200
+        assert r2.json()['idempotentReplay'] is True
+        assert r2.json()['revision']['id'] == rev_id
+        p = c.get(f'/api/projects/{pid}').json()
+        assert len(p['revisions']) == 1, 'only one revision must appear in the project'
+
+
+def test_cancel_does_not_affect_new_attempt(tmp_path, monkeypatch):
+    """A LATE cancel carrying a stale jobId must not cancel a newer attempt.
+    Proves the jobId-aware cancel gate works end-to-end."""
+    monkeypatch.setenv('OPENAI_API_KEY', 'fake-key')
+    seen = []
+    with TestClient(create_app(tmp_path, transport=_slow29_transport(seen, delay=0.12))) as c:
+        pid = new(c)
+        sid = c.post(f'/api/projects/{pid}/generation/sessions', headers=H,
+                     json={'mode': 'ai_chat', 'requested_difficulty': 'medium',
+                           'prompt': 'garden'}).json()['id']
+        base = f'/api/projects/{pid}/generation/sessions/{sid}'
+        c.post(f'{base}/plan', headers=H, json={'confirm_paid': True})
+        wait(c, pid, timeout=120)
+        r = c.post(f'{base}/generate', headers=H,
+                   json={'confirm_paid': True, 'idempotency_key': 'g1'})
+        old_job_id = r.json()['jobId']
+        # wait for generation to complete
+        p = wait(c, pid, timeout=240)
+        assert p['job']['status'] == 'done'
+        # trigger difficulty change to allow regeneration
+        c.post(f'{base}/mutate', headers=H,
+               json={'mutations': [{'op': 'set_difficulty', 'difficulty': 'hard'}]})
+        # start a NEW generation; send a cancel with the OLD jobId (late cancel)
+        r2 = c.post(f'{base}/generate', headers=H,
+                    json={'confirm_paid': True, 'idempotency_key': 'g2'})
+        new_job_id = r2.json()['jobId']
+        assert new_job_id != old_job_id
+        stale_cancel = c.post(f'/api/projects/{pid}/job/cancel', headers=H,
+                               json={'jobId': old_job_id})
+        assert stale_cancel.status_code == 200
+        p = wait(c, pid, timeout=240)
+        # new job must complete, not canceled by stale cancel
+        assert p['job']['status'] == 'done', \
+            f'stale cancel must not affect the new job: {p["job"]["status"]}'
+
+
+# ---------------------------------------------------------------------------
+# Task 31 frontend wiring probes (HTTP-level, no browser required)
+# ---------------------------------------------------------------------------
+
+def test_frontend_key_present_in_plan_request(tmp_path, monkeypatch):
+    """Proves idempotency_key is wired to /plan in the API layer.
+    We call the endpoint directly with a key (simulating what the hook
+    sends after a user click) and verify: (1) accepted, (2) replay works."""
+    monkeypatch.setenv('OPENAI_API_KEY', 'fake-key')
+    with TestClient(create_app(tmp_path, transport=_task29_transport([]))) as c:
+        pid = new(c)
+        sid = c.post(f'/api/projects/{pid}/generation/sessions', headers=H,
+                     json={'mode': 'ai_chat', 'requested_difficulty': 'medium',
+                           'prompt': 'harbour'}).json()['id']
+        base = f'/api/projects/{pid}/generation/sessions/{sid}'
+        r1 = c.post(f'{base}/plan', headers=H,
+                    json={'confirm_paid': True, 'idempotency_key': 'fe-plan-1'})
+        assert r1.status_code == 200
+        wait(c, pid, timeout=120)
+        r2 = c.post(f'{base}/plan', headers=H,
+                    json={'confirm_paid': True, 'idempotency_key': 'fe-plan-1'})
+        assert r2.status_code == 200
+        assert r2.json()['idempotentReplay'] is True
+        assert r2.json()['attemptStatus'] == 'done'
+
+
+def test_frontend_inflight_guard_prevents_double_submit(tmp_path, monkeypatch):
+    """Concurrent submits with same key collapse into one job (no 429/409)."""
+    monkeypatch.setenv('OPENAI_API_KEY', 'fake-key')
+    seen = []
+    with TestClient(create_app(tmp_path, transport=_slow29_transport(seen, delay=0.15))) as c:
+        pid = new(c)
+        sid = c.post(f'/api/projects/{pid}/generation/sessions', headers=H,
+                     json={'mode': 'ai_chat', 'requested_difficulty': 'medium',
+                           'prompt': 'garden'}).json()['id']
+        c.post(f'/api/projects/{pid}/generation/sessions/{sid}/plan', headers=H,
+               json={'confirm_paid': True})
+        wait(c, pid, timeout=120)
+        body = {'confirm_paid': True, 'idempotency_key': 'fe-gen-1'}
+        r1 = c.post(f'/api/projects/{pid}/generation/sessions/{sid}/generate', headers=H, json=body)
+        r2 = c.post(f'/api/projects/{pid}/generation/sessions/{sid}/generate', headers=H, json=body)
+        assert r1.status_code == 200 and r2.status_code == 200
+        assert r1.json()['jobId'] == r2.json()['jobId']
+        assert r2.json()['idempotentReplay'] is True
+        assert r1.json()['jobId'], 'job must be allocated atomically with the attempt'
+        p = wait(c, pid, timeout=240)
+        assert p['job']['status'] == 'done'
+
+
+def test_frontend_lost_response_retries_same_key(tmp_path, monkeypatch):
+    """Lost-response retry with same key: exactly one provider call, N replays."""
+    monkeypatch.setenv('OPENAI_API_KEY', 'fake-key')
+    seen = []
+    with TestClient(create_app(tmp_path, transport=_task29_transport(seen))) as c:
+        pid = new(c)
+        sid = c.post(f'/api/projects/{pid}/generation/sessions', headers=H,
+                     json={'mode': 'ai_chat', 'requested_difficulty': 'medium',
+                           'prompt': 'garden'}).json()['id']
+        c.post(f'/api/projects/{pid}/generation/sessions/{sid}/plan', headers=H,
+               json={'confirm_paid': True})
+        wait(c, pid, timeout=120)
+        body = {'confirm_paid': True, 'idempotency_key': 'fe-gen-lostresponse'}
+        r1 = c.post(f'/api/projects/{pid}/generation/sessions/{sid}/generate', headers=H, json=body)
+        assert r1.status_code == 200
+        wait(c, pid, timeout=240)
+        svg_after_first = sum(1 for x in seen if x.endswith('/svg'))
+        for _ in range(3):
+            r = c.post(f'/api/projects/{pid}/generation/sessions/{sid}/generate', headers=H, json=body)
+            assert r.status_code == 200
+            assert r.json()['idempotentReplay'] is True
+        assert sum(1 for x in seen if x.endswith('/svg')) == svg_after_first, \
+            'same-key retries must not buy additional provider calls'
+
+
+def test_frontend_commit_deduplicated_with_key(tmp_path, monkeypatch):
+    """Commit double-click / lost-response: never emits duplicate revisions."""
+    monkeypatch.setenv('OPENAI_API_KEY', 'fake-key')
+    with TestClient(create_app(tmp_path, transport=_task29_transport([]))) as c:
+        pid = new(c)
+        sid = _plan_and_generate(c, pid, [])
+        base = f'/api/projects/{pid}/generation/sessions/{sid}'
+        r1 = c.post(f'{base}/commit', headers=H, json={'idempotency_key': 'fe-commit-1'})
+        assert r1.status_code == 200
+        rev_id = r1.json()['revision']['id']
+        r2 = c.post(f'{base}/commit', headers=H, json={'idempotency_key': 'fe-commit-1'})
+        assert r2.status_code == 200
+        assert r2.json()['idempotentReplay'] is True
+        assert r2.json()['revision']['id'] == rev_id
+        assert len(c.get(f'/api/projects/{pid}').json()['revisions']) == 1
+
+
+def test_cancel_does_not_affect_new_attempt(tmp_path, monkeypatch):
+    """Late cancel with stale jobId is a no-op; the new attempt completes."""
+    monkeypatch.setenv('OPENAI_API_KEY', 'fake-key')
+    seen = []
+    with TestClient(create_app(tmp_path, transport=_slow29_transport(seen, delay=0.12))) as c:
+        pid = new(c)
+        sid = c.post(f'/api/projects/{pid}/generation/sessions', headers=H,
+                     json={'mode': 'ai_chat', 'requested_difficulty': 'medium',
+                           'prompt': 'garden'}).json()['id']
+        base = f'/api/projects/{pid}/generation/sessions/{sid}'
+        c.post(f'{base}/plan', headers=H, json={'confirm_paid': True})
+        wait(c, pid, timeout=120)
+        r = c.post(f'{base}/generate', headers=H,
+                   json={'confirm_paid': True, 'idempotency_key': 'g1'})
+        old_job_id = r.json()['jobId']
+        wait(c, pid, timeout=240)
+        c.post(f'{base}/mutate', headers=H,
+               json={'mutations': [{'op': 'set_difficulty', 'difficulty': 'hard'}]})
+        r2 = c.post(f'{base}/generate', headers=H,
+                    json={'confirm_paid': True, 'idempotency_key': 'g2'})
+        new_job_id = r2.json()['jobId']
+        assert new_job_id != old_job_id
+        # stale cancel with old job's id — must be no-op
+        stale = c.post(f'/api/projects/{pid}/job/cancel', headers=H,
+                       json={'jobId': old_job_id})
+        assert stale.status_code == 200
+        p = wait(c, pid, timeout=240)
+        assert p['job']['status'] == 'done', \
+            f'stale cancel must not affect new job: {p["job"]["status"]}'

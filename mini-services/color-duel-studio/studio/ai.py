@@ -356,15 +356,24 @@ class Provider:
                               'No partial master was saved; retry explicitly if you want to spend again.')
         return text[start:end+6], data.get('usage',{})
 
-    def svg_compose_from_objects(self, objects: list, aspect: str, progress=None):
+    def svg_compose_from_objects(self, objects: list, aspect: str, progress=None, cache_dir=None):
         """Compose a master from ALREADY-PLANNED objects (no planning call):
         one sanitized provider fragment per object, stamped with object
         identity (obj.get('id') when present, else derived from the name),
         composed in z order. Used by the Generation Orchestrator, where the
         ScenePlan is a separate, user-revisable draft stage — vector cost is
         only paid once the plan is stable. Any fragment failure raises a
-        clear ValueError; no partial master is saved."""
+        clear ValueError; no partial master is saved.
+
+        Task 31 checkpoint: with ``cache_dir`` set, every VALIDATED fragment
+        is persisted next to a fingerprint of its generation inputs; a retry
+        reuses cached fragments whose fingerprint still matches (plan/source
+        unchanged) and spends provider calls only on the missing or changed
+        objects."""
+        import hashlib as _hashlib
+        from pathlib import Path as _Path
         from .svg_master import import_master, emit_master_svg, MasterDoc
+        usage = {}
         view_box=ASPECT_VIEWBOX.get(aspect,'0 0 576 768')
         vw,vh=self._viewbox_size(aspect)
         tick=progress or (lambda *_: None)
@@ -378,7 +387,33 @@ class Provider:
             tick(.1+.75*i/max(1,len(objects)),f'Vectorizing object {i+1}/{len(objects)}: {obj["name"]}',
                  {'stage': 'vector_generation', 'completedObjects': i, 'totalObjects': len(objects),
                   'currentObjectId': obj.get('id') or f'obj-{i}'})
-            fragment,usage=self.svg_object(obj,view_box)
+            fragment=None
+            if cache_dir is not None:
+                # Task 31 checkpoint: reuse a previously VALIDATED fragment
+                # when its generation inputs (name/description/bbox/shapes/
+                # fills) are unchanged — plan changes or edits invalidate it.
+                fp=_hashlib.sha256(json.dumps(
+                    {'name':obj['name'],'description':obj.get('description',''),
+                     'bbox':obj['bbox'],'shapes':obj.get('shapes'),
+                     'fills':obj.get('fills')},sort_keys=True).encode()).hexdigest()[:16]
+                try:
+                    cfile=_Path(cache_dir)/f'{obj["id"]}.svg'
+                    mfile=_Path(cache_dir)/f'{obj["id"]}.json'
+                    if cfile.is_file() and mfile.is_file():
+                        meta=json.loads(mfile.read_text(encoding='utf-8'))
+                        if meta.get('fp')==fp:
+                            fragment=cfile.read_text(encoding='utf-8')
+                except Exception:
+                    fragment=None
+            if fragment is None:
+                fragment,usage=self.svg_object(obj,view_box)
+                if cache_dir is not None:
+                    try:
+                        (_Path(cache_dir)/f'{obj["id"]}.svg').write_text(fragment,encoding='utf-8')
+                        (_Path(cache_dir)/f'{obj["id"]}.json').write_text(json.dumps(
+                            {'fp':fp,'name':obj['name']}),encoding='utf-8')
+                    except Exception:
+                        pass
             if len(fragment.encode('utf-8'))>400*1024:
                 raise ValueError(f'Fragment for "{obj["name"]}" exceeds the 400 KB budget. No partial master was saved.')
             try:

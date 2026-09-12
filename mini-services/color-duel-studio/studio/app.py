@@ -53,9 +53,18 @@ def create_app(workspace: Path|None=None, transport=None):
             for sfile in (path.parent/'sessions').glob('sess-*/session.json') if (path.parent/'sessions').is_dir() else []:
                 try:
                     sess=read_json(sfile)
+                    changed=False
                     if sess.get('status') in ('generating','compiling'):
                         sess['status']='draft_plan'
                         sess.setdefault('meta',{})['interruptedNote']='Interrupted by a studio restart; retry explicitly.'
+                        changed=True
+                    # Task 31A: reconcile orphaned attempts so job and attempt
+                    # recovery states always agree.
+                    for a in sess.get('meta',{}).get('attempts',[]):
+                        if a.get('status') in ('queued','running'):
+                            a['status']='interrupted'
+                            changed=True
+                    if changed:
                         write_json(sfile,sess)
                 except Exception:
                     pass
@@ -84,12 +93,21 @@ def create_app(workspace: Path|None=None, transport=None):
     class JobCanceled(Exception):
         pass
 
-    def start(pid,kind,fn,on_cancel=None):
+    def admit(pid,kind,sid=None):
+        """Task 31A — admission check + job allocation under the project lock.
+        Split from launch() so idempotent operations can persist a COMPLETE
+        attempt record (with jobId) before the worker is scheduled."""
         with lock:
             p=project(pid);editable(p)
             active=sum(read_json(f).get('job',{}).get('status') in ['queued','running'] for f in root.glob('*/project.json'))
             if active>=4: raise HTTPException(429,'Local queue is full. Wait for another project to finish.')
-            jid=ident(); p['job']={'id':jid,'kind':kind,'status':'queued','progress':0,'message':'Queued','startedAt':now(),'sequence':0};save(p)
+            jid=ident()
+            job={'id':jid,'kind':kind,'status':'queued','progress':0,'message':'Queued','startedAt':now(),'sequence':0}
+            if sid: job['sid']=sid
+            p['job']=job;save(p)
+            return jid
+
+    def launch(pid,jid,kind,fn,on_cancel=None):
         def tick(fraction,message,detail=None):
             with lock:
                 p=project(pid)
@@ -147,47 +165,71 @@ def create_app(workspace: Path|None=None, transport=None):
                 with lock:
                     p=project(pid);p['job'].update(status='failed',message=str(exc)[:700],finishedAt=now());save(p)
         pool.submit(work)
+
+    def start(pid,kind,fn,on_cancel=None,sid=None):
+        jid=admit(pid,kind,sid)
+        launch(pid,jid,kind,fn,on_cancel)
         return {'jobId':jid,'projectId':pid}
 
     def run_idempotent(pid, sid, sm, operation, body, kind, run_fn,
                        on_result=None, on_cancel=None):
-        """Task 31A — operation identity + replay protection.
+        """Task 31A — operation identity + replay protection, atomically.
 
-        Without a key: legacy behaviour (no dedup). With a key, the check
-        runs under the project lock BEFORE editable(p) is checked — so
-        concurrent duplicate submits return the existing in-flight job instead
-        of failing with a 409 conflict. Same key + same input snapshot replays
-        the existing attempt (queued/running/done/failed — never a new paid
-        attempt); same key + different payload → 409."""
+        The whole critical section (replay search -> operation/payload
+        validation -> admission -> attemptId + jobId allocation -> persist)
+        runs under the project lock, so a record can never exist as 'queued'
+        without its job, and concurrent duplicates collapse into one attempt.
+        The worker is scheduled only AFTER the complete record is persisted.
+        Keys are operation-scoped: reusing a key across different operations
+        is a 409, never a silent cross-endpoint replay."""
         key = str((body or {}).get('idempotency_key') or '')
         if not key:
-            return start(pid, kind, run_fn, on_cancel=on_cancel)
+            jid = admit(pid, kind, sid)
+            launch(pid, jid, kind, run_fn, on_cancel)
+            return {'jobId': jid, 'projectId': pid}
         with lock:
             sess = sm.get_session(sid)
             attempts = sess.setdefault('meta', {}).setdefault('attempts', [])
             # The request fingerprint covers the client payload (the caller's
-            # intent). The plan/source snapshot is stored with the attempt for
-            # provenance/audit; matching payload + matching key IS the same
+            # intent). Source/plan snapshots are stored with the attempt for
+            # provenance/audit; matching key + operation + payload IS the same
             # request, even after the plan advanced as a consequence.
             payload_fingerprint = hashlib.sha256(json.dumps(
                 {k: v for k, v in (body or {}).items() if k != 'idempotency_key'},
                 sort_keys=True, default=str).encode('utf-8')).hexdigest()[:16]
             for a in attempts:
                 if a.get('key') == key:
+                    if a.get('operation') != operation:
+                        raise HTTPException(409, 'This idempotency key was already used for a '
+                                                 f'{a.get("operation")} request. Keys are scoped to one '
+                                                 'operation — use a new key for ' + operation + '.')
                     if a.get('payloadFingerprint') != payload_fingerprint:
-                        raise HTTPException(409, 'This idempotency key was already used with a different request. Use a new key for different work.')
-                    # In-flight or completed replay: return the existing job
+                        raise HTTPException(409, 'This idempotency key was already used with a different '
+                                                 'request. Use a new key for different work.')
+                    # In-flight or terminal replay: return the existing job
                     # without re-running any provider work
                     return {'jobId': a.get('jobId'), 'projectId': pid, 'attemptId': a.get('attemptId'),
                             'idempotentReplay': True, 'attemptStatus': a.get('status'),
                             **({'revision': a['revision']} if a.get('revision') else {})}
+            # Admission inside the SAME protected section: either the complete
+            # record (attempt + job) is persisted, or nothing is.
+            p = project(pid)
+            editable(p)
+            active = sum(read_json(f).get('job', {}).get('status') in ['queued', 'running']
+                         for f in root.glob('*/project.json'))
+            if active >= 4:
+                raise HTTPException(429, 'Local queue is full. Wait for another project to finish.')
+            jid = ident()
             attempt_id = 'att-' + ident()
             attempts.append({'key': key, 'operation': operation, 'attemptId': attempt_id,
-                             'payloadFingerprint': payload_fingerprint,
+                             'payloadFingerprint': payload_fingerprint, 'jobId': jid,
                              'sourceSha256': (sess.get('meta', {}).get('source') or {}).get('sha256'),
                              'planFingerprint': sm._plan_fingerprint(sess.get('scenePlan') or {}),
                              'status': 'queued'})
             del attempts[:-50]
+            p['job'] = {'id': jid, 'kind': kind, 'sid': sid, 'status': 'queued',
+                        'progress': 0, 'message': 'Queued', 'startedAt': now(), 'sequence': 0}
+            save(p)
             write_json(sm.session_path(sid) / 'session.json', sess)
 
         def record(attempt_id, **fields):
@@ -201,32 +243,48 @@ def create_app(workspace: Path|None=None, transport=None):
             record(attempt_id, status='running')
             try:
                 result = run_fn(tick)
+                # Terminal-state check BEFORE publishing done: a cancel that
+                # arrived during the last step wins — done is never published
+                # for work the user asked to cancel.
+                with lock:
+                    if project(pid)['job'].get('cancelRequested'):
+                        raise JobCanceled('canceled')
+                record(attempt_id, status='done')
+                if on_result:
+                    on_result(result, attempt_id)
+                return result
             except JobCanceled:
                 record(attempt_id, status='canceled')
                 raise
             except Exception as exc:
                 record(attempt_id, status='failed', error=str(exc)[:200])
                 raise
-            record(attempt_id, status='done')
-            if on_result:
-                on_result(result, attempt_id)
-            return result
-        job = start(pid, kind, wrapped, on_cancel=on_cancel)
-        record(attempt_id, jobId=job['jobId'])
-        return {**job, 'attemptId': attempt_id}
+        # Worker scheduled only after the complete record exists. If launch
+        # itself fails, the attempt is marked so it never reads as available.
+        try:
+            launch(pid, jid, kind, wrapped, on_cancel)
+        except Exception as exc:
+            record(attempt_id, status='admission-failed', error=str(exc)[:200])
+            raise
+        return {'jobId': jid, 'projectId': pid, 'attemptId': attempt_id}
 
     @app.post('/api/projects/{pid}/job/cancel')
-    def cancel_job_route(pid:str):
+    async def cancel_job_route(pid:str, body: dict = {}):
         """Task 31B — request cancellation of the running/queued job.
 
         Cooperative: the flag is stored FIRST; the worker checks it before
         every provider step and before promoting results. Already-sent
         provider requests may still complete (and may be billed) — the copy
-        never promises otherwise."""
+        never promises otherwise. An optional {jobId} targets a specific job:
+        a LATE cancel carrying a stale jobId is a no-op so it can never
+        cancel a newer attempt."""
+        wanted = (body or {}).get('jobId')
         with lock:
             p=project(pid)
             if p['job'].get('status') not in ['queued','running']:
                 return p
+            if wanted and wanted != p['job'].get('id'):
+                return p          # stale cancel: the targeted job is gone
             p['job']['cancelRequested']=True
             p['job']['message']='Cancellation requested. No further generation steps will start.'
             save(p)
@@ -675,9 +733,19 @@ def create_app(workspace: Path|None=None, transport=None):
 
     @app.post('/api/projects/{pid}/generation/sessions/{sid}/cancel')
     def cancel_generation_session_route(pid: str, sid: str):
+        # Task 31B: destructive session cancel must not race an active worker.
+        # Route the artist through the cooperative job cancel instead.
         with lock:
+            p = project(pid)
+            if p['job'].get('status') in ('queued', 'running') and p['job'].get('sid') == sid:
+                raise HTTPException(409, 'A generation job is running for this session. '
+                                         'Cancel the job first — it returns the session to draft_plan.')
             sm = GenerationSessionManager(folder(pid), pid)
             try:
+                sess = sm.get_session(sid)
+                if sess['status'] in ('generating', 'compiling'):
+                    raise HTTPException(409, 'This session is mid-generation. '
+                                             'Cancel the running job before canceling the session.')
                 return sm.cancel_session(sid)
             except (ValueError, FileNotFoundError) as exc:
                 raise HTTPException(400, str(exc))
@@ -685,8 +753,18 @@ def create_app(workspace: Path|None=None, transport=None):
     @app.delete('/api/projects/{pid}/generation/sessions/{sid}')
     def delete_generation_session_route(pid: str, sid: str):
         with lock:
+            p = project(pid)
+            # Task 31B: never delete a session whose worker may still be
+            # writing fragments/bundle into it.
+            if p['job'].get('status') in ('queued', 'running') and p['job'].get('sid') == sid:
+                raise HTTPException(409, 'A generation job is running for this session. '
+                                         'Cancel the job before discarding it.')
             sm = GenerationSessionManager(folder(pid), pid)
             try:
+                sess = sm.get_session(sid)
+                if sess['status'] in ('generating', 'compiling'):
+                    raise HTTPException(409, 'This session is mid-generation. '
+                                             'Cancel the running job before discarding it.')
                 sm.discard_session(sid)
             except ValueError as exc:
                 raise HTTPException(400, str(exc))
@@ -814,14 +892,6 @@ def create_app(workspace: Path|None=None, transport=None):
                             a['error'] = str(exc)[:200]
                     write_json(sm.session_path(sid) / 'session.json', sess)
                 raise HTTPException(400, str(exc))
-            if attempt_id:
-                sess = sm.get_session(sid)
-                for a in sess.setdefault('meta', {}).get('attempts', []):
-                    if a.get('attemptId') == attempt_id:
-                        a['status'] = 'done'
-                        a['revision'] = res['revision']
-                write_json(sm.session_path(sid) / 'session.json', sess)
-
             p['revisions'].append(res['revision'])
             p['currentRevision'] = res['revision']['id']
 
@@ -854,6 +924,15 @@ def create_app(workspace: Path|None=None, transport=None):
                     'createdAt': now(),
                 }
             save(p)
+            # Task 31A: attempt 'done' only AFTER the revision is published —
+            # a replay can then trust it unconditionally.
+            if attempt_id:
+                sess = sm.get_session(sid)
+                for a in sess.setdefault('meta', {}).get('attempts', []):
+                    if a.get('attemptId') == attempt_id:
+                        a['status'] = 'done'
+                        a['revision'] = res['revision']
+                write_json(sm.session_path(sid) / 'session.json', sess)
             return res
 
     @app.post('/api/projects/{pid}/generation/sessions/{sid}/plan')

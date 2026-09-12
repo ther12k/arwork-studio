@@ -480,36 +480,38 @@ export interface GenerationSessionFull extends GenerationSession {
   };
 }
 
-export const planSession = (pid: string, sid: string, confirm_paid: boolean): Promise<{ jobId: string }> =>
-  post(`/projects/${pid}/generation/sessions/${sid}/plan`, { confirm_paid });
+export const planSession = (pid: string, sid: string, confirm_paid: boolean, idempotency_key?: string): Promise<{ jobId: string }> =>
+  post(`/projects/${pid}/generation/sessions/${sid}/plan`, { confirm_paid, idempotency_key });
 
 export const planChatSession = (
   pid: string,
   sid: string,
   instruction: string,
-  confirm_paid: boolean
-): Promise<{ jobId: string }> => post(`/projects/${pid}/generation/sessions/${sid}/plan-chat`, { instruction, confirm_paid });
+  confirm_paid: boolean,
+  idempotency_key?: string
+): Promise<{ jobId: string }> => post(`/projects/${pid}/generation/sessions/${sid}/plan-chat`, { instruction, confirm_paid, idempotency_key });
 
 export const mutateSessionPlan = (pid: string, sid: string, mutations: unknown[]): Promise<GenerationSessionFull> =>
   post(`/projects/${pid}/generation/sessions/${sid}/mutate`, { mutations });
 
-export const generateSessionArtwork = (pid: string, sid: string, confirm_paid: boolean): Promise<{ jobId: string }> =>
-  post(`/projects/${pid}/generation/sessions/${sid}/generate`, { confirm_paid });
+export const generateSessionArtwork = (pid: string, sid: string, confirm_paid: boolean, idempotency_key?: string): Promise<{ jobId: string }> =>
+  post(`/projects/${pid}/generation/sessions/${sid}/generate`, { confirm_paid, idempotency_key });
 
 export const regenerateSessionObject = (
   pid: string,
   sid: string,
   objectId: string,
   instructions: string,
-  confirm_paid: boolean
+  confirm_paid: boolean,
+  idempotency_key?: string
 ): Promise<{ jobId: string }> =>
-  post(`/projects/${pid}/generation/sessions/${sid}/regenerate-object`, { objectId, instructions, confirm_paid });
+  post(`/projects/${pid}/generation/sessions/${sid}/regenerate-object`, { objectId, instructions, confirm_paid, idempotency_key });
 
 export const compileSession = (pid: string, sid: string): Promise<{ jobId: string }> =>
   post(`/projects/${pid}/generation/sessions/${sid}/compile`, {});
 
-export const commitSessionArtwork = (pid: string, sid: string, title?: string): Promise<{ revision: Revision }> =>
-  post(`/projects/${pid}/generation/sessions/${sid}/commit`, { title });
+export const commitSessionArtwork = (pid: string, sid: string, title?: string, idempotency_key?: string): Promise<{ revision: Revision }> =>
+  post(`/projects/${pid}/generation/sessions/${sid}/commit`, { title, idempotency_key });
 
 /** Read-only preview of the session's compiled artwork (review stage). */
 export const sessionPreviewUrl = (pid: string, sid: string, name: "colored.svg" | "numbered.svg" | "colored-preview.png" | "numbered-preview.png" | "source.png"): string =>
@@ -534,9 +536,9 @@ export const updateSessionSettings = (
 ): Promise<GenerationSessionFull> => post(`/projects/${pid}/generation/sessions/${sid}/settings`, body);
 
 /** Task 30C — paid Convert run against the STORED session source. */
-export const convertSession = (pid: string, sid: string, confirm_paid: boolean): Promise<{ jobId: string }> => {
+export const convertSession = (pid: string, sid: string, confirm_paid: boolean, idempotency_key?: string): Promise<{ jobId: string }> => {
   const form = new FormData();
-  form.append("body", JSON.stringify({ confirm_paid }));
+  form.append("body", JSON.stringify({ confirm_paid, idempotency_key }));
   return api<{ jobId: string }>(`/projects/${pid}/generation/sessions/${sid}/convert`, {
     method: "POST",
     body: form,
@@ -548,10 +550,11 @@ export const analyzeSessionReference = (
   pid: string,
   sid: string,
   confirm_paid: boolean,
-  instructions = ""
+  instructions = "",
+  idempotency_key?: string
 ): Promise<{ jobId: string }> => {
   const form = new FormData();
-  form.append("body", JSON.stringify({ confirm_paid, instructions }));
+  form.append("body", JSON.stringify({ confirm_paid, instructions, idempotency_key }));
   return api<{ jobId: string }>(`/projects/${pid}/generation/sessions/${sid}/reference-plan`, {
     method: "POST",
     body: form,

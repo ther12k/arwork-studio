@@ -1003,29 +1003,42 @@ export function StudioProvider({ children }: { children: React.ReactNode }) {
     if (!activeSession) setCreationMode(null);
   }, [activeSession]);
 
-  // --------------------------------------------- session steps (Task 29)
+  // --------------------------------------------- session steps (Task 29/31)
 
-  /** Fire one session step (paid gates live server-side) as an async job.
-   *  All step buttons disable while busy, so double submits are impossible. */
+  /** The operation key of the currently in-flight step (set before the
+   *  request is sent, cleared when the job settles) — resending the same
+   *  logical action reuses the SAME key, so a lost response replays the
+   *  existing attempt instead of buying new work. A retry after a failed
+   *  attempt generates a NEW key: it is an explicit new purchase. */
+  const inFlightOpRef = useRef<string | null>(null);
+
+  /** Fire one session step (paid gates live server-side) as an async job. */
   const runSessionStep = useCallback(
-    async (step: () => Promise<{ jobId: string }>) => {
+    async (operation: string, step: (key: string) => Promise<{ jobId: string }>) => {
       const p = projectRef.current;
       if (!p) throw new Error("Create a project first.");
       if (isBusyProject(p)) throw new Error("Wait for the current job.");
       if (!activeSession) throw new Error("No active generation session.");
-      await job(step);
+      if (inFlightOpRef.current) throw new Error("A request is already in flight.");
+      const key = `${operation}:${activeSession.id}:${crypto.randomUUID()}`;
+      inFlightOpRef.current = key;
+      try {
+        await job(() => step(key));
+      } finally {
+        inFlightOpRef.current = null;
+      }
     },
     [activeSession, job]
   );
 
   const planSceneWithAi = useCallback(
-    (confirmPaid: boolean) => runSessionStep(() => apiPlanSession(projectRef.current!.id, activeSession!.id, confirmPaid)),
+    (confirmPaid: boolean) => runSessionStep("plan", (key) => apiPlanSession(projectRef.current!.id, activeSession!.id, confirmPaid, key)),
     [runSessionStep]
   );
 
   const revisePlanWithAi = useCallback(
     (instruction: string, confirmPaid: boolean) =>
-      runSessionStep(() => apiPlanChatSession(projectRef.current!.id, activeSession!.id, instruction, confirmPaid)),
+      runSessionStep("plan-chat", (key) => apiPlanChatSession(projectRef.current!.id, activeSession!.id, instruction, confirmPaid, key)),
     [runSessionStep]
   );
 
@@ -1040,31 +1053,31 @@ export function StudioProvider({ children }: { children: React.ReactNode }) {
   );
 
   const generateArtwork = useCallback(
-    (confirmPaid: boolean) => runSessionStep(() => apiGenerateSessionArtwork(projectRef.current!.id, activeSession!.id, confirmPaid)),
+    (confirmPaid: boolean) => runSessionStep("generate", (key) => apiGenerateSessionArtwork(projectRef.current!.id, activeSession!.id, confirmPaid, key)),
     [runSessionStep]
   );
 
   const regenerateObject = useCallback(
     (objectId: string, instructions: string, confirmPaid: boolean) =>
-      runSessionStep(() => apiRegenerateSessionObject(projectRef.current!.id, activeSession!.id, objectId, instructions, confirmPaid)),
+      runSessionStep("regenerate-object", (key) => apiRegenerateSessionObject(projectRef.current!.id, activeSession!.id, objectId, instructions, confirmPaid, key)),
     [runSessionStep]
   );
 
   const recompileSessionArtwork = useCallback(
-    () => runSessionStep(() => apiCompileSession(projectRef.current!.id, activeSession!.id)),
+    () => runSessionStep("compile", () => apiCompileSession(projectRef.current!.id, activeSession!.id)),
     [runSessionStep]
   );
 
   // Task 30 — image session steps
   const convertImage = useCallback(
     (confirmPaid: boolean) =>
-      runSessionStep(() => apiConvertSession(projectRef.current!.id, activeSession!.id, confirmPaid)),
+      runSessionStep("convert", (key) => apiConvertSession(projectRef.current!.id, activeSession!.id, confirmPaid, key)),
     [runSessionStep]
   );
 
   const analyzeReference = useCallback(
     (confirmPaid: boolean) =>
-      runSessionStep(() => apiAnalyzeSessionReference(projectRef.current!.id, activeSession!.id, confirmPaid)),
+      runSessionStep("reference-plan", (key) => apiAnalyzeSessionReference(projectRef.current!.id, activeSession!.id, confirmPaid, "", key)),
     [runSessionStep]
   );
 
@@ -1085,7 +1098,8 @@ export function StudioProvider({ children }: { children: React.ReactNode }) {
     if (!p) throw new Error("Create a project first.");
     if (isBusyProject(p)) throw new Error("Wait for the current job.");
     if (!activeSession) throw new Error("No active generation session.");
-    const res = await apiCommitSessionArtwork(p.id, activeSession.id);
+    const commitKey = `commit:${activeSession.id}:${crypto.randomUUID()}`;
+    const res = await apiCommitSessionArtwork(p.id, activeSession.id, undefined, commitKey);
     const next = await getProject(p.id);
     setProjectSync(next);
     syncFields(next);
