@@ -373,7 +373,11 @@ class Provider:
         order=0
         stages={}
         for i,obj in enumerate(objects):
-            tick(.1+.75*i/max(1,len(objects)),f'Vectorizing object {i+1}/{len(objects)}: {obj["name"]}')
+            # Task 31C: structured progress alongside the human message — the
+            # frontend reads counts/ids from data, never from the string.
+            tick(.1+.75*i/max(1,len(objects)),f'Vectorizing object {i+1}/{len(objects)}: {obj["name"]}',
+                 {'stage': 'vector_generation', 'completedObjects': i, 'totalObjects': len(objects),
+                  'currentObjectId': obj.get('id') or f'obj-{i}'})
             fragment,usage=self.svg_object(obj,view_box)
             if len(fragment.encode('utf-8'))>400*1024:
                 raise ValueError(f'Fragment for "{obj["name"]}" exceeds the 400 KB budget. No partial master was saved.')

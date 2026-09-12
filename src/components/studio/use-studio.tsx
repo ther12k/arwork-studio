@@ -18,6 +18,7 @@ import { loadBundle, VectorBoard, type BoardMode, type BoardState, type Bundle }
 import {
   activateRevision,
   buildDraft,
+  cancelProjectJob as apiCancelProjectJob,
   createProject,
   createGenerationSession,
   discardGenerationSession,
@@ -232,6 +233,7 @@ export interface StudioApi {
     requested_difficulty?: SessionTier;
   }) => Promise<void>;
   commitArtworkToEditor: () => Promise<void>;
+  cancelJob: () => Promise<void>;
   clearSelection: () => void;
   startPlacing: () => void;
   /** Select a single region by id, switch to the board view and zoom to it (QA drill-down). */
@@ -1102,6 +1104,16 @@ export function StudioProvider({ children }: { children: React.ReactNode }) {
     toast(`Artwork committed — revision v${res.revision.version}.`);
   }, [activeSession, mountBoard, refreshList, setProjectSync, syncFields]);
 
+  /** Task 31B — request cancellation of the active job. Cooperative: stored
+   *  first, worker stops before the next provider step. */
+  const cancelJob = useCallback(async () => {
+    const p = projectRef.current;
+    if (!p) return;
+    const next = await apiCancelProjectJob(p.id);
+    setProjectSync(next);
+    toast("Cancellation requested — no further generation steps will start.");
+  }, [setProjectSync]);
+
   // Session truth lives server-side: after any session-step job finishes,
   // re-read the active session so the workspace reflects the new stage.
   const jobId = project?.job?.id ?? null;
@@ -1435,6 +1447,7 @@ export function StudioProvider({ children }: { children: React.ReactNode }) {
     analyzeReference,
     changeImageSettings,
     commitArtworkToEditor,
+    cancelJob,
     clearSelection,
     startPlacing,
     inspectRegion,

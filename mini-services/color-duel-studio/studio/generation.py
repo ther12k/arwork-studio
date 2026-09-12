@@ -844,6 +844,10 @@ class GenerationSessionManager:
             # nothing visual is outstanding against the existing artwork
             meta.pop('pendingArtworkChanges', None)
             meta.pop('artworkStale', None)
+        # Gameplay changes (difficulty) are build inputs too: keep the stale
+        # flag COMPUTED against the result's inherited identity.
+        if meta.get('activeBuildInputs') is not None:
+            meta['buildInputsStale'] = meta['activeBuildInputs'] != self._build_inputs(session)
 
         sdir = self.session_path(session_id)
         write_json(sdir / 'session.json', session)
@@ -1008,6 +1012,14 @@ class GenerationSessionManager:
             # resolved by this pass.
             session['meta'].pop('pendingArtworkChanges', None)
             session['meta'].pop('artworkStale', None)
+            # Task 31 provenance: WHAT the master was actually built from.
+            # Compile inherits this; it must never restamp provenance from
+            # the session's CURRENT state (a later source change would
+            # otherwise 're-validate' the old master).
+            session['meta']['masterOrigin'] = {
+                'sourceSha256': (session.get('meta', {}).get('source') or {}).get('sha256'),
+                'planRev': self._plan_fingerprint(session.get('scenePlan') or {}),
+            }
             session['updatedAt'] = _now()
             write_json(sdir / 'session.json', session)
             usage = {'kind': 'generation-synthesis', 'calls': calls, 'stages': stages}
@@ -1119,6 +1131,11 @@ class GenerationSessionManager:
         session['updatedAt'] = _now()
         session.setdefault('meta', {})['planUsage'] = usage
         session['meta']['referenceFile'] = reference.name
+        # Task 31 provenance: WHICH image was actually analyzed. The inline
+        # upload path funnels through set_session_source, so meta.source is
+        # the analyzed image in both entry paths.
+        session['meta']['planOriginSourceSha256'] = \
+            (session.get('meta', {}).get('source') or {}).get('sha256')
         sdir = self.session_path(session_id)
         write_json(sdir / 'session.json', session)
         return session, usage
@@ -1210,6 +1227,11 @@ class GenerationSessionManager:
             write_json(self.session_path(session_id) / 'session.json', session)
         return session
 
+    @staticmethod
+    def _plan_fingerprint(plan: dict) -> str:
+        return hashlib.sha256(json.dumps(
+            plan.get('objects') or [], sort_keys=True, ensure_ascii=False).encode()).hexdigest()[:16]
+
     def _build_inputs(self, session: dict) -> dict:
         """Identity of everything a convert RESULT depends on (Task 30D):
         source hash, mode, resolved fidelity policy, a CONTENT fingerprint of
@@ -1218,8 +1240,7 @@ class GenerationSessionManager:
         the active session state."""
         policy = resolve_convert_policy(session.get('fidelity') or 'balanced')
         plan = session.get('scenePlan') or {}
-        plan_rev = hashlib.sha256(json.dumps(
-            plan.get('objects') or [], sort_keys=True, ensure_ascii=False).encode()).hexdigest()[:16]
+        plan_rev = self._plan_fingerprint(plan)
         return {
             'sourceSha256': (session.get('meta', {}).get('source') or {}).get('sha256'),
             'mode': session['mode'],
@@ -1446,6 +1467,18 @@ class GenerationSessionManager:
         """
         session = self.get_session(session_id)
         sdir = self.session_path(session_id)
+        # Task 31 provenance guard: a plain recompile re-fits the EXISTING
+        # master. If the active source differs from the source the master was
+        # generated from, the compile must NOT proceed — otherwise a valid
+        # old master would be stamped with a provenance it never had.
+        origin = session.get('meta', {}).get('masterOrigin')
+        if origin is not None and origin.get('sourceSha256') is not None:
+            active_sha = (session.get('meta', {}).get('source') or {}).get('sha256')
+            if active_sha is not None and active_sha != origin['sourceSha256']:
+                raise ValueError(
+                    'The active source changed after this artwork was generated. '
+                    'Re-analyze the reference (and regenerate) to apply the new source — '
+                    'a plain recompile cannot.')
         bundle_dir = sdir / 'bundle'
         if bundle_dir.exists():
             shutil.rmtree(bundle_dir, ignore_errors=True)
@@ -1499,13 +1532,33 @@ class GenerationSessionManager:
                     'measuredDifficulty': measured,
                     'regionCount': result['manifest']['regionCount'],
                 }, clear_meta=['artworkStale'])
-                # Task 30 — the result now matches the ACTIVE inputs; record
-                # the identity snapshot (image sessions only — ai_chat has no
-                # source) so a later source change invalidates the commit.
+                # Task 31 provenance: compile INHERITS the master's origin —
+                # it must never restamp the snapshot from the session's
+                # CURRENT state (that would re-validate an old master against
+                # a newly active source). Identity = what the master was
+                # built from + the gameplay settings now applied to it.
                 fresh = self.get_session(session_id)
-                if fresh['mode'] in ('image_reference', 'image_convert'):
-                    fresh.setdefault('meta', {})['activeBuildInputs'] = self._build_inputs(fresh)
-                    fresh['meta'].pop('buildInputsStale', None)
+                origin = fresh.get('meta', {}).get('masterOrigin')
+                if origin is None:
+                    # Masters predating provenance keep the previous honest
+                    # snapshot semantics rather than inventing an origin.
+                    if fresh['mode'] in ('image_reference', 'image_convert'):
+                        fresh.setdefault('meta', {})['activeBuildInputs'] = self._build_inputs(fresh)
+                        fresh['meta'].pop('buildInputsStale', None)
+                        write_json(self.session_path(session_id) / 'session.json', fresh)
+                else:
+                    policy = resolve_convert_policy(fresh.get('fidelity') or 'balanced')
+                    identity = {
+                        'sourceSha256': origin.get('sourceSha256'),
+                        'mode': fresh['mode'],
+                        'fidelity': fresh.get('fidelity') or 'balanced',
+                        'policy': {k: policy[k] for k in sorted(policy)},
+                        'planRev': origin.get('planRev'),
+                        'targetRegions': fresh.get('targetRegions'),
+                        'requestedDifficulty': fresh.get('requestedDifficulty'),
+                    }
+                    fresh.setdefault('meta', {})['activeBuildInputs'] = identity
+                    fresh['meta']['buildInputsStale'] = identity != self._build_inputs(fresh)
                     write_json(self.session_path(session_id) / 'session.json', fresh)
             return result
         except Exception as exc:

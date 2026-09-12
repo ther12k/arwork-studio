@@ -1,4 +1,5 @@
 import io,time,json,base64,re,os,tempfile,hashlib
+from studio.pipeline import read_json, write_json
 from pathlib import Path
 import httpx,pytest
 import numpy as np
@@ -20,7 +21,7 @@ def wait(c,pid,timeout=30):
     end=time.time()+timeout
     while time.time()<end:
         p=c.get('/api/projects/'+pid).json()
-        if p['job']['status'] in ['done','failed']:return p
+        if p['job']['status'] in ['done','failed','canceled','interrupted']:return p
         time.sleep(.1)
     raise AssertionError('Job timeout')
 
@@ -541,7 +542,7 @@ def test_generation_plan_and_generate_mocked(tmp_path, monkeypatch):
                    json={'confirm_paid': True})
         assert r.status_code == 200, r.text
         p = wait(c, pid)
-        assert p['job']['status'] == 'done', p['job']
+        assert p['job']['status'] == 'done', (p['job'].get('status'), p['job'].get('message'))
         assert sum(1 for s in seen if s.endswith('/json')) == 1
         sess = c.get(f'/api/projects/{pid}/generation/sessions/{sid}').json()
         obj_ids = [o['id'] for o in sess['scenePlan']['objects']]
@@ -573,7 +574,7 @@ def test_generation_plan_and_generate_mocked(tmp_path, monkeypatch):
                    json={'confirm_paid': True})
         assert r.status_code == 200, r.text
         p = wait(c, pid)
-        assert p['job']['status'] == 'done', p['job']
+        assert p['job']['status'] == 'done', (p['job'].get('status'), p['job'].get('message'))
         assert sum(1 for s in seen if s.endswith('/svg')) == len(ids)
         sess = c.get(f'/api/projects/{pid}/generation/sessions/{sid}').json()
         assert sess['status'] == 'ready_to_commit'
@@ -639,7 +640,7 @@ def test_generation_targeted_regeneration_mocked(tmp_path, monkeypatch):
                          'confirm_paid': True})
         assert r.status_code == 200, r.text
         p = wait(c, pid)
-        assert p['job']['status'] == 'done', p['job']
+        assert p['job']['status'] == 'done', (p['job'].get('status'), p['job'].get('message'))
         assert sum(1 for s in seen if s.endswith('/svg')) == svg_calls_before + 1
         sess = c.get(f'/api/projects/{pid}/generation/sessions/{sid}').json()
         assert sess['status'] == 'ready_to_commit'
@@ -704,7 +705,7 @@ def test_generation_reference_plan_mocked(tmp_path, monkeypatch):
                    data={'body': json.dumps({'confirm_paid': True, 'instructions': 'warmer palette'})})
         assert r.status_code == 200, r.text
         p = wait(c, pid)
-        assert p['job']['status'] == 'done', p['job']
+        assert p['job']['status'] == 'done', (p['job'].get('status'), p['job'].get('message'))
         sess = c.get(f'/api/projects/{pid}/generation/sessions/{sid}').json()
         assert sess['status'] == 'draft_plan'
         oids = [o['id'] for o in sess['scenePlan']['objects']]
@@ -719,7 +720,7 @@ def test_generation_reference_plan_mocked(tmp_path, monkeypatch):
                    json={'confirm_paid': True})
         assert r.status_code == 200, r.text
         p = wait(c, pid)
-        assert p['job']['status'] == 'done', p['job']
+        assert p['job']['status'] == 'done', (p['job'].get('status'), p['job'].get('message'))
         assert sum(1 for path, _ in seen if path.endswith('/svg')) == svg_before + len(SCENE_OBJECTS)
         sess = c.get(f'/api/projects/{pid}/generation/sessions/{sid}').json()
         assert sess['status'] == 'ready_to_commit'
@@ -773,8 +774,12 @@ def _convert_transport(seen):
             # sanity for objects away from the canvas origin (reference flows
             # plan sky/house/grass at their fixture positions).
             body = json.loads(req.content)
-            m = re.search(r'viewBox="(\d+) (\d+) (\d+) (\d+)"', body['instructions'])
-            bx, by, bw, bh = (int(v) for v in m.groups())
+            m = re.search(r'planned bbox: \[x=([0-9.]+), y=([0-9.]+), width=([0-9.]+), height=([0-9.]+)\]', body.get('instructions', ''))
+            if m:
+                bx, by, bw, bh = (int(round(float(v))) for v in m.groups())
+            else:
+                m = re.search(r'viewBox="(\d+) (\d+) (\d+) (\d+)"', body.get('instructions', ''))
+                bx, by, bw, bh = (int(v) for v in m.groups()) if m else (0, 0, 100, 100)
             pad = max(4, min(bw, bh) // 8)
             svg = (f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="{bx} {by} {bw} {bh}">'
                    f'<rect x="{bx+pad}" y="{by+pad}" width="{bw-2*pad}" height="{bh-2*pad}" fill="#3366AA"/>'
@@ -851,7 +856,7 @@ def test_convert_end_to_end_semantic_ownership(client, monkeypatch):
         assert r.status_code == 200, r.text
         # hard sessions optimize toward 430 gameplay regions — heavy QA
         p = wait(c, pid, timeout=240)
-        assert p['job']['status'] == 'done', p['job']
+        assert p['job']['status'] == 'done', (p['job'].get('status'), p['job'].get('message'))
         sess = c.get(f'/api/projects/{pid}/generation/sessions/{sid}').json()
         assert sess['status'] == 'ready_to_commit'
         assert sess['meta']['qa']['passed'] is True
@@ -902,7 +907,7 @@ def test_convert_fidelity_changes_parameters_and_output(client, monkeypatch):
             assert r.status_code == 200, r.text
             # hard sessions optimize toward 430 gameplay regions — heavy QA
             p = wait(c, pid, timeout=240)
-            assert p['job']['status'] == 'done', p['job']
+            assert p['job']['status'] == 'done', (p['job'].get('status'), p['job'].get('message'))
             sess = c.get(f'/api/projects/{pid}/generation/sessions/{sid}').json()
             assert sess['status'] == 'ready_to_commit'
             policy = sess['meta']['convertPolicy']
@@ -967,7 +972,7 @@ def test_convert_round_trip_edits_keep_objects_valid(client, monkeypatch):
         r = c.post(f'/api/projects/{pid}/edit', headers=H, json=cut)
         assert r.status_code == 200, r.text
         p = wait(c, pid)
-        assert p['job']['status'] == 'done', p['job']
+        assert p['job']['status'] == 'done', (p['job'].get('status'), p['job'].get('message'))
         rev2 = p['currentRevision']
         regs2 = c.get(f'/api/projects/{pid}/revisions/{rev2}/files/regions.json').json()['regions']
         # ownership survived the cut: same object set, cut pieces inherit objectId
@@ -1021,7 +1026,7 @@ def test_convert_paint_hash_invariant_across_difficulty(client, monkeypatch):
             # Master compiles + optimizes toward ~650 gameplay regions with
             # full QA and preview renders — legitimately heavier than 30s.
             p = wait(c, pid, timeout=240)
-            assert p['job']['status'] == 'done', p['job']
+            assert p['job']['status'] == 'done', (p['job'].get('status'), p['job'].get('message'))
             sdir = Path(c.app.state.root) / pid / 'sessions' / sid
             paint = json.loads((sdir / 'bundle' / 'paint.json').read_text())
             regions = json.loads((sdir / 'bundle' / 'regions.json').read_text())['regions']
@@ -1089,7 +1094,7 @@ def test_convert_optimization_report_and_metadata(client, monkeypatch):
                            'fidelity': 'balanced'}).json()['id']
         assert _run_convert(c, pid, sid, _convert_fixture_png()).status_code == 200
         p = wait(c, pid)
-        assert p['job']['status'] == 'done', p['job']
+        assert p['job']['status'] == 'done', (p['job'].get('status'), p['job'].get('message'))
         sess = c.get(f'/api/projects/{pid}/generation/sessions/{sid}').json()
         report = sess['meta']['difficultyOptimization']
         assert report['requestedTier'] == 'medium'
@@ -1136,7 +1141,7 @@ def test_optimize_creates_revision_with_artwork_frozen(client):
         'min_region_pixels': 4, 'min_label_radius': 1.0, 'auto_subdivide': True})
     assert r.status_code == 200
     p = wait(client, pid, timeout=120)
-    assert p['job']['status'] == 'done', p['job']
+    assert p['job']['status'] == 'done', (p['job'].get('status'), p['job'].get('message'))
     rev = p['currentRevision']
     base = f'/api/projects/{pid}/revisions/{rev}'
     before = {
@@ -1149,7 +1154,7 @@ def test_optimize_creates_revision_with_artwork_frozen(client):
                     json={'base_revision': rev, 'tier': 'easy'})
     assert r.status_code == 200, r.text
     p = wait(client, pid, timeout=240)
-    assert p['job']['status'] == 'done', p['job']
+    assert p['job']['status'] == 'done', (p['job'].get('status'), p['job'].get('message'))
     rev2 = p['currentRevision']
     assert rev2 and rev2 != rev
     report = p['lastOptimization']
@@ -1195,7 +1200,7 @@ def test_optimize_noop_does_not_create_revision(client):
                     json={'base_revision': rev_easy, 'tier': 'easy'})
     assert r.status_code == 200, r.text
     p = wait(client, pid, timeout=120)
-    assert p['job']['status'] == 'done', p['job']
+    assert p['job']['status'] == 'done', (p['job'].get('status'), p['job'].get('message'))
     assert p['currentRevision'] == rev_easy, 'no-op must not create a revision'
     assert len(p['revisions']) == n0
     assert p['lastOptimization']['noop'] is True
@@ -1217,7 +1222,7 @@ def test_optimize_upward_then_deterministic(client):
                     json={'base_revision': rev, 'tier': 'master'})
     assert r.status_code == 200
     p = wait(client, pid, timeout=240)
-    assert p['job']['status'] == 'done', p['job']
+    assert p['job']['status'] == 'done', (p['job'].get('status'), p['job'].get('message'))
     master_rev = p['currentRevision']
     assert master_rev != rev
     report = p['lastOptimization']
@@ -1242,11 +1247,14 @@ def test_optimize_upward_then_deterministic(client):
 # mutations, lock semantics, stale-plan flow, session preview
 # ---------------------------------------------------------------------------
 
-def _task29_transport(seen):
+def _task29_transport(seen, svg_delay=0.0):
     """Multistage mock whose /json endpoint ALSO serves the plan-mutations
-    translator (distinguished by its instructions prefix)."""
+    translator (distinguished by its instructions prefix). svg_delay slows
+    fragment calls for cancellation/progress timing tests."""
     def respond(req):
         seen.append(req.url.path)
+        if svg_delay and req.url.path.endswith('/svg'):
+            time.sleep(svg_delay)
         if req.url.path.endswith('/json'):
             body = json.loads(req.content)
             assert body['store'] is False
@@ -1264,8 +1272,12 @@ def _task29_transport(seen):
         if req.url.path.endswith('/svg'):
             body = json.loads(req.content)
             import re as _re
-            m = _re.search(r'viewBox="(\d+) (\d+) (\d+) (\d+)"', body['instructions'])
-            bx, by, bw, bh = (int(v) for v in m.groups())
+            m = re.search(r'planned bbox: \[x=([0-9.]+), y=([0-9.]+), width=([0-9.]+), height=([0-9.]+)\]', body.get('instructions', ''))
+            if m:
+                bx, by, bw, bh = (int(round(float(v))) for v in m.groups())
+            else:
+                m = re.search(r'viewBox="(\d+) (\d+) (\d+) (\d+)"', body.get('instructions', ''))
+                bx, by, bw, bh = (int(v) for v in m.groups()) if m else (0, 0, 100, 100)
             pad = max(4, min(bw, bh) // 8)
             # PER-CALL fill variation (same geometry): consecutive provider
             # calls return visibly different fragments, so a broken
@@ -1290,12 +1302,12 @@ def _plan_and_generate(c, pid, seen):
                json={'confirm_paid': True})
     assert r.status_code == 200, r.text
     p = wait(c, pid)
-    assert p['job']['status'] == 'done', p['job']
+    assert p['job']['status'] == 'done', (p['job'].get('status'), p['job'].get('message'))
     r = c.post(f'/api/projects/{pid}/generation/sessions/{sid}/generate', headers=H,
                json={'confirm_paid': True})
     assert r.status_code == 200
     p = wait(c, pid)
-    assert p['job']['status'] == 'done', p['job']
+    assert p['job']['status'] == 'done', (p['job'].get('status'), p['job'].get('message'))
     sess = c.get(f'/api/projects/{pid}/generation/sessions/{sid}').json()
     assert sess['status'] == 'ready_to_commit'
     return sid
@@ -1331,7 +1343,7 @@ def test_plan_chat_translates_to_structured_mutations(tmp_path, monkeypatch):
                    json={'confirm_paid': True, 'instruction': 'make the tree bigger and remove the path'})
         assert r.status_code == 200, r.text
         p = wait(c, pid)
-        assert p['job']['status'] == 'done', p['job']
+        assert p['job']['status'] == 'done', (p['job'].get('status'), p['job'].get('message'))
         # exactly ONE extra /json call (the translator), full plan never resent
         assert sum(1 for s in seen if s.endswith('/json')) == 2
         sess = c.get(f'/api/projects/{pid}/generation/sessions/{sid}').json()
@@ -1377,7 +1389,7 @@ def test_plan_edit_after_ready_marks_artwork_stale_then_compile(tmp_path, monkey
         r = c.post(f'{base}/compile', headers=H, json={})
         assert r.status_code == 200
         p = wait(c, pid)
-        assert p['job']['status'] == 'done', p['job']
+        assert p['job']['status'] == 'done', (p['job'].get('status'), p['job'].get('message'))
         sess = c.get(base).json()
         assert sess['status'] == 'draft_plan'
         assert sess['meta']['pendingArtworkChanges'] == {'obj-flowers': ['description']}
@@ -1401,7 +1413,7 @@ def test_plan_edit_after_ready_marks_artwork_stale_then_compile(tmp_path, monkey
                    json={'objectId': 'obj-flowers', 'confirm_paid': True})
         assert r.status_code == 200
         p = wait(c, pid)
-        assert p['job']['status'] == 'done', p['job']
+        assert p['job']['status'] == 'done', (p['job'].get('status'), p['job'].get('message'))
         sess = c.get(base).json()
         assert sess['status'] == 'ready_to_commit'
         assert 'pendingArtworkChanges' not in sess['meta']
@@ -1434,7 +1446,7 @@ def test_two_visual_changes_regen_one_commit_blocked(tmp_path, monkeypatch):
                    json={'objectId': 'obj-tree', 'confirm_paid': True})
         assert r.status_code == 200
         p = wait(c, pid)
-        assert p['job']['status'] == 'done', p['job']
+        assert p['job']['status'] == 'done', (p['job'].get('status'), p['job'].get('message'))
         sess = c.get(base).json()
         assert sess['status'] == 'draft_plan', 'one pending object must block ready'
         assert sess['meta']['pendingArtworkChanges'] == {'obj-flowers': ['fills']}
@@ -1447,7 +1459,7 @@ def test_two_visual_changes_regen_one_commit_blocked(tmp_path, monkeypatch):
         r = c.post(f'{base}/generate', headers=H, json={'confirm_paid': True})
         assert r.status_code == 200
         p = wait(c, pid)
-        assert p['job']['status'] == 'done', p['job']
+        assert p['job']['status'] == 'done', (p['job'].get('status'), p['job'].get('message'))
         sess = c.get(base).json()
         assert sess['status'] == 'ready_to_commit'
         assert 'pendingArtworkChanges' not in sess['meta']
@@ -1514,7 +1526,7 @@ def test_locked_object_regenerate_guard_and_bulk_keep(tmp_path, monkeypatch):
                    json={'confirm_paid': True})
         assert r.status_code == 200
         p = wait(c, pid)
-        assert p['job']['status'] == 'done', p['job']
+        assert p['job']['status'] == 'done', (p['job'].get('status'), p['job'].get('message'))
         sess = c.get(f'/api/projects/{pid}/generation/sessions/{sid}').json()
         assert sess['status'] == 'ready_to_commit'
         assert sess['meta'].get('keptLockedObjects') == ['obj-sky']
@@ -1534,7 +1546,7 @@ def test_locked_object_regenerate_guard_and_bulk_keep(tmp_path, monkeypatch):
                    json={'objectId': 'obj-sky', 'confirm_paid': True})
         assert r.status_code == 200
         p = wait(c, pid)
-        assert p['job']['status'] == 'done', p['job']
+        assert p['job']['status'] == 'done', (p['job'].get('status'), p['job'].get('message'))
         assert sum(1 for x in seen if x.endswith('/svg')) == svg_calls + 5 + 1
 
 
@@ -1625,7 +1637,7 @@ def test_all_locked_local_prune_applies_removal(tmp_path, monkeypatch):
         r = c.post(f'{base}/generate', headers=H, json={'confirm_paid': True})
         assert r.status_code == 200
         p = wait(c, pid)
-        assert p['job']['status'] == 'done', p['job']
+        assert p['job']['status'] == 'done', (p['job'].get('status'), p['job'].get('message'))
         assert sum(1 for x in seen if x.endswith('/svg')) == svg0, 'all-locked run must not spend'
         sess = c.get(base).json()
         assert sess['status'] == 'ready_to_commit'
@@ -1687,7 +1699,7 @@ def test_session_source_upload_persists_and_survives_refresh(tmp_path, monkeypat
                    files={'body': (None, json.dumps({'confirm_paid': True}))})
         assert r.status_code == 200, r.text
         p = wait(c, pid, timeout=240)
-        assert p['job']['status'] == 'done', p['job']
+        assert p['job']['status'] == 'done', (p['job'].get('status'), p['job'].get('message'))
         sess = c.get(base).json()
         assert sess['status'] == 'ready_to_commit'
         # identity recorded from the STORED source
@@ -1747,7 +1759,7 @@ def test_source_or_settings_change_invalidates_result(tmp_path, monkeypatch):
                    files={'body': (None, json.dumps({'confirm_paid': True}))})
         assert r.status_code == 200
         p = wait(c, pid, timeout=240)
-        assert p['job']['status'] == 'done', p['job']
+        assert p['job']['status'] == 'done', (p['job'].get('status'), p['job'].get('message'))
         # settings change (fidelity) -> free, marks result stale
         r = c.post(f'{base}/settings', headers=H, json={'fidelity': 'faithful'})
         assert r.status_code == 200, r.text
@@ -1787,7 +1799,7 @@ def test_reference_plan_uses_stored_source_without_file(tmp_path, monkeypatch):
                    files={'body': (None, json.dumps({'confirm_paid': True}))})
         assert r.status_code == 200, r.text
         p = wait(c, pid, timeout=120)
-        assert p['job']['status'] == 'done', p['job']
+        assert p['job']['status'] == 'done', (p['job'].get('status'), p['job'].get('message'))
         # the vision call carried the stored image (input_image part present)
         assert any(s.endswith('/json') for s in seen)
         sess = c.get(base).json()
@@ -1816,7 +1828,7 @@ def test_reference_source_change_blocks_commit(tmp_path, monkeypatch):
         r = c.post(f'{base}/generate', headers=H, json={'confirm_paid': True})
         assert r.status_code == 200
         p = wait(c, pid, timeout=240)
-        assert p['job']['status'] == 'done', p['job']
+        assert p['job']['status'] == 'done', (p['job'].get('status'), p['job'].get('message'))
         sess = c.get(base).json()
         assert sess['status'] == 'ready_to_commit'
         assert sess['meta']['activeBuildInputs']['sourceSha256'] == sha_a
@@ -1849,7 +1861,7 @@ def test_convert_summary_matches_final_manifest(tmp_path, monkeypatch):
         c.post(f'{base}/convert', headers=H,
                files={'body': (None, json.dumps({'confirm_paid': True}))})
         p = wait(c, pid, timeout=240)
-        assert p['job']['status'] == 'done', p['job']
+        assert p['job']['status'] == 'done', (p['job'].get('status'), p['job'].get('message'))
         sess = c.get(base).json()
         manifest = json.loads((tmp_path / pid / 'sessions' / sid / 'bundle' / 'artwork.json').read_text())
         assert sess['meta']['measuredDifficulty']['rating'] == manifest['difficulty']['rating']
@@ -1909,7 +1921,7 @@ def test_inline_convert_upload_updates_metadata_and_identity(tmp_path, monkeypat
                           'body': (None, json.dumps({'confirm_paid': True}))})
         assert r.status_code == 200, r.text
         p = wait(c, pid, timeout=240)
-        assert p['job']['status'] == 'done', p['job']
+        assert p['job']['status'] == 'done', (p['job'].get('status'), p['job'].get('message'))
         sess = c.get(base).json()
         import hashlib as _h
         stored = (tmp_path / pid / 'sessions' / sid / 'source.png').read_bytes()
@@ -1918,3 +1930,315 @@ def test_inline_convert_upload_updates_metadata_and_identity(tmp_path, monkeypat
         assert sess['meta']['activeBuildInputs']['sourceSha256'] == sha_b
         r = c.post(f'{base}/commit', headers=H, json={})
         assert r.status_code == 200, r.text
+
+
+# ---------------------------------------------------------------------------
+# Task 31 part 1 — build provenance (compile must not re-validate old masters)
+# ---------------------------------------------------------------------------
+
+def test_recompile_after_source_change_is_refused(tmp_path, monkeypatch):
+    """P1: Reference A → analyze → generate (ready) → source swapped to B →
+    a PLAIN recompile must not proceed (it would stamp master A with source
+    B's provenance). Commit stays refused; the honest error names the fix."""
+    monkeypatch.setenv('OPENAI_API_KEY', 'fake-key')
+    with TestClient(create_app(tmp_path, transport=_convert_transport([]))) as c:
+        pid = new(c)
+        sid = c.post(f'/api/projects/{pid}/generation/sessions', headers=H,
+                     json={'mode': 'image_reference', 'requested_difficulty': 'medium'}).json()['id']
+        base = f'/api/projects/{pid}/generation/sessions/{sid}'
+        c.post(f'{base}/source', headers=H,
+               files={'file': ('a.png', _convert_fixture_png(), 'image/png')})
+        c.post(f'{base}/reference-plan', headers=H,
+               files={'body': (None, json.dumps({'confirm_paid': True}))})
+        wait(c, pid, timeout=120)
+        r = c.post(f'{base}/generate', headers=H, json={'confirm_paid': True})
+        p = wait(c, pid, timeout=240)
+        assert p['job']['status'] == 'done', (p['job'].get('status'), p['job'].get('message'))
+        sess = c.get(base).json()
+        assert sess['meta']['masterOrigin']['sourceSha256'] == sess['meta']['source']['sha256']
+        # swap the source
+        variant = io.BytesIO()
+        Image.new('RGB', (256, 256), '#224488').save(variant, format='PNG')
+        r = c.post(f'{base}/source', headers=H,
+                   files={'file': ('b.png', variant.getvalue(), 'image/png')})
+        assert r.json()['meta']['buildInputsStale'] is True
+        # plain recompile must be REFUSED synchronously (no state mutated)
+        r = c.post(f'{base}/compile', headers=H, json={})
+        assert r.status_code == 400
+        assert 'Re-analyze the reference' in r.json()['detail']
+        # the session keeps its healthy ready state (the refusal mutates
+        # nothing) and commit still refuses on identity, not on a nuked status
+        sess = c.get(base).json()
+        assert sess['status'] == 'ready_to_commit'
+        r = c.post(f'{base}/commit', headers=H, json={})
+        assert r.status_code == 400
+        assert 'different inputs' in r.json()['detail']
+
+
+def test_inline_reference_upload_updates_provenance(tmp_path, monkeypatch):
+    """P1: stored A → inline Reference B (multipart on /reference-plan) —
+    the analyzed image, meta.source hash and plan provenance ALL point at B."""
+    monkeypatch.setenv('OPENAI_API_KEY', 'fake-key')
+    with TestClient(create_app(tmp_path, transport=_convert_transport([]))) as c:
+        pid = new(c)
+        sid = c.post(f'/api/projects/{pid}/generation/sessions', headers=H,
+                     json={'mode': 'image_reference', 'requested_difficulty': 'medium'}).json()['id']
+        base = f'/api/projects/{pid}/generation/sessions/{sid}'
+        r = c.post(f'{base}/source', headers=H,
+                   files={'file': ('a.png', _convert_fixture_png(), 'image/png')})
+        sha_a = r.json()['meta']['source']['sha256']
+        variant = io.BytesIO()
+        Image.new('RGB', (256, 256), '#224488').save(variant, format='PNG')
+        r = c.post(f'{base}/reference-plan', headers=H,
+                   files={'file': ('b.png', variant.getvalue(), 'image/png'),
+                          'body': (None, json.dumps({'confirm_paid': True}))})
+        assert r.status_code == 200, r.text
+        p = wait(c, pid, timeout=120)
+        assert p['job']['status'] == 'done', (p['job'].get('status'), p['job'].get('message'))
+        sess = c.get(base).json()
+        sha_b = sess['meta']['source']['sha256']
+        assert sha_b != sha_a
+        # metadata, plan provenance and analyze origin all point at B
+        assert sess['meta']['planOriginSourceSha256'] == sha_b
+        assert sess['meta']['source']['name'] == 'b.png'
+
+
+def test_metadata_only_compile_keeps_origin_and_enables_commit(tmp_path, monkeypatch):
+    """Difficulty changes are gameplay-only: a free recompile still works
+    after the provenance patch, and the inherited identity tracks the new
+    gameplay settings honestly (the artwork provenance stays the origin)."""
+    monkeypatch.setenv('OPENAI_API_KEY', 'fake-key')
+    with TestClient(create_app(tmp_path, transport=_convert_transport([]))) as c:
+        pid = new(c)
+        sid = c.post(f'/api/projects/{pid}/generation/sessions', headers=H,
+                     json={'mode': 'image_reference', 'requested_difficulty': 'medium'}).json()['id']
+        base = f'/api/projects/{pid}/generation/sessions/{sid}'
+        c.post(f'{base}/source', headers=H,
+               files={'file': ('a.png', _convert_fixture_png(), 'image/png')})
+        c.post(f'{base}/reference-plan', headers=H,
+               files={'body': (None, json.dumps({'confirm_paid': True}))})
+        wait(c, pid, timeout=120)
+        c.post(f'{base}/generate', headers=H, json={'confirm_paid': True})
+        p = wait(c, pid, timeout=240)
+        assert p['job']['status'] == 'done'
+        origin_sha = c.get(base).json()['meta']['masterOrigin']['sourceSha256']
+        # difficulty change (gameplay-only; free, no provider call)
+        r = c.post(f'{base}/mutate', headers=H,
+                   json={'mutations': [{'op': 'set_difficulty', 'difficulty': 'hard'}]})
+        assert r.status_code == 200
+        assert r.json()['meta'].get('buildInputsStale') is True
+        # free recompile is ALLOWED (source untouched) and adopts the new
+        # gameplay settings into the inherited identity
+        r = c.post(f'{base}/compile', headers=H, json={})
+        assert r.status_code == 200
+        p = wait(c, pid, timeout=240)
+        assert p['job']['status'] == 'done', (p['job'].get('status'), p['job'].get('message'))
+        sess = c.get(base).json()
+        assert sess['status'] == 'ready_to_commit'
+        assert sess['meta']['buildInputsStale'] is False
+        # artwork provenance still points at the ORIGIN source
+        assert sess['meta']['activeBuildInputs']['sourceSha256'] == origin_sha
+        r = c.post(f'{base}/commit', headers=H, json={})
+        assert r.status_code == 200, r.text
+
+
+# ---------------------------------------------------------------------------
+# Task 31 — operation identity, cancellation, recovery, structured progress
+# ---------------------------------------------------------------------------
+
+def _slow29_transport(seen, delay=0.25):
+    """_task29_transport whose fragment calls are slow enough to cancel
+    mid-generation."""
+    return _task29_transport(seen, svg_delay=delay)
+
+
+def test_idempotent_same_key_collapses_and_replays(tmp_path, monkeypatch):
+    """Same key twice: ONE provider run; the second response replays the
+    same attempt. After completion the replay carries attemptStatus=done.
+    Same key with a different payload is a 409."""
+    monkeypatch.setenv('OPENAI_API_KEY', 'fake-key')
+    seen = []
+    with TestClient(create_app(tmp_path, transport=_task29_transport(seen))) as c:
+        pid = new(c)
+        sid = c.post(f'/api/projects/{pid}/generation/sessions', headers=H,
+                     json={'mode': 'ai_chat', 'prompt': 'garden'}).json()['id']
+        base = f'/api/projects/{pid}/generation/sessions/{sid}'
+        c.post(f'{base}/plan', headers=H, json={'confirm_paid': True})
+        wait(c, pid, timeout=120)
+        json_calls_before = sum(1 for x in seen if x.endswith('/json'))
+        body = {'confirm_paid': True, 'instruction': 'make the tree bigger', 'idempotency_key': 'op-1'}
+        r1 = c.post(f'{base}/plan-chat', headers=H, json=body)
+        r2 = c.post(f'{base}/plan-chat', headers=H, json=body)
+        assert r1.status_code == 200 and r2.status_code == 200
+        assert r1.json()['jobId'] == r2.json()['jobId']
+        assert r2.json()['idempotentReplay'] is True
+        wait(c, pid, timeout=120)
+        # exactly ONE translator call for the two identical submits
+        assert sum(1 for x in seen if x.endswith('/json')) == json_calls_before + 1
+        # resend after completion: same attempt, no new provider call
+        r3 = c.post(f'{base}/plan-chat', headers=H, json=body)
+        assert r3.status_code == 200
+        assert r3.json()['idempotentReplay'] is True
+        assert r3.json()['attemptStatus'] == 'done'
+        assert sum(1 for x in seen if x.endswith('/json')) == json_calls_before + 1
+        # same key, different payload → 409
+        r4 = c.post(f'{base}/plan-chat', headers=H,
+                    json={'confirm_paid': True, 'instruction': 'different work', 'idempotency_key': 'op-1'})
+        assert r4.status_code == 409
+
+
+def test_failed_attempt_never_respends_automatically(tmp_path, monkeypatch):
+    """A replay of a FAILED attempt returns the failed attempt (and spends
+    nothing) — retrying is an explicit new action, not a silent resend."""
+    monkeypatch.setenv('OPENAI_API_KEY', 'fake-key')
+    seen = []
+    with TestClient(create_app(tmp_path, transport=_task29_transport(seen))) as c:
+        pid = new(c)
+        sid = c.post(f'/api/projects/{pid}/generation/sessions', headers=H,
+                     json={'mode': 'ai_chat', 'prompt': 'garden'}).json()['id']
+        base = f'/api/projects/{pid}/generation/sessions/{sid}'
+        c.post(f'{base}/plan', headers=H, json={'confirm_paid': True})
+        wait(c, pid, timeout=120)
+        svg0 = sum(1 for x in seen if x.endswith('/svg'))
+        r = c.post(f'{base}/regenerate-object', headers=H,
+                   json={'objectId': 'obj-ghost', 'confirm_paid': True, 'idempotency_key': 'op-x'})
+        assert r.status_code == 200
+        p = wait(c, pid, timeout=120)
+        assert p['job']['status'] == 'failed'
+        calls_after_fail = sum(1 for x in seen if x.endswith('/svg'))
+        r2 = c.post(f'{base}/regenerate-object', headers=H,
+                    json={'objectId': 'obj-ghost', 'confirm_paid': True, 'idempotency_key': 'op-x'})
+        assert r2.status_code == 200
+        assert r2.json()['idempotentReplay'] is True
+        assert r2.json()['attemptStatus'] == 'failed'
+        assert sum(1 for x in seen if x.endswith('/svg')) == calls_after_fail
+
+
+def test_commit_resend_returns_same_revision(tmp_path, monkeypatch):
+    """Resending the same commit request returns the already-created revision
+    instead of a duplicate."""
+    monkeypatch.setenv('OPENAI_API_KEY', 'fake-key')
+    with TestClient(create_app(tmp_path, transport=_task29_transport([]))) as c:
+        pid = new(c)
+        sid = _plan_and_generate(c, pid, [])
+        base = f'/api/projects/{pid}/generation/sessions/{sid}'
+        r1 = c.post(f'{base}/commit', headers=H, json={'idempotency_key': 'commit-1'})
+        assert r1.status_code == 200, r1.text
+        rev1 = r1.json()['revision']['id']
+        r2 = c.post(f'{base}/commit', headers=H, json={'idempotency_key': 'commit-1'})
+        assert r2.status_code == 200
+        assert r2.json()['idempotentReplay'] is True
+        assert r2.json()['revision']['id'] == rev1
+        p = c.get(f'/api/projects/{pid}').json()
+        assert len(p['revisions']) == 1
+
+
+def test_cancel_running_generation(tmp_path, monkeypatch):
+    """Cancel mid-generation: no further fragment steps run, the job ends
+    'canceled' with the honest copy, and the session returns to draft_plan
+    (resumable). A retry with a NEW key completes normally."""
+    monkeypatch.setenv('OPENAI_API_KEY', 'fake-key')
+    seen = []
+    with TestClient(create_app(tmp_path, transport=_slow29_transport(seen))) as c:
+        pid = new(c)
+        sid = _plan_and_generate(c, pid, [])
+        # reset to a fresh generate round: mutate to draft then regenerate
+        c.post(f'/api/projects/{pid}/generation/sessions/{sid}/mutate', headers=H,
+               json={'mutations': [{'op': 'set_difficulty', 'difficulty': 'hard'}]})
+        svg_at_start = sum(1 for x in seen if x.endswith('/svg'))
+        r = c.post(f'/api/projects/{pid}/generation/sessions/{sid}/generate', headers=H,
+                   json={'confirm_paid': True, 'idempotency_key': 'gen-1'})
+        assert r.status_code == 200
+        # wait until the first fragments are running, then cancel
+        deadline = time.time() + 10
+        while time.time() < deadline and sum(1 for x in seen if x.endswith('/svg')) == svg_at_start:
+            time.sleep(0.05)
+        c.post(f'/api/projects/{pid}/job/cancel', headers=H)
+        p = wait(c, pid, timeout=120)
+        assert p['job']['status'] == 'canceled', p['job']
+        assert 'Cancellation requested' in p['job']['message']
+        calls_at_cancel = sum(1 for x in seen if x.endswith('/svg'))
+        time.sleep(1.0)   # a late response would add calls
+        assert sum(1 for x in seen if x.endswith('/svg')) == calls_at_cancel, \
+            'no further provider steps may run after cancellation'
+        sess = c.get(f'/api/projects/{pid}/generation/sessions/{sid}').json()
+        assert sess['status'] == 'draft_plan', 'canceled session must stay resumable'
+        # the cancellation bookkeeping settles BEFORE the next attempt starts
+        time.sleep(0.3)
+        # retry with a NEW key completes the work
+        r = c.post(f'/api/projects/{pid}/generation/sessions/{sid}/generate', headers=H,
+                   json={'confirm_paid': True, 'idempotency_key': 'gen-2'})
+        assert r.status_code == 200
+        p = wait(c, pid, timeout=240)
+        assert p['job']['status'] == 'done', (p['job'].get('status'), p['job'].get('message'))
+        sess = c.get(f'/api/projects/{pid}/generation/sessions/{sid}').json()
+        assert sess['status'] == 'ready_to_commit'
+
+
+def test_restart_sweep_marks_interrupted(tmp_path, monkeypatch):
+    """After a service restart, a running job becomes 'interrupted' (readable
+    recovery state, no automatic paid replay) and a session left generating
+    returns to draft_plan."""
+    monkeypatch.setenv('OPENAI_API_KEY', 'fake-key')
+    ws = tmp_path / 'ws'
+    with TestClient(create_app(ws, transport=_task29_transport([]))) as c:
+        pid = new(c)
+        sid = c.post(f'/api/projects/{pid}/generation/sessions', headers=H,
+                     json={'mode': 'ai_chat', 'prompt': 'garden'}).json()['id']
+        # simulate a hard stop mid-generation
+        pj = read_json(ws / pid / 'project.json')
+        pj['job'] = {'id': 'x', 'kind': 'AI artwork synthesis', 'status': 'running',
+                     'progress': 0.4, 'message': 'Vectorizing object 2/6: tree'}
+        write_json(ws / pid / 'project.json', pj)
+        sf = ws / pid / 'sessions' / sid / 'session.json'
+        sess = read_json(sf)
+        sess['status'] = 'generating'
+        write_json(sf, sess)
+    calls = []
+    with TestClient(create_app(ws, transport=_task29_transport(calls))) as c2:
+        p = c2.get(f'/api/projects/{pid}').json()
+        assert p['job']['status'] == 'interrupted'
+        assert 'retry explicitly' in p['job']['message']
+        assert not isBusyStatus(p['job']['status'])
+        sess = c2.get(f'/api/projects/{pid}/generation/sessions/{sid}').json()
+        assert sess['status'] == 'draft_plan'
+        assert 'restart' in sess['meta'].get('interruptedNote', '')
+        assert sum(1 for x in calls if x.endswith('/svg')) == 0, 'no paid replay on boot'
+
+
+def isBusyStatus(st):
+    return st in ('queued', 'running')
+
+
+def test_structured_progress_fields(tmp_path, monkeypatch):
+    """31C: while generating, the job exposes structured progress (stage,
+    completedObjects, totalObjects, currentObjectId, sequence) — the frontend
+    never parses the message string."""
+    monkeypatch.setenv('OPENAI_API_KEY', 'fake-key')
+    seen = []
+    with TestClient(create_app(tmp_path, transport=_slow29_transport(seen, delay=0.2))) as c:
+        pid = new(c)
+        sid = c.post(f'/api/projects/{pid}/generation/sessions', headers=H,
+                     json={'mode': 'ai_chat', 'requested_difficulty': 'medium',
+                           'prompt': 'garden'}).json()['id']
+        c.post(f'/api/projects/{pid}/generation/sessions/{sid}/plan', headers=H,
+               json={'confirm_paid': True})
+        wait(c, pid, timeout=120)
+        c.post(f'/api/projects/{pid}/generation/sessions/{sid}/generate', headers=H,
+               json={'confirm_paid': True})
+        observed = None
+        deadline = time.time() + 15
+        while time.time() < deadline:
+            job = c.get(f'/api/projects/{pid}').json()['job']
+            if job.get('stage') == 'vector_generation' and job.get('totalObjects'):
+                observed = job
+                break
+            if job.get('status') in ('done', 'failed', 'canceled'):
+                break
+            time.sleep(0.03)
+        assert observed, 'structured progress never observed'
+        assert observed['totalObjects'] == 6
+        assert isinstance(observed['completedObjects'], int)
+        assert observed['currentObjectId']
+        assert observed['sequence'] >= 1
+        wait(c, pid, timeout=240)

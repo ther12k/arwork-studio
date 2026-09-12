@@ -121,6 +121,14 @@ Backend (in `mini-services/color-duel-studio/`):
   report `safe-ceiling`/`best-safe-result` with reasons. Re-exposed sub-tolerance seams are
   absorbed via `partitionTolerance` re-measurement; the roundtrip pixel allowance scales with
   region count.
+- Operation Resilience & Job Recovery (Task 31): Paid generation operations support `idempotency_key`
+  with attempt tracking; same key collapses duplicate submits and replays completed results without
+  resending or duplicating spend; conflicting payloads return 409; `/commit` replays the already-created
+  revision. Cooperative cancellation (`POST /job/cancel`) stops workers before subsequent fragment
+  calls and resets sessions cleanly to `draft_plan`. On process boot, in-flight jobs become `interrupted`
+  (no automatic paid replay). Workers publish structured progress (`stage`, `completedObjects`,
+  `totalObjects`, `currentObjectId`, `sequence`). Build provenance (`masterOrigin`) prevents a plain
+  `/compile` from validating an outdated master against a swapped source.
 
 ## Conventions & hygiene
 

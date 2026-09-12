@@ -122,4 +122,5 @@ class MutateScenePlanRequest(StrictModel):
 
 class CommitSessionRequest(StrictModel):
     title: str | None = Field(None, max_length=100)
+    idempotency_key: str = Field('', max_length=80)
 

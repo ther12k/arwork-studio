@@ -124,11 +124,18 @@ export interface Revision {
 export interface Job {
   id?: string;
   kind?: string;
-  status?: "queued" | "running" | "done" | "failed";
+  status?: "queued" | "running" | "done" | "failed" | "canceled" | "interrupted";
   progress?: number;
   message?: string;
   startedAt?: string;
   finishedAt?: string | null;
+  cancelRequested?: boolean;
+  sequence?: number;
+  /** Task 31C — structured progress from the worker (never parsed from message). */
+  stage?: string;
+  completedObjects?: number;
+  totalObjects?: number;
+  currentObjectId?: string;
 }
 
 export interface ChatMessage {
@@ -364,6 +371,9 @@ export const getConfig = (): Promise<StudioConfig> => api<StudioConfig>("/config
 export const listProjects = (): Promise<Project[]> => api<Project[]>("/projects");
 
 export const getProject = (pid: string): Promise<Project> => api<Project>(`/projects/${pid}`);
+
+/** Task 31B — request cooperative cancellation of the running/queued job. */
+export const cancelProjectJob = (pid: string): Promise<Project> => post<Project>(`/projects/${pid}/job/cancel`, {});
 
 // --- Generation sessions (Task 28 shells; Tasks 29/30 fill the workspaces) ---
 

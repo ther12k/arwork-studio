@@ -298,6 +298,7 @@ export function AiWorkspace({ session, planMode = "chat" }: { session: Generatio
   const {
     busy,
     project,
+    cancelJob,
     planSceneWithAi,
     analyzeReference,
     revisePlanWithAi,
@@ -327,14 +328,18 @@ export function AiWorkspace({ session, planMode = "chat" }: { session: Generatio
   const hasPending = Object.keys(pendingChanges).length > 0;
   const stale = hasPending;
 
-  // per-object progress from the job message ("Vectorizing object i/N: name")
+  // Task 31C: structured progress from the worker — counts and object ids
+  // come from real worker completion, never from string scraping.
   const progress = useMemo(() => {
     if (session.status !== "generating" && session.status !== "compiling") return null;
+    if (typeof job.completedObjects === "number" && typeof job.totalObjects === "number") {
+      const currentName = objects.find((o) => o.id === job.currentObjectId)?.name ?? null;
+      return { done: job.completedObjects, total: job.totalObjects, current: currentName };
+    }
     const m = /object (\d+)\/(\d+): (.+)$/.exec(job.message ?? "");
     if (!m) return { done: 0, total: objects.length, current: null as string | null };
-    const done = Math.max(0, Number(m[1]) - 1);
-    return { done, total: Number(m[2]), current: m[3] };
-  }, [session.status, job.message, objects.length]);
+    return { done: Math.max(0, Number(m[1]) - 1), total: Number(m[2]), current: m[3] };
+  }, [session.status, job.completedObjects, job.totalObjects, job.currentObjectId, job.message, objects]);
 
   const saveObjectEdit = async (objectId: string, changes: Record<string, unknown>) => {
     try {
@@ -561,10 +566,26 @@ export function AiWorkspace({ session, planMode = "chat" }: { session: Generatio
       {/* ---------------------------------------------------------- stage 2 */}
       {stage === "generate" && (
         <div className="rounded-xl border border-[#dfe6d8] bg-white p-4 sm:p-5" aria-live="polite">
-          <h3 className="flex items-center gap-2 text-sm font-bold text-[#183837]">
-            <Loader2 className="size-4 animate-spin text-[#087f74]" aria-hidden />
-            {session.status === "compiling" ? "Compiling the board…" : "Generating artwork"}
-          </h3>
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <h3 className="flex items-center gap-2 text-sm font-bold text-[#183837]">
+              <Loader2 className="size-4 animate-spin text-[#087f74]" aria-hidden />
+              {session.status === "compiling" ? "Compiling the board…" : "Generating artwork"}
+            </h3>
+            <Button
+              variant="outline"
+              size="sm"
+              disabled={job.cancelRequested}
+              onClick={() => void cancelJob().catch((e: Error) => toast(e.message))}
+              className="h-7 rounded-md border-[#e1e5df] bg-white px-2.5 text-[10px] text-[#ba463f] hover:border-[#e8cfc7] hover:bg-[#fdf3f1] disabled:opacity-50"
+            >
+              {job.cancelRequested ? "Canceling…" : "Cancel generation"}
+            </Button>
+          </div>
+          {job.cancelRequested && (
+            <p className="mt-1 text-[10px] text-[#957242]">
+              Cancellation requested — no further generation steps will start.
+            </p>
+          )}
           {progress && objects.length > 0 && (
             <>
               <div className="mt-2 flex items-center gap-2 text-[11px] text-[#4c5b56]">

@@ -1697,3 +1697,19 @@ Work Log:
 
 Stage Summary:
 - The reviewer's six-item table is closed with regressions proving each row, the Reference journey is now browser-verified end-to-end from a stored source (the exact path Convert couldn't cover), and two latent bugs (single-color palette crash; misleading convert mock) surfaced and fixed by the new tests. Baseline for the next review is this single commit; Task 31 (progress/cancel/retry/recovery + idempotency) follows with no scope bleed from this patch.
+
+---
+Task ID: 33
+Agent: main (ZCode)
+Task: Task-31 — Operation identity, cooperative job cancellation, recovery states, structured progress, and the P1 build-provenance patch.
+
+Work Log:
+- P1 provenance patch: masterOrigin recorded at compose time (WHAT the master was actually built from: sourceSha256 + planContentFingerprint); compile_session INHERITS this origin rather than restamping from the session's CURRENT state; compile guard REFUSES (400) a plain recompile whose active source differs from masterOrigin ('Re-analyze the reference to apply the new source — a plain recompile cannot'); inline /reference-plan upload funnels through set_session_source so bytes, meta hash and plan provenance always agree. 3 regressions: recompile-after-source-change blocked + commit still refused; inline reference upload updates all three; metadata-only difficulty change still recompiles and keeps the original source origin committable.
+- 31A operation identity + idempotency: run_idempotent() helper evaluated under project lock BEFORE editable(p) so concurrent duplicate submits return the existing in-flight job instead of a 409; attempts recorded per session (key, operation, attemptId, payloadFingerprint, status, revision); same key + same payload replays existing attempt (never a new paid call); same key + different payload -> 409; failed attempt replay returns the failed attempt (no silent respend — retrying is an explicit new attempt); commit idempotency returns the ALREADY-CREATED revision instead of a duplicate.
+- 31B cooperative cancellation + recovery: start() tick checks p['job'].cancelRequested before every step -> JobCanceled exception; on_cancel handler resets the session to draft_plan BEFORE status='canceled' is published (eliminating race conditions with waiting callers); late worker updates cannot overwrite canceled state; honest copy: 'Cancellation requested. No further generation steps will start.' Restart sweep marks queued/running jobs as 'interrupted' (readable recovery state, no automatic paid replay) and resets abandoned sessions to draft_plan.
+- 31C structured progress: svg_compose ticks with {stage: 'vector_generation', completedObjects, totalObjects, currentObjectId} + sequence counter — the frontend reads real worker counts, not scraped strings.
+- Frontend: Job type updated with structured progress + cancelRequested + sequence; cancelProjectJob client + cancelJob action; sessionResumeCopy recognizes canceled ('Generation canceled' / 'Resume session'); ai-workspace stage-2 consumes structured progress and shows a 'Cancel generation' button with the honest copy.
+- Gates: Task-31 test suite (+6 tests, all green: idempotent collapse/replay, failed attempt no-respend, commit duplicate prevention, mid-generation cancel + retry with new key, restart sweep -> interrupted, structured progress fields); tsc/lint/build green.
+
+Stage Summary:
+- Task 31 completes the resilience and operational honesty layer: artists can cancel long generations without paying for subsequent fragments, resends from network drops replay existing attempts without duplicating spend or revisions, restarts never replay paid work silently, and progress comes from real worker completion. The P1 provenance hole is closed at the source. All 9 prioritized Task 31 gate assertions are proven.

@@ -49,7 +49,8 @@ const FIDELITIES: Array<{ value: "stylized" | "balanced" | "faithful"; label: st
   { value: "faithful", label: "Faithful", hint: "Closest to the original" },
 ];
 
-/** Status-aware resume copy — a failed session is never "in progress". */
+/** Status-aware resume copy — failed / canceled / interrupted sessions
+ *  never report "in progress". */
 export function sessionResumeCopy(status: string | undefined): { title: string; cta: string } {
   switch (status) {
     case "generating":
@@ -59,6 +60,8 @@ export function sessionResumeCopy(status: string | undefined): { title: string; 
       return { title: "Artwork ready to review", cta: "Review artwork" };
     case "failed":
       return { title: "Generation needs attention", cta: "Review session" };
+    case "canceled":
+      return { title: "Generation canceled", cta: "Resume session" };
     default:
       return { title: "Continue planning", cta: "Resume planning" };
   }

@@ -51,6 +51,13 @@ AI generation and image workflows are orchestrated transactionally via `Generati
 
 Create-with-AI runs as separate paid steps so vector cost is only paid once the plan is stable: `plan` (one strict-JSON scene-planning call → fills the draft's objects) → user revisions via structured mutations → `generate` (one fragment call per planned object, composed into the session master, compiled + QA'd) → `commit`. Targeted object regeneration (`regenerate-object`) replaces a single object's shapes in the session master — the `objectId` is preserved while internal shapeIds change — and recompiles, re-deriving neighbours' visible surfaces without touching untouched objects' shapes.
 
+Task 31 adds operation identity, cooperative cancellation, recovery, and build provenance:
+- **Operation identity & idempotency:** Paid operations accept an optional `idempotency_key`. Within a session, matching keys with matching payload fingerprints replay the existing attempt without duplicating provider spend or running parallel jobs; differing payloads return HTTP 409. Re-sending `/commit` with the same key returns the already-created revision rather than emitting duplicate revisions.
+- **Cooperative job cancellation:** `POST /api/projects/{pid}/job/cancel` stores a cooperative cancellation flag. The worker checks this flag before each subsequent provider call and before promoting results. Any un-executed fragment steps are dropped, the job completes as `canceled`, and the session safely rolls back to `draft_plan` so it remains resumable.
+- **Restart recovery:** On studio daemon start, any running/queued jobs are marked `interrupted` (readable recovery state — never auto-replayed) and mid-flight sessions return to `draft_plan`.
+- **Structured progress:** Workers emit structured telemetry (`stage`, `completedObjects`, `totalObjects`, `currentObjectId`, `sequence`) on every tick rather than requiring clients to parse progress strings.
+- **Build provenance:** When a master is generated, its origin is stamped (`meta.masterOrigin = {sourceSha256, planRev}`). Subsequent `/compile` actions inherit this origin and verify that the active session source matches it — preventing a plain recompile from retroactively "validating" an old master against a newly uploaded source.
+
 When committed, `artwork.json` records generation provenance:
 
 ```json

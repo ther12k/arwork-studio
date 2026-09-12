@@ -41,12 +41,24 @@ def create_app(workspace: Path|None=None, transport=None):
     root.mkdir(parents=True,exist_ok=True)
     lock=threading.RLock();pool=ThreadPoolExecutor(max_workers=1,thread_name_prefix='art-studio')
     provider=Provider(transport)
-    # A stopped local process never silently replays paid jobs on restart.
+    # A stopped local process never silently replays paid jobs on restart
+    # (Task 31B): jobs become 'interrupted' — a readable recovery state, not
+    # an automatic retry — and sessions left mid-flight return to draft_plan.
     for path in root.glob('*/project.json'):
         p=read_json(path)
         if p.get('job',{}).get('status') in ['queued','running']:
-            p['job']['status']='failed';p['job']['message']='Studio restarted. Job was not retried; check provider usage before retrying paid work.'
+            p['job']['status']='interrupted'
+            p['job']['message']='Studio restarted. The job was interrupted — review the state and retry explicitly; no paid work is replayed automatically.'
             write_json(path,p)
+            for sfile in (path.parent/'sessions').glob('sess-*/session.json') if (path.parent/'sessions').is_dir() else []:
+                try:
+                    sess=read_json(sfile)
+                    if sess.get('status') in ('generating','compiling'):
+                        sess['status']='draft_plan'
+                        sess.setdefault('meta',{})['interruptedNote']='Interrupted by a studio restart; retry explicitly.'
+                        write_json(sfile,sess)
+                except Exception:
+                    pass
     @asynccontextmanager
     async def lifespan(app):
         yield
@@ -69,21 +81,38 @@ def create_app(workspace: Path|None=None, transport=None):
         p=project(pid)
         if revision not in [r['id'] for r in p['revisions']]: raise HTTPException(404,'Revision not found.')
         return folder(pid)/'revisions'/revision
-    def start(pid,kind,fn):
+    class JobCanceled(Exception):
+        pass
+
+    def start(pid,kind,fn,on_cancel=None):
         with lock:
             p=project(pid);editable(p)
             active=sum(read_json(f).get('job',{}).get('status') in ['queued','running'] for f in root.glob('*/project.json'))
             if active>=4: raise HTTPException(429,'Local queue is full. Wait for another project to finish.')
-            jid=ident(); p['job']={'id':jid,'kind':kind,'status':'queued','progress':0,'message':'Queued','startedAt':now()};save(p)
-        def tick(fraction,message):
+            jid=ident(); p['job']={'id':jid,'kind':kind,'status':'queued','progress':0,'message':'Queued','startedAt':now(),'sequence':0};save(p)
+        def tick(fraction,message,detail=None):
             with lock:
-                p=project(pid);p['job'].update(status='running',progress=fraction,message=message);save(p)
+                p=project(pid)
+                # Task 31B: cooperative cancellation — checked at every worker
+                # update, so no further provider step starts after a request.
+                if p['job'].get('cancelRequested'):
+                    raise JobCanceled('canceled')
+                seq=int(p['job'].get('sequence') or 0)+1
+                p['job'].update(status='running',progress=fraction,message=message,sequence=seq)
+                # Task 31C: structured progress (object counts, stage, ids) —
+                # never parsed out of the message string.
+                if detail: p['job'].update(detail)
+                save(p)
         def work():
             try:
                 tick(.01,'Starting '+kind)
                 result=fn(tick)
                 with lock:
                     p=project(pid)
+                    # Worker checks BEFORE promoting results: a cancel that
+                    # arrived during the last step wins.
+                    if p['job'].get('cancelRequested'):
+                        raise JobCanceled('canceled')
                     if result.get('revision'):
                         p['revisions'].append(result['revision']);p['currentRevision']=result['revision']['id']
                     if result.get('master'):
@@ -100,11 +129,108 @@ def create_app(workspace: Path|None=None, transport=None):
                     if result.get('consumePending'):
                         p.pop('pendingBuildSettings',None)
                     p['job'].update(status='done',progress=1,message='Ready',finishedAt=now());save(p)
+            except JobCanceled:
+                # on_cancel runs BEFORE status='canceled' is published so the
+                # session's draft state settles before any waiting caller or
+                # polling client observes the job as finished.
+                if on_cancel:
+                    try: on_cancel()
+                    except Exception: pass
+                with lock:
+                    p=project(pid)
+                    p['job'].update(status='canceled',progress=0,
+                        message='Cancellation requested. No further generation steps will start.',
+                        finishedAt=now())
+                    p['job'].pop('cancelRequested',None)
+                    save(p)
             except Exception as exc:
                 with lock:
                     p=project(pid);p['job'].update(status='failed',message=str(exc)[:700],finishedAt=now());save(p)
         pool.submit(work)
         return {'jobId':jid,'projectId':pid}
+
+    def run_idempotent(pid, sid, sm, operation, body, kind, run_fn,
+                       on_result=None, on_cancel=None):
+        """Task 31A — operation identity + replay protection.
+
+        Without a key: legacy behaviour (no dedup). With a key, the check
+        runs under the project lock BEFORE editable(p) is checked — so
+        concurrent duplicate submits return the existing in-flight job instead
+        of failing with a 409 conflict. Same key + same input snapshot replays
+        the existing attempt (queued/running/done/failed — never a new paid
+        attempt); same key + different payload → 409."""
+        key = str((body or {}).get('idempotency_key') or '')
+        if not key:
+            return start(pid, kind, run_fn, on_cancel=on_cancel)
+        with lock:
+            sess = sm.get_session(sid)
+            attempts = sess.setdefault('meta', {}).setdefault('attempts', [])
+            # The request fingerprint covers the client payload (the caller's
+            # intent). The plan/source snapshot is stored with the attempt for
+            # provenance/audit; matching payload + matching key IS the same
+            # request, even after the plan advanced as a consequence.
+            payload_fingerprint = hashlib.sha256(json.dumps(
+                {k: v for k, v in (body or {}).items() if k != 'idempotency_key'},
+                sort_keys=True, default=str).encode('utf-8')).hexdigest()[:16]
+            for a in attempts:
+                if a.get('key') == key:
+                    if a.get('payloadFingerprint') != payload_fingerprint:
+                        raise HTTPException(409, 'This idempotency key was already used with a different request. Use a new key for different work.')
+                    # In-flight or completed replay: return the existing job
+                    # without re-running any provider work
+                    return {'jobId': a.get('jobId'), 'projectId': pid, 'attemptId': a.get('attemptId'),
+                            'idempotentReplay': True, 'attemptStatus': a.get('status'),
+                            **({'revision': a['revision']} if a.get('revision') else {})}
+            attempt_id = 'att-' + ident()
+            attempts.append({'key': key, 'operation': operation, 'attemptId': attempt_id,
+                             'payloadFingerprint': payload_fingerprint,
+                             'sourceSha256': (sess.get('meta', {}).get('source') or {}).get('sha256'),
+                             'planFingerprint': sm._plan_fingerprint(sess.get('scenePlan') or {}),
+                             'status': 'queued'})
+            del attempts[:-50]
+            write_json(sm.session_path(sid) / 'session.json', sess)
+
+        def record(attempt_id, **fields):
+            sess = sm.get_session(sid)
+            for a in sess.setdefault('meta', {}).get('attempts', []):
+                if a.get('attemptId') == attempt_id:
+                    a.update(fields)
+            write_json(sm.session_path(sid) / 'session.json', sess)
+
+        def wrapped(tick):
+            record(attempt_id, status='running')
+            try:
+                result = run_fn(tick)
+            except JobCanceled:
+                record(attempt_id, status='canceled')
+                raise
+            except Exception as exc:
+                record(attempt_id, status='failed', error=str(exc)[:200])
+                raise
+            record(attempt_id, status='done')
+            if on_result:
+                on_result(result, attempt_id)
+            return result
+        job = start(pid, kind, wrapped, on_cancel=on_cancel)
+        record(attempt_id, jobId=job['jobId'])
+        return {**job, 'attemptId': attempt_id}
+
+    @app.post('/api/projects/{pid}/job/cancel')
+    def cancel_job_route(pid:str):
+        """Task 31B — request cancellation of the running/queued job.
+
+        Cooperative: the flag is stored FIRST; the worker checks it before
+        every provider step and before promoting results. Already-sent
+        provider requests may still complete (and may be billed) — the copy
+        never promises otherwise."""
+        with lock:
+            p=project(pid)
+            if p['job'].get('status') not in ['queued','running']:
+                return p
+            p['job']['cancelRequested']=True
+            p['job']['message']='Cancellation requested. No further generation steps will start.'
+            save(p)
+            return p
     @app.middleware('http')
     async def local_safety(request:Request,call_next):
         # Same-origin custom header blocks drive-by browser POSTs to a local service.
@@ -587,6 +713,21 @@ def create_app(workspace: Path|None=None, transport=None):
             if not target_svg.is_file():
                 raise HTTPException(400, 'Session has no master SVG to compile.')
 
+        # Task 31 provenance: refuse a plain recompile whose active source
+        # differs from the master's origin BEFORE any state changes — the
+        # session keeps its current status so the artist can re-analyze.
+        try:
+            sess0 = sm.get_session(sid)
+            origin = (sess0.get('meta') or {}).get('masterOrigin')
+            if origin and origin.get('sourceSha256'):
+                active_sha = ((sess0.get('meta') or {}).get('source') or {}).get('sha256')
+                if active_sha and active_sha != origin['sourceSha256']:
+                    raise HTTPException(400, 'The active source changed after this artwork was '
+                                             'generated. Re-analyze the reference (and regenerate) '
+                                             'to apply the new source — a plain recompile cannot.')
+        except ValueError as exc:
+            raise HTTPException(400, str(exc))
+
         def run(tick):
             tick(0.2, 'Compiling session bundle')
             try:
@@ -638,12 +779,48 @@ def create_app(workspace: Path|None=None, transport=None):
             p = project(pid)
             editable(p)
             sm = GenerationSessionManager(folder(pid), pid)
+            # Task 31A — commit idempotency: resending the same commit request
+            # returns the ALREADY-CREATED revision instead of a duplicate.
+            key = str(getattr(body, 'idempotency_key', '') or '')
+            if key:
+                sess = sm.get_session(sid)
+                for a in sess.setdefault('meta', {}).get('attempts', []):
+                    if a.get('key') == key and a.get('operation') == 'commit':
+                        if a.get('status') == 'done' and a.get('revision'):
+                            return {'revision': a['revision'], 'idempotentReplay': True}
+                        if a.get('status') in ('queued', 'running'):
+                            raise HTTPException(409, 'This commit is already in progress.')
+                attempt_id = 'att-' + ident()
+                sess.setdefault('meta', {}).setdefault('attempts', []).append(
+                    {'key': key, 'operation': 'commit', 'attemptId': attempt_id,
+                     'inputVersion': hashlib.sha256(json.dumps(
+                         {'rev': p['currentRevision'], 'title': body.title},
+                         sort_keys=True).encode()).hexdigest()[:16],
+                     'status': 'running'})
+                del sess['meta']['attempts'][:-50]
+                write_json(sm.session_path(sid) / 'session.json', sess)
+            else:
+                attempt_id = None
             version = f'0.{len(p["revisions"]) + 1}.0'
             title = body.title or p['title']
             try:
                 res = sm.commit_session(sid, version=version, title=title)
             except (ValueError, FileNotFoundError) as exc:
+                if attempt_id:
+                    sess = sm.get_session(sid)
+                    for a in sess.setdefault('meta', {}).get('attempts', []):
+                        if a.get('attemptId') == attempt_id:
+                            a['status'] = 'failed'
+                            a['error'] = str(exc)[:200]
+                    write_json(sm.session_path(sid) / 'session.json', sess)
                 raise HTTPException(400, str(exc))
+            if attempt_id:
+                sess = sm.get_session(sid)
+                for a in sess.setdefault('meta', {}).get('attempts', []):
+                    if a.get('attemptId') == attempt_id:
+                        a['status'] = 'done'
+                        a['revision'] = res['revision']
+                write_json(sm.session_path(sid) / 'session.json', sess)
 
             p['revisions'].append(res['revision'])
             p['currentRevision'] = res['revision']['id']
@@ -685,7 +862,6 @@ def create_app(workspace: Path|None=None, transport=None):
         # revisable ScenePlan; no vector fragments are purchased yet.
         with lock:
             p = project(pid)
-            editable(p)
             if not (body or {}).get('confirm_paid'):
                 raise HTTPException(400, 'Confirm the paid provider request first: this sends the prompt to the AI provider and may incur charges.')
             if not provider.config()['configured']:
@@ -698,7 +874,8 @@ def create_app(workspace: Path|None=None, transport=None):
                                                      progress=tick)
             return {'session': session, 'usage': {'kind': 'scene-plan', 'at': now(), **usage}}
 
-        return start(pid, 'AI scene planning', run)
+        return run_idempotent(pid, sid, sm, 'plan', body, 'AI scene planning', run,
+                              on_cancel=lambda: sm.update_status(sid, 'draft_plan', meta={'canceledAt': now()}))
 
     @app.post('/api/projects/{pid}/generation/sessions/{sid}/plan-chat')
     def plan_chat_session_route(pid: str, sid: str, body: dict = {}):
@@ -707,7 +884,6 @@ def create_app(workspace: Path|None=None, transport=None):
         # mutation engine applies them. The full conversation is never resent.
         with lock:
             p = project(pid)
-            editable(p)
             body = body or {}
             if not body.get('confirm_paid'):
                 raise HTTPException(400, 'Confirm the paid provider request first: this sends your instruction and the current scene plan to the AI provider and may incur charges.')
@@ -723,7 +899,8 @@ def create_app(workspace: Path|None=None, transport=None):
             return {'session': session, 'summary': summary, 'applied': applied,
                     'usage': {'kind': 'plan-revision', 'at': now(), **usage}}
 
-        return start(pid, 'AI plan revision', run)
+        return run_idempotent(pid, sid, sm, 'plan-chat', body, 'AI plan revision', run,
+                              on_cancel=lambda: sm.update_status(sid, 'draft_plan', meta={'canceledAt': now()}))
 
     @app.get('/api/projects/{pid}/generation/sessions/{sid}/preview/{name}')
     def session_preview_route(pid: str, sid: str, name: str):
@@ -752,7 +929,6 @@ def create_app(workspace: Path|None=None, transport=None):
         # object, composed + compiled + QA'd inside the session workspace.
         with lock:
             p = project(pid)
-            editable(p)
             if not (body or {}).get('confirm_paid'):
                 raise HTTPException(400, 'Confirm the paid provider request first: this runs one AI call per planned object and may incur charges.')
             if not provider.config()['configured']:
@@ -763,7 +939,8 @@ def create_app(workspace: Path|None=None, transport=None):
             session, usage = sm.generate_session_master(sid, provider, progress=tick)
             return {'session': session, 'usage': {'at': now(), **usage}}
 
-        return start(pid, 'AI artwork synthesis', run)
+        return run_idempotent(pid, sid, sm, 'generate', body, 'AI artwork synthesis', run,
+                              on_cancel=lambda: sm.update_status(sid, 'draft_plan', meta={'canceledAt': now()}))
 
     @app.post('/api/projects/{pid}/generation/sessions/{sid}/regenerate-object')
     def regenerate_session_object_route(pid: str, sid: str, body: dict = {}):
@@ -771,7 +948,6 @@ def create_app(workspace: Path|None=None, transport=None):
         # preserved), recompile, QA — everything else keeps its geometry.
         with lock:
             p = project(pid)
-            editable(p)
             body = body or {}
             if not body.get('confirm_paid'):
                 raise HTTPException(400, 'Confirm the paid provider request first: this sends the object brief to the AI provider and may incur charges.')
@@ -788,7 +964,8 @@ def create_app(workspace: Path|None=None, transport=None):
                                                           progress=tick)
             return {'session': session, 'usage': {'at': now(), **usage}}
 
-        return start(pid, 'targeted object regeneration', run)
+        return run_idempotent(pid, sid, sm, 'regenerate-object', body, 'targeted object regeneration', run,
+                              on_cancel=lambda: sm.update_status(sid, 'draft_plan', meta={'canceledAt': now()}))
 
     @app.post('/api/projects/{pid}/generation/sessions/{sid}/reference-plan')
     async def reference_plan_session_route(pid: str, sid: str, file: UploadFile | None = File(None), body: str = Form('{}')):
@@ -798,7 +975,6 @@ def create_app(workspace: Path|None=None, transport=None):
         # is never traced.
         with lock:
             p = project(pid)
-            editable(p)
             req = json.loads(body or '{}')
             if not req.get('confirm_paid'):
                 raise HTTPException(400, 'Confirm the paid provider request first: this sends the image to the AI provider for vision analysis and may incur charges.')
@@ -806,23 +982,24 @@ def create_app(workspace: Path|None=None, transport=None):
                 raise HTTPException(503, 'AI not configured. Add OPENAI_API_KEY to .env. Upload-to-vector works without it.')
             sm = GenerationSessionManager(folder(pid), pid)
             sdir = sm.session_path(sid)
-            ref_path = sdir / 'reference-image'
-            if file is None:
-                stored = sdir / 'source.png'
-                if not stored.is_file():
-                    raise HTTPException(400, 'Upload the reference image first.')
-                # already clean_image-normalized PNG: use it verbatim
-                ref_path = sdir / 'reference-image.png'
-                ref_path.write_bytes(stored.read_bytes())
-            else:
+            # BOTH entry paths resolve through set_session_source so the
+            # analyzed image, meta.source hash and plan provenance always
+            # point at the SAME bytes (Task 31: an inline upload must not
+            # leave metadata pointing at the previous source).
+            if file is not None:
                 raw = await file.read(12 * 1024 * 1024 + 1)
                 if len(raw) >= 12 * 1024 * 1024:
                     raise HTTPException(400, 'Use a reference image under 12 MB.')
-                suffix = Path(file.filename or 'reference.jpg').suffix.lower()
-                if suffix not in ('.png', '.jpg', '.jpeg', '.webp'):
-                    suffix = '.jpg'
-                ref_path = ref_path.with_suffix(suffix)
-                ref_path.write_bytes(raw)
+                try:
+                    sm.set_session_source(sid, raw, file.filename or 'reference image')
+                except (ValueError, FileNotFoundError) as exc:
+                    raise HTTPException(400, str(exc))
+            stored = sdir / 'source.png'
+            if not stored.is_file():
+                raise HTTPException(400, 'Upload the reference image first.')
+            # already clean_image-normalized PNG: use it verbatim for vision
+            ref_path = sdir / 'reference-image.png'
+            ref_path.write_bytes(stored.read_bytes())
 
         def run(tick):
             session, usage = sm.plan_session_from_image(sid, provider, ref_path,
@@ -830,7 +1007,8 @@ def create_app(workspace: Path|None=None, transport=None):
                                                         progress=tick)
             return {'session': session, 'usage': {'kind': 'reference-scene-plan', 'at': now(), **usage}}
 
-        return start(pid, 'reference scene planning', run)
+        return run_idempotent(pid, sid, sm, 'reference-plan', req, 'reference scene planning', run,
+                              on_cancel=lambda: sm.update_status(sid, 'draft_plan', meta={'canceledAt': now()}))
 
     @app.post('/api/projects/{pid}/generation/sessions/{sid}/convert')
     async def convert_session_route(pid: str, sid: str, file: UploadFile | None = File(None), body: str = Form('{}')):
@@ -839,7 +1017,6 @@ def create_app(workspace: Path|None=None, transport=None):
         # semantics + deterministic CV run inside the session sandbox.
         with lock:
             p = project(pid)
-            editable(p)
             req = json.loads(body or '{}')
             if not req.get('confirm_paid'):
                 raise HTTPException(400, 'Confirm the paid provider request first: this sends the image to the AI provider for semantic decomposition and may incur charges.')
@@ -869,7 +1046,8 @@ def create_app(workspace: Path|None=None, transport=None):
                                                progress=tick)
             return {'session': session, 'usage': {'kind': 'image-convert', 'at': now()}}
 
-        return start(pid, 'image conversion', run)
+        return run_idempotent(pid, sid, sm, 'convert', req, 'image conversion', run,
+                              on_cancel=lambda: sm.update_status(sid, 'draft_plan', meta={'canceledAt': now()}))
 
     app.mount('/static',StaticFiles(directory=BASE/'web'),name='static')
     @app.get('/')
