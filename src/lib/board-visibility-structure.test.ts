@@ -50,6 +50,22 @@ describe("VectorBoard visibility integration (Task 32 review R2)", () => {
     expect(src).toContain("URL.revokeObjectURL(previous)");
   });
 
+  test("an EMPTY visible layer clears the cached image instead of keeping it (round-2 R2)", () => {
+    const build = src.slice(src.indexOf("private buildUnderpainting()"), src.indexOf("private publishUnderpaintLayer("));
+    // null body (empty layer) flows through the same publish path
+    expect(build).toMatch(/publishUnderpaintLayer\([\s\S]*?artBody\.length \? [\s\S]*?: null\)/);
+    expect(build).toMatch(/publishUnderpaintLayer\([\s\S]*?inkBody\.length \? [\s\S]*?: null\)/);
+    const publish = src.slice(src.indexOf("private publishUnderpaintLayer("), src.indexOf("private mountUnderpaintImage("));
+    expect(publish).toContain("group.replaceChildren()");
+    expect(publish).toContain("URL.revokeObjectURL(previous)");
+  });
+
+  test("a per-layer generation token invalidates in-flight image loads (round-2 R2)", () => {
+    expect(src).toContain("private underpaintGeneration = new Map<string, number>()");
+    const mount = src.slice(src.indexOf("private mountUnderpaintImage("), src.indexOf("  destroy()"));
+    expect(mount).toContain("this.underpaintGeneration.get(id) !== generation");
+  });
+
   test("the board wires its region map into the controller catalog", () => {
     expect(src).toContain("this.visibility.regionsSource = () => this.regions;");
     expect(src).toContain("this.visibility.setCatalog(bundle.objects?.objects ?? [])");

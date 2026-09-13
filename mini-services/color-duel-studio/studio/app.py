@@ -552,17 +552,31 @@ def create_app(workspace: Path|None=None, transport=None):
                 if sc.is_file():
                     try:sidecar=normalize_objects(read_json(sc))
                     except Exception:sidecar=None
+            # Review round 2, R3A: the rebuild compiles the CURRENT AUTHORING
+            # SNAPSHOT's master (layer reorders and pen edits live there), not
+            # the untouched original import — otherwise a visual reorder would
+            # silently revert on the next Build. The imported original itself
+            # is never overwritten.
+            snapshot=None
+            if p.get('currentRevision'):
+                ext='source-master.svg' if is_svg else 'source-master.png'
+                cand=folder(pid)/'revisions'/p['currentRevision']/ext
+                if cand.is_file(): snapshot=cand
+            master_path=snapshot or (folder(pid)/p['master']['file'])
+            base_provenance={'source':p['master']['source'],'sourceHash':p['master']['sha256'],
+                'rightsConfirmedByUser':p['master'].get('rightsConfirmed',False),'legalClearanceVerified':False}
+            if snapshot is not None:
+                base_provenance['sourceSnapshot']={'revision':p['currentRevision'],'file':snapshot.name,
+                    'note':'Rebuilt from the current authoring revision master, not the original import.'}
             if is_svg:
-                result=compile_svg_master(folder(pid)/p['master']['file'],folder(pid)/'revisions'/rev,
+                result=compile_svg_master(master_path,folder(pid)/'revisions'/rev,
                     artwork_id=pid,version=version,title=p['title'],settings=effective,
-                    provenance={'source':p['master']['source'],'sourceHash':p['master']['sha256'],
-                        'rightsConfirmedByUser':p['master'].get('rightsConfirmed',False),'legalClearanceVerified':False},
+                    provenance=base_provenance,
                     authoring_sidecar=sidecar,progress=tick)
             else:
-                result=compile_image(folder(pid)/p['master']['file'],folder(pid)/'revisions'/rev,
+                result=compile_image(master_path,folder(pid)/'revisions'/rev,
                     artwork_id=pid,version=version,title=p['title'],settings=effective,
-                    provenance={'source':p['master']['source'],'sourceHash':p['master']['sha256'],
-                        'rightsConfirmedByUser':p['master'].get('rightsConfirmed',False),'legalClearanceVerified':False},
+                    provenance=base_provenance,
                     authoring_sidecar=sidecar,progress=tick)
             reply={'revision':{'id':rev,'version':version,'createdAt':now(),'kind':'build','sourceHash':p['master']['sha256'],
                 'regionCount':result['manifest']['regionCount'],'qa':result['validation'],
@@ -1102,38 +1116,39 @@ def create_app(workspace: Path|None=None, transport=None):
             object_id = str(body.get('objectId') or '')
             if not object_id:
                 raise HTTPException(400, 'objectId is required.')
+            # Review round 2, R4: the AUTHORITATIVE lock context is the CURRENT
+            # revision only. Historical revisions sharing the session provenance
+            # preserve their own decisions but must not make an old locked state
+            # permanently authoritative over a later unlock.
+            current_rev = p.get('currentRevision')
             sm = GenerationSessionManager(folder(pid), pid)
 
         def run(tick):
-            # Task 32 review R4: the same lock must be enforced in the AUTHORING
-            # context. A committed revision whose provenance points at THIS
-            # session (manifest.generation.sessionId) carries inspector locks in
-            # its objects.json — enforce them here, before any provider call,
-            # so locking through /objects protects regeneration of that art.
-            rev_root = folder(pid) / 'revisions'
-            if rev_root.is_dir():
-                for rdir in sorted(rev_root.glob('rev-*')):
-                    mfile = rdir / 'artwork.json'
-                    if not mfile.is_file():
-                        continue
+            # Task 32 review R4: if the CURRENT revision is a committed
+            # generation of THIS session, enforce its objects.json lock here,
+            # before any provider call, so locking through /objects protects
+            # regeneration of that artwork (and unlocking re-enables it).
+            if current_rev:
+                rdir = folder(pid) / 'revisions' / current_rev
+                mfile = rdir / 'artwork.json'
+                if mfile.is_file():
                     try:
                         manifest = read_json(mfile)
                     except Exception:
-                        continue
-                    if (manifest.get('generation') or {}).get('sessionId') != sid:
-                        continue
-                    ofile = rdir / 'objects.json'
-                    if not ofile.is_file():
-                        continue
-                    try:
-                        records = normalize_objects(read_json(ofile)) or []
-                    except Exception:
-                        continue
-                    for rec in records:
-                        if rec['id'] == object_id and (rec.get('generation') or {}).get('locked'):
-                            raise ValueError(
-                                f'"{rec.get("name") or object_id}" is locked in the committed '
-                                'artwork. Unlock it in the Objects & Layers inspector before regenerating.')
+                        manifest = {}
+                    if (manifest.get('generation') or {}).get('sessionId') == sid:
+                        ofile = rdir / 'objects.json'
+                        records = []
+                        if ofile.is_file():
+                            try:
+                                records = normalize_objects(read_json(ofile)) or []
+                            except Exception:
+                                records = []
+                        for rec in records:
+                            if rec['id'] == object_id and (rec.get('generation') or {}).get('locked'):
+                                raise ValueError(
+                                    f'"{rec.get("name") or object_id}" is locked in the committed '
+                                    'artwork. Unlock it in the Objects & Layers inspector before regenerating.')
             session, usage = sm.regenerate_session_object(sid, provider, object_id,
                                                           instructions=str(body.get('instructions') or ''),
                                                           progress=tick)

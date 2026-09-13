@@ -11,6 +11,7 @@ export default tseslint.config(
     ignores: [
       "node_modules/**",
       "dist/**",
+      "tests/browser/dist/**",
       "dev.log",
       "mini-services/**",
       "examples/**",

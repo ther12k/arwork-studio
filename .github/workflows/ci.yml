@@ -48,5 +48,7 @@ jobs:
         run: bun run lint
       - name: Component recovery tests (Task 35B)
         run: bun run test
+      - name: VectorBoard browser gate (Task 32 review, real Chromium)
+        run: bun run browser:install && bun run test:browser
       - name: Static production build
         run: bun run build

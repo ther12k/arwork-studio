@@ -460,10 +460,11 @@ def test_smoke_8_authoring_metadata_survives_rebuild(studio):
     assert (blue.get('subdivision') or {}).get('detailWeight') == 2.5
 
 
-def test_smoke_9_layer_reorder_flips_overlap_in_preview(studio):
-    """Closing gate 1 (Front/Back on overlapping objects): send_to_back flips
-    the rendered overlap in the exported colored preview while the region
-    topology and QA stay valid."""
+def test_smoke_9_layer_reorder_flips_overlap_ownership(studio):
+    """Closing gate 1 (round 2): Front/Back on overlapping objects flips BOTH
+    the rendered pixels AND the gameplay ownership of the overlap — a hit at
+    (140,140) must answer for the new top object."""
+    from shapely.geometry import Polygon, Point
     c, _recorder = studio
     pid, rev = _svg_project(c)
 
@@ -471,9 +472,18 @@ def test_smoke_9_layer_reorder_flips_overlap_in_preview(studio):
         svg = c.get(f'/api/projects/{pid}/revisions/{rev_id}/files/colored.svg').text
         return svg.split('<g data-layer="paint">', 1)[1]
 
-    regions0 = c.get(f'/api/projects/{pid}/revisions/{rev}/files/regions.json').json()['regions']
+    def hit_owner(rev_id, x, y):
+        regions = c.get(f'/api/projects/{pid}/revisions/{rev_id}/files/regions.json').json()['regions']
+        for reg in regions:
+            rings = reg.get('rings') or []
+            if rings and Polygon(rings[0], rings[1:]).contains(Point(x, y)):
+                return reg
+        return None
+
     layer0 = paint_layer_of(rev)
     assert layer0.rfind('#3366CC') > layer0.rfind('#CC3333'), 'fixture: blue starts in front'
+    hit0 = hit_owner(rev, 140, 140)
+    assert hit0 is not None and hit0['objectId'] == 'obj-blue'
 
     r = c.post(f'/api/projects/{pid}/objects', headers=H, json={
         'base_revision': rev, 'object_id': 'obj-blue', 'order_action': 'send_to_back'})
@@ -483,7 +493,8 @@ def test_smoke_9_layer_reorder_flips_overlap_in_preview(studio):
     rev2 = p['currentRevision']
     layer2 = paint_layer_of(rev2)
     assert layer2.rfind('#CC3333') > layer2.rfind('#3366CC'), 'red must render on top after send_to_back'
-    regions2 = c.get(f'/api/projects/{pid}/revisions/{rev2}/files/regions.json').json()['regions']
-    assert {x['id'] for x in regions2} == {x['id'] for x in regions0}
+    hit2 = hit_owner(rev2, 140, 140)
+    assert hit2 is not None and hit2['objectId'] == 'obj-red', \
+        'the overlap region must now BELONG to red, not just render red'
     qa = c.get(f'/api/projects/{pid}/revisions/{rev2}/files/validation.json').json()
     assert qa['passed'] is True

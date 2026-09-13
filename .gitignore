@@ -20,6 +20,7 @@ node_modules
 # vite / production
 /dist/
 /build
+/tests/browser/dist/
 
 # misc
 .DS_Store
@@ -68,3 +69,7 @@ download/
 
 # exception: the env template is documentation and is tracked
 !mini-services/color-duel-studio/.env.example
+
+# playwright artifacts
+test-results/
+playwright-report/

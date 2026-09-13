@@ -634,6 +634,9 @@ export class VectorBoard {
   /** Active underpainting blob URL per layer id — revoked when the cached
    *  appearance is regenerated (visibility change) or on destroy. */
   private underpaintUrls = new Map<string, string>();
+  /** Per-layer cache generation: a monotonically increasing token that makes
+   *  in-flight image loads stale when visibility changed meanwhile. */
+  private underpaintGeneration = new Map<string, number>();
 
   constructor(svg: SVGSVGElement, bundle: Bundle, options: BoardOptions = {}) {
     if (!(svg instanceof SVGSVGElement)) throw new Error("Pass an <svg> element to VectorBoard");
@@ -1438,15 +1441,43 @@ export class VectorBoard {
     }
     // Ink layer (above the masks): open line art + closed ink shapes.
     const inkBody = paint.inkPaths.filter(shapeVisible).map((p) => serializeInkPath(p));
-    if (this.artLayer && artBody.length)
-      this.mountUnderpaintImage(this.artLayer, wrapStandaloneSvg(defs, artBody, bx, by, bw, bh), "underpaint-art");
-    if (this.inkLayer && inkBody.length)
-      this.mountUnderpaintImage(this.inkLayer, wrapStandaloneSvg(defs, inkBody, bx, by, bw, bh), "underpaint-ink");
+    // Task 32 review round-2 R2: an EMPTY visible body is a valid rendering
+    // result — the previously cached image must be CLEARED, not kept. Each
+    // layer carries a generation token so a stale image-load callback can
+    // never replace a newer visibility result (rapid toggles included).
+    if (this.artLayer)
+      this.publishUnderpaintLayer(this.artLayer, "underpaint-art",
+        artBody.length ? wrapStandaloneSvg(defs, artBody, bx, by, bw, bh) : null);
+    if (this.inkLayer)
+      this.publishUnderpaintLayer(this.inkLayer, "underpaint-ink",
+        inkBody.length ? wrapStandaloneSvg(defs, inkBody, bx, by, bw, bh) : null);
+  }
+
+  /** Publish one appearance layer: nonempty body → build the replacement
+   *  image; empty body → clear the cached layer (releasing its URL). The
+   *  generation token invalidates in-flight replacements. */
+  private publishUnderpaintLayer(group: SVGGElement, id: string, svgString: string | null) {
+    const generation = (this.underpaintGeneration.get(id) ?? 0) + 1;
+    this.underpaintGeneration.set(id, generation);
+    if (svgString !== null) {
+      this.mountUnderpaintImage(group, svgString, id, generation);
+      return;
+    }
+    // Empty layer: only clear DOM when the layer currently holds a cached
+    // image — otherwise the live path fallback is the active renderer and
+    // its per-shape classes already reflect visibility.
+    const previous = this.underpaintUrls.get(id);
+    if (previous !== undefined) {
+      this.blobUrls = this.blobUrls.filter((u) => u !== previous);
+      URL.revokeObjectURL(previous);
+      this.underpaintUrls.delete(id);
+      group.replaceChildren();
+    }
   }
 
   /** Load the serialized SVG via a blob URL, verify it decodes with an
    *  Image probe, and only then swap the live group children for the image. */
-  private mountUnderpaintImage(group: SVGGElement, svgString: string, id: string) {
+  private mountUnderpaintImage(group: SVGGElement, svgString: string, id: string, generation: number) {
     let url: string;
     try {
       url = URL.createObjectURL(new Blob([svgString], { type: "image/svg+xml" }));
@@ -1464,7 +1495,13 @@ export class VectorBoard {
     this.blobUrls.push(url);
     const probe = new Image();
     probe.onload = () => {
-      if (this.destroyed) return;
+      // The generation token makes this load stale if another visibility
+      // change was requested while the image was decoding.
+      if (this.destroyed || this.underpaintGeneration.get(id) !== generation) {
+        this.blobUrls = this.blobUrls.filter((u) => u !== url);
+        URL.revokeObjectURL(url);
+        return;
+      }
       const [bx, by, bw, bh] = this.base;
       const image = svgNode("image", {
         id: this.prefix + id,
@@ -1503,6 +1540,7 @@ export class VectorBoard {
     for (const url of this.blobUrls) URL.revokeObjectURL(url);
     this.blobUrls = [];
     this.underpaintUrls.clear();
+    this.underpaintGeneration.clear();
     this.pointers.clear();
   }
 }
