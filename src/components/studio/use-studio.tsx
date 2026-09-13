@@ -42,6 +42,7 @@ import {
   regenerateSessionObject as apiRegenerateSessionObject,
   updateSessionSettings as apiUpdateSessionSettings,
   uploadSessionSource as apiUploadSessionSource,
+  updateProjectObject as apiUpdateProjectObject,
   patchProject,
   promoteReference as promoteReferenceApi,
   recordPlaytest as apiRecordPlaytest,
@@ -57,9 +58,12 @@ import {
   type GenerateSource,
   type GenerationSessionFull,
   type ImageQuality,
+  type ObjectsFile,
+  type ObjectUpdateRequest,
   type PlaytestRecordBody,
   type Project,
   type Revision,
+  type SemanticObject,
   type SessionTier,
   type StudioConfig,
 } from "@/lib/studio-api";
@@ -239,6 +243,16 @@ export interface StudioApi {
   startPlacing: () => void;
   /** Select a single region by id, switch to the board view and zoom to it (QA drill-down). */
   inspectRegion: (id: string) => void;
+  // Task 32 — Semantic Object / Layer Inspector
+  selectedObjectId: string | null;
+  setSelectedObjectId: (id: string | null) => void;
+  hiddenObjectIds: Set<string>;
+  isolatedObjectId: string | null;
+  toggleHideObject: (id: string) => void;
+  toggleIsolateObject: (id: string) => void;
+  selectAllObjectRegions: (id: string) => void;
+  updateObject: (update: Omit<ObjectUpdateRequest, "base_revision">) => Promise<void>;
+  inspectObject: (id: string) => void;
   activateSelectedRevision: () => Promise<void>;
   submitReviewNote: (note: string) => Promise<void>;
   switchView: (next: StudioView) => void;
@@ -265,6 +279,11 @@ export function StudioProvider({ children }: { children: React.ReactNode }) {
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [placing, setPlacing] = useState(false);
   const [connectionError, setConnectionError] = useState(false);
+
+  // Task 32 — Semantic Object / Layer Inspector states
+  const [selectedObjectId, setSelectedObjectId] = useState<string | null>(null);
+  const [hiddenObjectIds, setHiddenObjectIds] = useState<Set<string>>(new Set());
+  const [isolatedObjectId, setIsolatedObjectId] = useState<string | null>(null);
 
   // editable fields
   const [titleInput, setTitleInput] = useState("New illustrated world");
@@ -603,6 +622,16 @@ export function StudioProvider({ children }: { children: React.ReactNode }) {
   useEffect(() => {
     applyBoardView();
   }, [view, bundle, applyBoardView]);
+
+  // Task 32 — sync semantic object highlighting to board
+  useEffect(() => {
+    boardRef.current?.setHighlightedObject(selectedObjectId);
+  }, [selectedObjectId, bundle]);
+
+  // Task 32 — sync hidden/isolated objects to board
+  useEffect(() => {
+    boardRef.current?.setHiddenObjects(hiddenObjectIds, isolatedObjectId);
+  }, [hiddenObjectIds, isolatedObjectId, bundle]);
 
   // auto-scroll chat messages
   useEffect(() => {
@@ -1415,6 +1444,61 @@ export function StudioProvider({ children }: { children: React.ReactNode }) {
     [highlightSelection]
   );
 
+  // Task 32 — Semantic Object / Layer Inspector actions
+  const toggleHideObject = useCallback((id: string) => {
+    setHiddenObjectIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  }, []);
+
+  const toggleIsolateObject = useCallback((id: string) => {
+    setIsolatedObjectId((prev) => (prev === id ? null : id));
+  }, []);
+
+  const selectAllObjectRegions = useCallback(
+    (id: string) => {
+      const b = bundleRef.current;
+      if (!b) return;
+      const matching = b.geometry.regions.filter((r) => r.objectId === id).map((r) => r.id);
+      if (!matching.length) {
+        toast("No gameplay regions belong to this object.");
+        return;
+      }
+      setSelected(new Set(matching));
+      selectedRef.current = new Set(matching);
+      highlightSelection();
+      toast(`Selected ${matching.length} region(s) for "${id}".`);
+    },
+    [highlightSelection]
+  );
+
+  const updateObject = useCallback(
+    async (update: Omit<ObjectUpdateRequest, "base_revision">) => {
+      const p = projectRef.current;
+      if (!p || !p.currentRevision) throw new Error("No active revision to update.");
+      await job(() =>
+        apiUpdateProjectObject(p.id, {
+          ...update,
+          base_revision: p.currentRevision!,
+        })
+      );
+    },
+    [job]
+  );
+
+  const inspectObject = useCallback((id: string) => {
+    setSelectedObjectId(id);
+    const b = bundleRef.current;
+    if (!b) return;
+    const matching = b.geometry.regions.filter((r) => r.objectId === id);
+    if (matching.length > 0) {
+      boardRef.current?.focusRegion(matching[0].id);
+    }
+  }, []);
+
   const activateSelectedRevision = useCallback(async () => {
     const p = projectRef.current;
     if (!p) throw new Error("Create a project first.");
@@ -1575,6 +1659,15 @@ export function StudioProvider({ children }: { children: React.ReactNode }) {
     clearSelection,
     startPlacing,
     inspectRegion,
+    selectedObjectId,
+    setSelectedObjectId,
+    hiddenObjectIds,
+    isolatedObjectId,
+    toggleHideObject,
+    toggleIsolateObject,
+    selectAllObjectRegions,
+    updateObject,
+    inspectObject,
     activateSelectedRevision,
     submitReviewNote,
     switchView,

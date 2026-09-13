@@ -35,6 +35,7 @@ import { Switch } from "@/components/ui/switch";
 import { exportUrl, renderUrl, type DifficultyProfile, type ImageQuality } from "@/lib/studio-api";
 import { useStudioContext } from "./use-studio";
 import { ReviewDialog } from "./review-dialog";
+import { ObjectInspector } from "./object-inspector";
 import {
   DIFFICULTY_TIERS as TIERS,
   PlaytestValidatedBadge,
@@ -57,6 +58,20 @@ function flattenToleranceLine(derivation: string): string | null {
 function regionIdsIn(text: string): string[] {
   const ids = text.match(/\br-[A-Za-z0-9_-]{4,}\b/g);
   return ids ? [...new Set(ids)] : [];
+}
+
+/** Detect if a QA warning references semantic objects or unassigned geometry (Task 32). */
+function objectActionIn(text: string): { objectId?: string; isUnassigned?: boolean } | null {
+  if (/\bunassigned\b/i.test(text) || /have no object/i.test(text)) {
+    return { isUnassigned: true };
+  }
+  const match =
+    /\bObject\s+([a-z][a-z0-9_-]{0,63})\b/i.exec(text) ||
+    /\bmissing object record\s+([a-z][a-z0-9_-]{0,63})\b/i.exec(text);
+  if (match) {
+    return { objectId: match[1] };
+  }
+  return null;
 }
 
 /** "#RRGGBB" only — the backend recolor route rejects anything else. */
@@ -376,6 +391,7 @@ export function RightPanel() {
     startPlacing,
     clearSelection,
     inspectRegion,
+    inspectObject,
     runEdit,
     build,
     activateSelectedRevision,
@@ -715,6 +731,45 @@ export function RightPanel() {
               <ul className="studio-scroll mt-1.5 max-h-40 space-y-1 overflow-y-auto pr-1">
                 {qa.warnings.map((w, i) => {
                   const ids = regionIdsIn(w);
+                  const objAction = objectActionIn(w);
+                  if (objAction?.objectId) {
+                    return (
+                      <li key={i}>
+                        <Button
+                          variant="ghost"
+                          className="h-auto w-full justify-start gap-1.5 whitespace-normal rounded-md px-1.5 py-1 text-left text-[10px] font-normal leading-relaxed text-[#087f74] hover:bg-[#e5f3ed]"
+                          onClick={() => inspectObject(objAction.objectId!)}
+                          aria-label={`Inspect object ${objAction.objectId}`}
+                          title={`Focus object ${objAction.objectId} in layer inspector`}
+                        >
+                          <Layers className="mt-0.5 size-3 shrink-0" aria-hidden />
+                          <span className="min-w-0 break-words">{w}</span>
+                        </Button>
+                      </li>
+                    );
+                  }
+                  if (objAction?.isUnassigned) {
+                    return (
+                      <li key={i}>
+                        <Button
+                          variant="ghost"
+                          className="h-auto w-full justify-start gap-1.5 whitespace-normal rounded-md px-1.5 py-1 text-left text-[10px] font-normal leading-relaxed text-amber-800 hover:bg-[#ece6d5]"
+                          onClick={() => {
+                            if (!bundle) return;
+                            const unassigned = bundle.geometry.regions
+                              .filter((r) => !r.objectId || r.objectId === "unassigned")
+                              .map((r) => r.id);
+                            if (unassigned.length > 0) inspectRegion(unassigned[0]);
+                          }}
+                          aria-label="Select unassigned regions"
+                          title="Select unassigned regions on canvas"
+                        >
+                          <AlertTriangle className="mt-0.5 size-3 shrink-0 text-amber-600" aria-hidden />
+                          <span className="min-w-0 break-words">{w}</span>
+                        </Button>
+                      </li>
+                    );
+                  }
                   if (!ids.length) {
                     // Not actionable (no region drill-down) — plain warning line.
                     return (
@@ -756,6 +811,9 @@ export function RightPanel() {
       {bundle && project?.currentRevision && (
         <OptimizeCard currentTierKey={normalizeDifficulty(bundle.manifest.difficulty)?.tier.key ?? null} />
       )}
+
+      {/* Task 32 — Semantic Object & Layer inspector */}
+      {bundle && project?.currentRevision && <ObjectInspector />}
 
       {/* Region inspector */}
       {view === "inspect" && bundle && (

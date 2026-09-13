@@ -196,7 +196,11 @@ class _Context:
             ctx.object_ref = obj[:64]
             nm = (merged.get('data-cd-name') or '').strip()
             ctx.object_name = nm[:80] or None
-            ctx.object_parent = self.object_ref if self.object_ref and self.object_ref != obj else self.object_parent
+            explicit_parent = (merged.get('data-cd-parent') or '').strip()
+            if explicit_parent:
+                ctx.object_parent = explicit_parent[:64]
+            else:
+                ctx.object_parent = self.object_ref if self.object_ref and self.object_ref != obj else self.object_parent
         else:
             ctx.object_ref = self.object_ref
             ctx.object_name = self.object_name
@@ -769,6 +773,9 @@ def emit_master_svg(doc: MasterDoc) -> str:
         name = next((t.get('objectName') for t in run if t.get('objectName')), None)
         if name:
             gattrs['data-cd-name'] = name
+        parent = next((t.get('objectParent') for t in run if t.get('objectParent')), None)
+        if parent:
+            gattrs['data-cd-parent'] = parent
         gnode = ET.SubElement(root, 'g', gattrs)
         for t in run:
             shape_node(gnode, t)

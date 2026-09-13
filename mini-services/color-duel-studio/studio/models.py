@@ -124,3 +124,19 @@ class CommitSessionRequest(StrictModel):
     title: str | None = Field(None, max_length=100)
     idempotency_key: str = Field('', max_length=80)
 
+class ObjectUpdateRequest(StrictModel):
+    """Task 32 — Semantic Object / Layer inspector update request: rename,
+    reparent, lock, adjust subdivision detail priority, or reorder layers
+    in an existing committed revision."""
+    base_revision: str
+    object_id: str = Field(..., min_length=1, max_length=64)
+    name: str | None = Field(None, min_length=1, max_length=80)
+    parent_id: str | None = Field(None, max_length=64)
+    locked: bool | None = None
+    detail_weight: float | None = Field(None, ge=0.01, le=20.0)
+    min_regions: int | None = Field(None, ge=0, le=5000)
+    preferred_regions: int | None = Field(None, ge=0, le=5000)
+    max_regions: int | None = Field(None, ge=0, le=5000)
+    order_action: Literal['bring_to_front', 'send_to_back', 'above', 'below'] | None = None
+    target_object_id: str | None = Field(None, max_length=64)
+

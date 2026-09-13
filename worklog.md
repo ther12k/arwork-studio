@@ -1765,3 +1765,37 @@ Work Log:
 
 Stage Summary:
 - Every item from the final review round is closed with a regression test: the smoke matrix and the three browser-level recovery scenarios now run on every push. The frontend identity layer is simpler than the review found it — one synchronous setter owns ref + localStorage, one restore effect owns reload, the terminal effect owns matching-clear — and the lint errors are fixed at the root (declaration order), not suppressed. Remaining known limit: the two historical CI-only API timing flakes stay diagnosable via their enriched assertion payloads; watch them in this run.
+
+---
+Task ID: 32
+Agent: main (ZCode)
+Task: Task 32 — Semantic Object & Layer Inspector: hierarchy tree, selection highlighting, lock, detail priority, layer ordering, temporary hide/isolate, and QA orphan navigation.
+
+Work Log:
+- Backend `ObjectUpdateRequest` model (`studio/models.py`): validated request model covering object rename, reparenting (`parent_id`), lock toggle (`locked`), detail priority (`detail_weight`, `min_regions`, `preferred_regions`, `max_regions`), and layer ordering (`bring_to_front`, `send_to_back`, `above`, `below` with `target_object_id`).
+- Backend object editing engine (`studio/pipeline.py` - `edit_objects_bundle`): loads revision bundle, validates object existence, applies rename (1..80 chars), reparent with circular dependency and self-parent detection, lock flag toggle on generation block, detail priority updates on subdivision metadata (without modifying visual paint bytes), and layer reordering in `objects.json`. Emits new immutable revision with QA validation and `kind: 'object_update'`.
+- SVG Master parent attribute preservation (`studio/svg_master.py`): updated `clean_svg` and `emit_master_svg` to preserve `data-cd-parent` on `<g data-cd-object>` nodes across the upload sanitation roundtrip, and updated `_Context.child` to inherit explicit or enclosing parent references.
+- Backend API route (`studio/app.py`): `POST /api/projects/{pid}/objects` checks base_revision lock (stale revision returns 409) and runs `edit_objects_bundle` asynchronously via `start()`.
+- Frontend types & board integration (`src/lib/studio-api.ts`, `src/lib/detailed-board.ts`, `src/globals.css`):
+  - Added `SemanticObject`, `ObjectsFile`, `ObjectUpdateRequest` types and `updateProjectObject` API client.
+  - `loadBundle` fetches `objects.json` through the gateway (tolerating 404 for legacy bundles without semantic objects).
+  - `VectorBoard` sets `data-shape-id` on art/ink paths and `data-object-id` on region paths; added `setHighlightedObject` for active inspection and `setHiddenObjects` for instant in-memory isolate/hide.
+  - Added `.object-highlight-region`, `.object-highlight-shape`, and `.object-hidden` CSS rules.
+- Studio state & actions (`src/components/studio/use-studio.tsx`):
+  - State: `selectedObjectId`, `hiddenObjectIds`, `isolatedObjectId`.
+  - Actions: `setSelectedObjectId`, `toggleHideObject`, `toggleIsolateObject`, `selectAllObjectRegions`, `updateObject`, `inspectObject`.
+  - Synced board highlighting and visibility to active object state via `useEffect`.
+- Object Inspector UI component (`src/components/studio/object-inspector.tsx`):
+  - Hierarchical tree view showing nested parent-child relationships, expand/collapse, region/shape counts, lock icon, hide/isolate buttons.
+  - Selected object details card: inline rename, parent object selector (with cycle prevention disabling self and descendants), layer order controls (Front, Up, Down, Back), detail priority preset buttons (Low 0.5x, Medium 1.0x, High 2.0x, Focal 4.0x), lock switch against AI regeneration, "Select All Regions" CTA, and AI targeted regeneration (honors lock state).
+  - Graceful empty state when revision contains no semantic objects.
+- Right panel integration & QA navigation (`src/components/studio/right-panel.tsx`):
+  - Rendered `<ObjectInspector />` above the Region Inspector.
+  - Added `objectActionIn` helper to parse QA warnings: object references render as clickable buttons focusing that object in the inspector (`inspectObject`), and unassigned region warnings navigate to canvas selection.
+- Verification tests:
+  - Backend (`tests/test_api.py`): 7 new/updated tests for rename, reparent with cycle check, detail weight paint preservation, lock & order actions, stale 409 guard, and targeted regen refusal on locked object. Full backend suite passes (161 passed).
+  - Frontend (`src/components/studio/object-inspector.test.tsx`): 8 vitest unit tests covering tree hierarchy rendering, selection details, select-all CTA, detail priority preset click, lock toggle, locked regen disable, hide/isolate UI state toggles, and empty state. Full frontend suite passes (11 passed across 2 test files).
+  - Gates: `bunx tsc --noEmit` clean, `eslint .` clean, `vite build` clean, release archive packaging clean.
+
+Stage Summary:
+- Task 32 completes the artist-facing Semantic Object & Layer Inspector: artists can inspect the scene hierarchy, rename and reparent objects, lock objects to prevent AI regeneration, tune detail priority weights for auto-subdivision without touching artwork pixels, reorder layers, and temporarily isolate or hide objects directly on the board.

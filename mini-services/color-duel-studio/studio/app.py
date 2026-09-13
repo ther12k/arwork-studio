@@ -13,7 +13,7 @@ from fastapi.staticfiles import StaticFiles
 from .models import *
 from . import STUDIO_VERSION
 from .pipeline import (BACKENDS, clean_image, compile_image, compile_svg_master,
-                        difficulty_profile, edit_bundle, read_json, write_json, make_export,
+                        difficulty_profile, edit_bundle, edit_objects_bundle, read_json, write_json, make_export,
                         load_bundle, validate_bundle, legacy_geometry, checksum)
 from .svg_master import clean_svg
 from .ai import Provider
@@ -571,6 +571,24 @@ def create_app(workspace: Path|None=None, transport=None):
                 'sourceHash':p['master']['sha256'],'regionCount':result['manifest']['regionCount'],'qa':result['validation'],
                 'manifestUrl':f'/api/projects/{pid}/revisions/{rev}/files/artwork.json'}}
         return start(pid,'region edit',run)
+    @app.post('/api/projects/{pid}/objects')
+    def update_object_route(pid:str,body:ObjectUpdateRequest):
+        """Task 32 — Update semantic object metadata or layer order in a revision."""
+        with lock:
+            p=project(pid)
+        if p['currentRevision']!=body.base_revision:
+            raise HTTPException(409,'Revision changed. Reload before updating objects.')
+        src=revision_dir(pid,body.base_revision)
+        rev='rev-'+ident()
+        version=f'0.{len(p["revisions"])+1}.0'
+        def run(tick):
+            tick(.2,f'Applying object updates for "{body.object_id}"')
+            result=edit_objects_bundle(src,folder(pid)/'revisions'/rev,body,version)
+            return {'revision':{'id':rev,'version':version,'createdAt':now(),'kind':'object_update',
+                'sourceHash':p['master']['sha256'] if p.get('master') else '',
+                'regionCount':result['manifest']['regionCount'],'qa':result['validation'],
+                'manifestUrl':f'/api/projects/{pid}/revisions/{rev}/files/artwork.json'}}
+        return start(pid,'object update',run)
     @app.post('/api/projects/{pid}/optimize')
     def optimize(pid:str,body:OptimizeRequest):
         """Task 27 — Optimize Difficulty: reshape the gameplay layer of the

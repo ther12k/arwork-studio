@@ -2850,3 +2850,257 @@ def test_checkpoint_survives_across_era_generation(tmp_path, monkeypatch):
             'sky must come from this era checkpoint'
         assert calls_per_bbox[(0, 380)] == calls_before_retry.get((0, 380)), \
             'house must come from this era checkpoint'
+
+
+# ---------------------------------------------------------------------------
+# Task 32 — Semantic Object / Layer Inspector: rename, reparent, lock,
+# detail priority, layer order, cycle check, paint preservation
+# ---------------------------------------------------------------------------
+
+TASK32_SVG = b'''<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 300 300">
+<g data-cd-object="obj-sky" data-cd-name="Sky">
+  <rect x="0" y="0" width="300" height="150" fill="#3366AA"/>
+</g>
+<g data-cd-object="obj-ground" data-cd-name="Ground">
+  <rect x="0" y="150" width="300" height="150" fill="#44AA66"/>
+  <g data-cd-object="obj-flower" data-cd-name="Flower">
+    <circle cx="100" cy="200" r="20" fill="#DD3333"/>
+  </g>
+</g>
+</svg>'''
+
+
+def _task32_project(client):
+    pid = new(client)
+    r = client.post(f'/api/projects/{pid}/upload-svg', headers=H,
+                    files={'file': ('scene.svg', TASK32_SVG, 'image/svg+xml')},
+                    data={'rights_confirmed': 'true'})
+    assert r.status_code == 200, r.text
+    r = client.post(f'/api/projects/{pid}/build', headers=H, json={
+        'target_regions': 40, 'palette_colors': 4, 'paint_colors': 16, 'max_edge': 300,
+        'min_region_pixels': 4, 'min_label_radius': 1.0, 'auto_subdivide': False})
+    assert r.status_code == 200, r.text
+    p = wait(client, pid, timeout=120)
+    assert p['job']['status'] == 'done', p['job']
+    rev = p['currentRevision']
+    assert rev
+    return pid, rev
+
+
+def test_object_rename_creates_revision_and_preserves_ids(client):
+    """Task 32: rename creates a new immutable revision, updates name in objects.json,
+    leaves object IDs and shapeIds unchanged."""
+    pid, rev = _task32_project(client)
+    base_rev = f'/api/projects/{pid}/revisions/{rev}'
+    objs0 = client.get(f'{base_rev}/files/objects.json').json()['objects']
+    flower0 = next(o for o in objs0 if o['id'] == 'obj-flower')
+    assert flower0['name'] == 'Flower'
+
+    r = client.post(f'/api/projects/{pid}/objects', headers=H, json={
+        'base_revision': rev,
+        'object_id': 'obj-flower',
+        'name': 'Crimson Rose'
+    })
+    assert r.status_code == 200, r.text
+    p = wait(client, pid, timeout=60)
+    assert p['job']['status'] == 'done'
+    rev2 = p['currentRevision']
+    assert rev2 != rev
+
+    objs1 = client.get(f'/api/projects/{pid}/revisions/{rev2}/files/objects.json').json()['objects']
+    flower1 = next(o for o in objs1 if o['id'] == 'obj-flower')
+    assert flower1['name'] == 'Crimson Rose'
+    assert flower1['id'] == 'obj-flower', 'ID must remain stable'
+    assert flower1.get('shapeIds') == flower0.get('shapeIds'), 'shapeIds must remain stable'
+
+    # source revision remains immutable
+    objs0_check = client.get(f'{base_rev}/files/objects.json').json()['objects']
+    assert next(o for o in objs0_check if o['id'] == 'obj-flower')['name'] == 'Flower'
+
+
+def test_object_reparent_and_cycle_check(client):
+    """Task 32: reparenting updates parentId, supports detaching to top-level,
+    and rejects cycles and self-parenting with 400."""
+    pid, rev = _task32_project(client)
+    objs = client.get(f'/api/projects/{pid}/revisions/{rev}/files/objects.json').json()['objects']
+    flower = next(o for o in objs if o['id'] == 'obj-flower')
+    assert flower.get('parentId') == 'obj-ground'
+
+    # 1. Reparent flower to sky
+    r = client.post(f'/api/projects/{pid}/objects', headers=H, json={
+        'base_revision': rev,
+        'object_id': 'obj-flower',
+        'parent_id': 'obj-sky'
+    })
+    assert r.status_code == 200
+    p = wait(client, pid)
+    rev2 = p['currentRevision']
+    objs2 = client.get(f'/api/projects/{pid}/revisions/{rev2}/files/objects.json').json()['objects']
+    assert next(o for o in objs2 if o['id'] == 'obj-flower')['parentId'] == 'obj-sky'
+
+    # 2. Detach to top-level with empty string
+    r = client.post(f'/api/projects/{pid}/objects', headers=H, json={
+        'base_revision': rev2,
+        'object_id': 'obj-flower',
+        'parent_id': ''
+    })
+    assert r.status_code == 200
+    p = wait(client, pid)
+    rev3 = p['currentRevision']
+    objs3 = client.get(f'/api/projects/{pid}/revisions/{rev3}/files/objects.json').json()['objects']
+    assert 'parentId' not in next(o for o in objs3 if o['id'] == 'obj-flower')
+
+    # 3. Self-parenting rejected
+    r = client.post(f'/api/projects/{pid}/objects', headers=H, json={
+        'base_revision': rev3,
+        'object_id': 'obj-sky',
+        'parent_id': 'obj-sky'
+    })
+    assert r.status_code == 200 # accepted by job, job fails with validation error
+    p = wait(client, pid)
+    assert p['job']['status'] == 'failed'
+    assert 'cannot be its own parent' in p['job']['message']
+
+    # 4. Circular dependency rejected (sky -> ground -> flower -> sky)
+    # First make sky child of ground
+    r = client.post(f'/api/projects/{pid}/objects', headers=H, json={
+        'base_revision': rev3,
+        'object_id': 'obj-sky',
+        'parent_id': 'obj-ground'
+    })
+    p = wait(client, pid)
+    rev4 = p['currentRevision']
+    # Now try to make ground child of sky
+    r = client.post(f'/api/projects/{pid}/objects', headers=H, json={
+        'base_revision': rev4,
+        'object_id': 'obj-ground',
+        'parent_id': 'obj-sky'
+    })
+    p = wait(client, pid)
+    assert p['job']['status'] == 'failed'
+    assert 'circular' in p['job']['message']
+
+
+def test_object_detail_weight_updates_subdivision_metadata_not_paint(client):
+    """Task 32: detail priority updates subdivision metadata (detailWeight, min/preferred/max regions)
+    without touching visual paint.json bytes."""
+    pid, rev = _task32_project(client)
+    paint0 = hashlib.sha256(
+        client.get(f'/api/projects/{pid}/revisions/{rev}/files/paint.json').content).hexdigest()
+
+    r = client.post(f'/api/projects/{pid}/objects', headers=H, json={
+        'base_revision': rev,
+        'object_id': 'obj-flower',
+        'detail_weight': 3.5,
+        'min_regions': 5,
+        'preferred_regions': 12,
+        'max_regions': 20
+    })
+    assert r.status_code == 200
+    p = wait(client, pid)
+    assert p['job']['status'] == 'done'
+    rev2 = p['currentRevision']
+
+    # paint bytes byte-identical
+    paint1 = hashlib.sha256(
+        client.get(f'/api/projects/{pid}/revisions/{rev2}/files/paint.json').content).hexdigest()
+    assert paint1 == paint0, 'detail priority update must not change paint.json'
+
+    # subdivision metadata updated
+    objs = client.get(f'/api/projects/{pid}/revisions/{rev2}/files/objects.json').json()['objects']
+    flower = next(o for o in objs if o['id'] == 'obj-flower')
+    sub = flower.get('subdivision') or {}
+    assert sub.get('detailWeight') == 3.5
+    assert sub.get('minRegions') == 5
+    assert sub.get('preferredRegions') == 12
+    assert sub.get('maxRegions') == 20
+
+
+def test_object_lock_and_order_actions(client):
+    """Task 32: lock state toggles in objects.json, and order actions
+    (bring_to_front / send_to_back) reorder the object list."""
+    pid, rev = _task32_project(client)
+
+    # 1. Lock object
+    r = client.post(f'/api/projects/{pid}/objects', headers=H, json={
+        'base_revision': rev,
+        'object_id': 'obj-flower',
+        'locked': True
+    })
+    p = wait(client, pid)
+    assert p['job']['status'] == 'done'
+    rev2 = p['currentRevision']
+    objs2 = client.get(f'/api/projects/{pid}/revisions/{rev2}/files/objects.json').json()['objects']
+    flower = next(o for o in objs2 if o['id'] == 'obj-flower')
+    assert flower.get('generation', {}).get('locked') is True
+
+    # 2. Reorder: send flower to back (start of objects list)
+    r = client.post(f'/api/projects/{pid}/objects', headers=H, json={
+        'base_revision': rev2,
+        'object_id': 'obj-flower',
+        'order_action': 'send_to_back'
+    })
+    p = wait(client, pid)
+    assert p['job']['status'] == 'done'
+    rev3 = p['currentRevision']
+    objs3 = client.get(f'/api/projects/{pid}/revisions/{rev3}/files/objects.json').json()['objects']
+    assert objs3[0]['id'] == 'obj-flower'
+
+    # 3. Reorder: bring flower to front (end of objects list)
+    r = client.post(f'/api/projects/{pid}/objects', headers=H, json={
+        'base_revision': rev3,
+        'object_id': 'obj-flower',
+        'order_action': 'bring_to_front'
+    })
+    p = wait(client, pid)
+    assert p['job']['status'] == 'done'
+    rev4 = p['currentRevision']
+    objs4 = client.get(f'/api/projects/{pid}/revisions/{rev4}/files/objects.json').json()['objects']
+    assert objs4[-1]['id'] == 'obj-flower'
+
+
+def test_object_update_stale_revision_returns_409(client):
+    """Task 32: stale base revision is rejected with 409."""
+    pid, rev = _task32_project(client)
+    # first update succeeds
+    r = client.post(f'/api/projects/{pid}/objects', headers=H, json={
+        'base_revision': rev,
+        'object_id': 'obj-flower',
+        'name': 'First Name'
+    })
+    p = wait(client, pid)
+    assert p['job']['status'] == 'done'
+
+    # second update with STALE base_revision -> 409
+    r = client.post(f'/api/projects/{pid}/objects', headers=H, json={
+        'base_revision': rev,
+        'object_id': 'obj-flower',
+        'name': 'Stale Name'
+    })
+    assert r.status_code == 409
+    assert 'Revision changed' in r.json()['detail']
+
+
+def test_locked_object_refuses_targeted_regeneration(tmp_path, monkeypatch):
+    """Task 32: lock state prevents targeted AI regeneration."""
+    monkeypatch.setenv('OPENAI_API_KEY', 'fake-key')
+    with TestClient(create_app(tmp_path, transport=_task29_transport([]))) as c:
+        pid = new(c)
+        sid = _plan_and_generate(c, pid, [])
+        base = f'/api/projects/{pid}/generation/sessions/{sid}'
+
+        # Lock the house object via mutate
+        r = c.post(f'{base}/mutate', headers=H, json={
+            'mutations': [{'op': 'update_object', 'objectId': 'obj-house',
+                           'changes': {'generation': {'locked': True}}}]
+        })
+        assert r.status_code == 200
+
+        # Attempt targeted regeneration on the locked object -> refused
+        r = c.post(f'{base}/regenerate-object', headers=H, json={
+            'confirm_paid': True,
+            'objectId': 'obj-house'
+        })
+        p = wait(c, pid)
+        assert p['job']['status'] == 'failed'
+        assert 'is locked' in p['job']['message']

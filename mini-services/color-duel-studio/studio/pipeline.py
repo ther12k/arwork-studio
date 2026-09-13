@@ -3383,6 +3383,104 @@ def edit_bundle(source: Path, output: Path, request, version: str):
     return {'manifest': m, 'validation': qa}
 
 
+def edit_objects_bundle(source: Path, output: Path, request, version: str) -> dict:
+    """Task 32 — Semantic Object / Layer inspector edit engine.
+
+    Applies metadata edits (rename, reparent, lock/unlock, subdivision detail
+    priority) or layer reordering to objects.json in an existing revision.
+    Artwork paint paths and shapeIds are preserved byte-identical unless an
+    order action explicitly reorganizes visual layers.
+    Emits a new immutable revision with full validation and QA reporting.
+    """
+    bundle = load_bundle(source)
+    m = bundle['manifest']
+    g = bundle['geometry']
+    objects = bundle.get('objects') or []
+    if not objects:
+        raise ValueError('This revision contains no semantic objects to inspect or edit.')
+
+    target = next((o for o in objects if o['id'] == request.object_id), None)
+    if not target:
+        raise ValueError(f'Object "{request.object_id}" was not found in this revision.')
+
+    # 1. Rename
+    if request.name is not None:
+        clean_name = request.name.strip()
+        if not clean_name:
+            raise ValueError('Object name cannot be empty.')
+        target['name'] = clean_name[:80]
+
+    # 2. Reparent (with cycle check)
+    if request.parent_id is not None:
+        pid = request.parent_id.strip()
+        if not pid:
+            target.pop('parentId', None)
+        else:
+            if pid == request.object_id:
+                raise ValueError(f'Object "{request.object_id}" cannot be its own parent.')
+            if not any(o['id'] == pid for o in objects):
+                raise ValueError(f'Parent object "{pid}" does not exist.')
+            # Cycle detection: walk ancestry from pid
+            curr = pid
+            visited = {request.object_id}
+            while curr:
+                if curr in visited:
+                    raise ValueError(f'Reparenting creates a circular parent-child dependency ({request.object_id} <-> {pid}).')
+                visited.add(curr)
+                parent_obj = next((o for o in objects if o['id'] == curr), None)
+                curr = parent_obj.get('parentId') if parent_obj else None
+            target['parentId'] = pid
+
+    # 3. Lock state
+    if request.locked is not None:
+        gen = target.setdefault('generation', {})
+        gen['locked'] = bool(request.locked)
+
+    # 4. Detail priority (subdivision metadata - does not touch visual paint)
+    sub = target.setdefault('subdivision', {})
+    if request.detail_weight is not None:
+        sub['detailWeight'] = round(float(request.detail_weight), 3)
+    if request.min_regions is not None:
+        sub['minRegions'] = max(0, int(request.min_regions))
+    if request.preferred_regions is not None:
+        sub['preferredRegions'] = max(0, int(request.preferred_regions))
+    if request.max_regions is not None:
+        sub['maxRegions'] = max(0, int(request.max_regions))
+
+    # 5. Layer ordering
+    if request.order_action:
+        idx = next(i for i, o in enumerate(objects) if o['id'] == request.object_id)
+        popped = objects.pop(idx)
+        if request.order_action == 'bring_to_front':
+            objects.append(popped)
+        elif request.order_action == 'send_to_back':
+            objects.insert(0, popped)
+        elif request.order_action in ('above', 'below'):
+            if not request.target_object_id:
+                raise ValueError('target_object_id is required for above/below reordering.')
+            t_idx = next((i for i, o in enumerate(objects) if o['id'] == request.target_object_id), None)
+            if t_idx is None:
+                raise ValueError(f'Target object "{request.target_object_id}" not found.')
+            insert_at = t_idx + 1 if request.order_action == 'above' else t_idx
+            objects.insert(insert_at, popped)
+
+    # Re-normalize and update bundle
+    bundle['objects'] = normalize_objects({'objects': objects})
+    m['version'] = version
+    g['artworkVersion'] = version
+    m.pop('review', None)
+    m.setdefault('provenance', {})['lastEdit'] = 'object_update'
+
+    output.mkdir(parents=True, exist_ok=True)
+    master_name = m['assets'].get('sourceMaster', 'source-master.png')
+    for f in {master_name, 'build-settings.json', 'source-master.svg'}:
+        if (source / f).is_file():
+            shutil.copy2(source / f, output / f)
+
+    qa = emit_bundle(output, bundle)
+    return {'manifest': m, 'validation': qa}
+
+
 def validate_runtime_contract(bundle: dict) -> list:
     """Mirror of the shipped game adapter's validateBundle (shared contract).
 

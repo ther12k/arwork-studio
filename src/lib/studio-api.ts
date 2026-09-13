@@ -283,6 +283,56 @@ export interface EditPayload {
   z_behind?: boolean;
 }
 
+export interface SemanticObjectSubdivision {
+  detailWeight?: number;
+  minRegions?: number;
+  preferredRegions?: number;
+  maxRegions?: number;
+  preserveSilhouette?: boolean;
+}
+
+export interface SemanticObjectGeneration {
+  locked?: boolean;
+  prompt?: string;
+  provider?: string;
+  [key: string]: unknown;
+}
+
+export interface SemanticObject {
+  id: string;
+  name: string;
+  type?: string;
+  role?: string;
+  parentId?: string;
+  shapeIds?: string[];
+  subdivision?: SemanticObjectSubdivision;
+  generation?: SemanticObjectGeneration;
+}
+
+export interface ObjectsFile {
+  schemaVersion: number;
+  objects: SemanticObject[];
+}
+
+export interface ObjectUpdateRequest {
+  base_revision: string;
+  object_id: string;
+  name?: string;
+  parent_id?: string;
+  locked?: boolean;
+  detail_weight?: number;
+  min_regions?: number;
+  preferred_regions?: number;
+  max_regions?: number;
+  order_action?: "bring_to_front" | "send_to_back" | "above" | "below";
+  target_object_id?: string;
+}
+
+export const updateProjectObject = (
+  pid: string,
+  update: ObjectUpdateRequest
+): Promise<{ jobId: string }> => post(`/projects/${pid}/objects`, update);
+
 /** Difficulty metrics from the compiler analyzer (contract §5).
  *  Numbers unless noted; labelClearance and paletteAmbiguity are enums
  *  expressed as strings. Extra keys are tolerated for forward compat. */

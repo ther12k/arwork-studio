@@ -178,6 +178,22 @@
   stroke-width: 2 !important;
 }
 
+/* semantic object highlight in inspector (Task 32) */
+.object-highlight-region {
+  stroke: #0284c7 !important;
+  stroke-width: 2.2 !important;
+}
+
+.object-highlight-shape {
+  outline: 2px solid #0284c7 !important;
+  outline-offset: 1px;
+}
+
+/* temporarily hidden / isolated objects in editor (Task 32) */
+.object-hidden {
+  display: none !important;
+}
+
 /* slim custom scrollbars for chat / palette / QA lists */
 .studio-scroll {
   scrollbar-width: thin;

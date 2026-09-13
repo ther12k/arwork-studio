@@ -18,7 +18,7 @@
  *    is applied once at gesture end (see bindGestures).
  */
 
-import type { DifficultyProfile } from "./studio-api";
+import type { DifficultyProfile, ObjectsFile } from "./studio-api";
 
 const NS = "http://www.w3.org/2000/svg";
 let sequence = 0;
@@ -268,6 +268,7 @@ export interface Bundle {
   geometry: Geometry;
   palette: PaletteEntry[];
   paint: PaintLayer | null;
+  objects?: ObjectsFile | null;
 }
 
 // ---------------------------------------------------------------------------
@@ -372,17 +373,20 @@ async function fetchJson<T>(url: string): Promise<T> {
   return res.json() as Promise<T>;
 }
 
-/** Fetch + validate the four bundle files for a revision, through the gateway. */
+/** Fetch + validate the bundle files for a revision, through the gateway. */
 export async function loadBundle(pid: string, rev: string): Promise<Bundle> {
   const base = `/api/projects/${pid}/revisions/${rev}/files/`;
   const q = "?XTransformPort=8765";
-  const [manifest, geometry, palette, paint] = await Promise.all([
+  const [manifest, geometry, palette, paint, objects] = await Promise.all([
     fetchJson<Manifest>(base + "artwork.json" + q),
     fetchJson<Geometry>(base + "regions.json" + q),
     fetchJson<PaletteEntry[]>(base + "palette.json" + q),
     fetchJson<PaintLayer | null>(base + "paint.json" + q),
+    fetchJson<ObjectsFile | null>(base + "objects.json" + q).catch(() => null),
   ]);
-  return validateBundle({ manifest, geometry, palette, paint });
+  const bundle = validateBundle({ manifest, geometry, palette, paint });
+  bundle.objects = objects;
+  return bundle;
 }
 
 // ---------------------------------------------------------------------------
@@ -609,6 +613,7 @@ export class VectorBoard {
         if (p.filled === false || (p.strokeWidth != null && !p.fill.startsWith("#"))) continue;
         const gradientFill = p.fill.startsWith("url(#");
         const attrs: Attrs = { d: p.d, fill: p.fill, "fill-rule": p.fillRule ?? "evenodd" };
+        if (p.shapeId) attrs["data-shape-id"] = p.shapeId;
         if (!gradientFill) {
           attrs.stroke = p.stroke ?? p.fill;
           attrs["stroke-width"] = p.strokeWidth ?? 0.55;
@@ -640,6 +645,7 @@ export class VectorBoard {
         id: this.prefix + r.id,
         "data-region-id": r.id,
         "data-palette-id": r.paletteId,
+        "data-object-id": r.objectId || "",
         d: r.d,
         tabindex: 0,
         role: "button",
@@ -662,13 +668,16 @@ export class VectorBoard {
       const ink = svgNode("g", { "data-layer": "ink", "pointer-events": "none" }) as SVGGElement;
       for (const p of this.bundle.paint.inkPaths) {
         if (p.strokeWidth != null || p.filled === false) {
-          ink.append(svgNode("path", {
+          const inkAttrs: Attrs = {
             d: p.d, fill: "none", stroke: p.fill,
             "stroke-width": p.strokeWidth ?? 1.5,
             "stroke-linecap": "round", "stroke-linejoin": "round",
-          }));
+          };
+          if (p.shapeId) inkAttrs["data-shape-id"] = p.shapeId;
+          ink.append(svgNode("path", inkAttrs));
         } else {
           const attrs: Attrs = { d: p.d, fill: p.fill, "fill-rule": p.fillRule ?? "evenodd" };
+          if (p.shapeId) attrs["data-shape-id"] = p.shapeId;
           if (p.opacity != null && p.opacity < 0.999) attrs.opacity = p.opacity;
           if (p.fillOpacity != null && p.fillOpacity < 0.999) attrs["fill-opacity"] = p.fillOpacity;
           ink.append(svgNode("path", attrs));
@@ -969,6 +978,59 @@ export class VectorBoard {
     ]);
     this.elements.get(id)?.focus({ preventScroll: true });
     return id;
+  }
+
+  /** Task 32: Highlight all regions and visual shapes belonging to a semantic object. */
+  setHighlightedObject(objectId: string | null) {
+    for (const [id, el] of this.elements) {
+      const reg = this.regions.get(id);
+      el.classList.toggle("object-highlight-region", !!objectId && reg?.objectId === objectId);
+    }
+    const root = this.svg;
+    const ownedShapes = new Set(
+      objectId && this.bundle.objects
+        ? this.bundle.objects.objects.find((o) => o.id === objectId)?.shapeIds || []
+        : []
+    );
+    const paths = root.querySelectorAll<SVGPathElement>("[data-shape-id]");
+    paths.forEach((p) => {
+      const sid = p.getAttribute("data-shape-id");
+      p.classList.toggle("object-highlight-shape", !!sid && ownedShapes.has(sid));
+    });
+  }
+
+  /** Task 32: Temporarily hide or isolate objects in editor view (in-memory DOM state). */
+  setHiddenObjects(hiddenIds: Set<string>, isolatedId: string | null) {
+    const isHidden = (oid?: string) => {
+      if (!oid) return false;
+      if (isolatedId) return oid !== isolatedId;
+      return hiddenIds.has(oid);
+    };
+
+    for (const [id, el] of this.elements) {
+      const reg = this.regions.get(id);
+      const hidden = isHidden(reg?.objectId);
+      el.classList.toggle("object-hidden", hidden);
+      const label = this.labels.get(id);
+      if (label) {
+        if (hidden) label.style.display = "none";
+        else this.updateLabelVisibility();
+      }
+    }
+
+    const hiddenShapes = new Set<string>();
+    if (this.bundle.objects) {
+      for (const obj of this.bundle.objects.objects) {
+        if (isHidden(obj.id)) {
+          for (const sid of obj.shapeIds || []) hiddenShapes.add(sid);
+        }
+      }
+    }
+    const paths = this.svg.querySelectorAll<SVGPathElement>("[data-shape-id]");
+    paths.forEach((p) => {
+      const sid = p.getAttribute("data-shape-id");
+      p.classList.toggle("object-hidden", !!sid && hiddenShapes.has(sid));
+    });
   }
 
   private bindGestures() {
