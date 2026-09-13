@@ -19,7 +19,8 @@ image-aware *draft* regions, not semantic object detection.
 """
 from __future__ import annotations
 
-import hashlib, json, math, random, shutil, zipfile
+import hashlib
+import uuid, json, math, random, shutil, zipfile
 from collections import defaultdict
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
@@ -91,14 +92,18 @@ BACKENDS = [
 
 
 def write_json(path: Path, value) -> None:
-    # Atomic publish (tmp + rename): concurrent readers — polling HTTP
-    # requests during a running job — must never observe a half-written
-    # session/project file (a truncated read surfaces as a spurious 400
-    # 'Expecting value' JSON error).
+    # Atomic publish with a UNIQUE temporary per write: concurrent readers —
+    # polling HTTP requests during a running job — must never observe a
+    # half-written file, and concurrent WRITERS must never clobber each
+    # other's temporary (a shared fixed '.tmp' name lets writer B's write
+    # invalidate writer A's rename with FileNotFoundError).
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + '.tmp')
-    tmp.write_text(json.dumps(value, ensure_ascii=False, separators=(',', ':'), allow_nan=False), encoding='utf-8')
-    tmp.replace(path)
+    tmp = path.with_name(f'{path.name}.{uuid.uuid4().hex}.tmp')
+    try:
+        tmp.write_text(json.dumps(value, ensure_ascii=False, separators=(',', ':'), allow_nan=False), encoding='utf-8')
+        tmp.replace(path)
+    finally:
+        tmp.unlink(missing_ok=True)
 
 
 def read_json(path: Path):

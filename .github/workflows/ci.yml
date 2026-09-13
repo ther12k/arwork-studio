@@ -25,7 +25,7 @@ jobs:
           cache: pip
       - run: pip install -r requirements.txt
       - name: Test suite
-        run: python -m pytest tests/test_pipeline.py tests/test_api.py tests/test_game_adapter.py -q
+        run: python -m pytest tests -q
       - name: Release archive hygiene
         run: |
           python scripts/package_release.py
@@ -46,5 +46,7 @@ jobs:
         run: bunx tsc --noEmit
       - name: Lint
         run: bun run lint
+      - name: Component recovery tests (Task 35B)
+        run: bun run test
       - name: Static production build
         run: bun run build

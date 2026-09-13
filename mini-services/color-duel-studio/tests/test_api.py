@@ -1128,10 +1128,11 @@ def test_convert_optimization_report_and_metadata(client, monkeypatch):
 # Task 27 — Optimize Difficulty revision action
 # ---------------------------------------------------------------------------
 
-def test_optimize_creates_revision_with_artwork_frozen(client):
-    """Downward hop on a dense board: Optimize to Easy creates a NEW immutable
-    revision — gameplay merged down, paint bytes identical, objects.shapeIds
-    identical, report persisted in manifest and project, source untouched."""
+def _optimize_dense_fixture(client):
+    """Build a dense board and Optimize it to Easy; assert the new immutable
+    revision froze the artwork layer (paint bytes, objects.shapeIds, source)
+    while gameplay merged down, with the report persisted in manifest and
+    project. Shared by the create-revision and no-op optimize tests."""
     pid = new(client)
     r = client.post(f'/api/projects/{pid}/upload-svg', headers=H,
                     files={'file': ('m.svg', SMALL_SVG, 'image/svg+xml')}, data={'rights_confirmed': 'true'})
@@ -1189,11 +1190,18 @@ def test_optimize_creates_revision_with_artwork_frozen(client):
     return pid, rev2
 
 
+def test_optimize_creates_revision_with_artwork_frozen(client):
+    """Downward hop on a dense board creates a NEW immutable revision with the
+    artwork layer byte-identical (full assertions in the shared fixture)."""
+    pid, rev2 = _optimize_dense_fixture(client)
+    assert client.get(f'/api/projects/{pid}/revisions/{rev2}/files/validation.json').json()['passed'] is True
+
+
 def test_optimize_noop_does_not_create_revision(client):
     """Optimizing a revision that already sits in the requested tier band is
     an honest no-op: report returned, NO duplicate revision created. A stale
     base revision is rejected like the edit route."""
-    pid, rev_easy = test_optimize_creates_revision_with_artwork_frozen(client)
+    pid, rev_easy = _optimize_dense_fixture(client)
     p0 = client.get(f'/api/projects/{pid}').json()
     n0 = len(p0['revisions'])
     r = client.post(f'/api/projects/{pid}/optimize', headers=H,

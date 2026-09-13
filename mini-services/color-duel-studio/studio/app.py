@@ -1,5 +1,5 @@
 from __future__ import annotations
-import io,json,os,re,shutil,threading,uuid,hashlib
+import io,json,os,re,shutil,sys,threading,uuid,hashlib
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
@@ -127,7 +127,28 @@ def create_app(workspace: Path|None=None, transport=None):
                 if detail: p['job'].update(detail)
                 save(p)
         def work():
-            outcome=('failed',None,None)
+            # Task 31 review: the attempt finalization (on_terminal) runs in
+            # the SAME critical section that publishes the job's terminal
+            # status. The global lock also serializes admission, so no new
+            # operation can be admitted while a terminal record is still being
+            # written — attempt and job can never disagree, and terminal
+            # persistence failures are not swallowed silently.
+            def finish(outcome, error=None, result=None):
+                if on_terminal:
+                    try:
+                        on_terminal(outcome, error, result)
+                    except Exception as term_exc:
+                        # Honest failure signal: the job is already published,
+                        # so this must not change the outcome — but it is NOT
+                        # silently swallowed either.
+                        print(f'[studio] terminal finalization failed for job {jid} '
+                              f'({outcome}): {term_exc}', file=sys.stderr)
+                        try:
+                            (root / pid / 'job-terminal-error.json').write_text(json.dumps(
+                                {'jobId': jid, 'outcome': outcome, 'error': str(term_exc)[:400],
+                                 'at': now()}), encoding='utf-8')
+                        except Exception:
+                            pass
             try:
                 tick(.01,'Starting '+kind)
                 result=fn(tick)
@@ -153,7 +174,7 @@ def create_app(workspace: Path|None=None, transport=None):
                     if result.get('consumePending'):
                         p.pop('pendingBuildSettings',None)
                     p['job'].update(status='done',progress=1,message='Ready',finishedAt=now());save(p)
-                    outcome=('done',None,result)
+                    finish('done',None,result)
             except JobCanceled:
                 # on_cancel runs BEFORE status='canceled' is published so the
                 # session's draft state settles before any waiting caller or
@@ -167,16 +188,13 @@ def create_app(workspace: Path|None=None, transport=None):
                         message='Cancellation requested. No further generation steps will start.',
                         finishedAt=now())
                     p['job'].pop('cancelRequested',None)
-                    outcome=('canceled',None,None)
                     save(p)
+                    finish('canceled')
             except Exception as exc:
                 with lock:
                     p=project(pid);p['job'].update(status='failed',message=str(exc)[:700],finishedAt=now())
-                    outcome=('failed',str(exc)[:200],None)
                     save(p)
-            if on_terminal:
-                try: on_terminal(outcome[0],outcome[1],outcome[2])
-                except Exception: pass
+                    finish('failed',str(exc)[:200])
         pool.submit(work)
 
     def start(pid,kind,fn,on_cancel=None,sid=None):

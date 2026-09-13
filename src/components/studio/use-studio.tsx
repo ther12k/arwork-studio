@@ -337,6 +337,57 @@ export function StudioProvider({ children }: { children: React.ReactNode }) {
   const appliedPendingPbsRef = useRef<string>("");
   const configRef = useRef<StudioConfig | null>(null);
 
+  // ------------------------------------- pending operation identity (Task 31)
+
+  /** Task 31 review fix — TWO distinct pieces of state:
+   *  - requestInFlight: transient guard, true only while the HTTP request
+   *    itself is on the wire.
+   *  - pendingOperation: the operation identity (operation, sessionId, key)
+   *    kept while the OUTCOME is unknown. A lost response does NOT clear it:
+   *    resending the same logical action reuses the SAME key, so the backend
+   *    replays the existing attempt instead of buying new work. It clears
+   *    only when a terminal outcome is observed (via polling) or the session
+   *    is discarded. The record is written to localStorage SYNCHRONOUSLY
+   *    inside setPendingOp (no render flush in between) so the key is durable
+   *    the moment it is adopted — a crash or reload right after the click
+   *    still replays with the same identity. */
+  const requestInFlightRef = useRef(false);
+  const PENDING_OP_KEY = "cd-pending-operation";
+  type PendingOp = { operation: string; sessionId: string; key: string;
+    /** jobId attached after the request is accepted — the terminal effect
+     *  clears the pending identity only when THIS job settles, never for an
+     *  unrelated job that finished while the operation was unresolved. */
+    jobId?: string };
+  const pendingOpRef = useRef<PendingOp | null>(null);
+  const pendingCommitRef = useRef<{ sessionId: string; key: string } | null>(null);
+
+  // Stable callback (only ever invoked from event handlers / effects): it
+  // mutates the ref synchronously — the identity must be reliable within the
+  // same tick.
+  const setPendingOp = useCallback((op: PendingOp | null) => {
+    pendingOpRef.current = op;
+    try {
+      if (op) localStorage.setItem(PENDING_OP_KEY, JSON.stringify(op));
+      else localStorage.removeItem(PENDING_OP_KEY);
+    } catch {
+      /* storage unavailable — in-memory identity still guards this tab */
+    }
+  }, []);
+
+  // Restore a pending operation after a page reload: the outcome is unknown,
+  // so the next explicit action for the same session reuses the same key.
+  useEffect(() => {
+    try {
+      const raw = localStorage.getItem(PENDING_OP_KEY);
+      if (raw) {
+        const op = JSON.parse(raw) as PendingOp;
+        if (op?.key && op?.sessionId) setPendingOp(op);
+      }
+    } catch {
+      /* corrupted record — ignore */
+    }
+  }, []);
+
   // DOM refs
   const svgRef = useRef<SVGSVGElement | null>(null);
   const canvasRef = useRef<HTMLDivElement | null>(null);
@@ -637,6 +688,11 @@ export function StudioProvider({ children }: { children: React.ReactNode }) {
         }
         if (isBusyProject(next)) {
           pollTimerRef.current = setTimeout(() => void pollRef.current(pid), 900);
+        } else if (pendingOpRef.current) {
+          // Task 31: an unresolved operation identity needs its matching job's
+          // terminal outcome to clear itself — keep polling (gentler cadence)
+          // until that job settles, even though THIS project is idle.
+          pollTimerRef.current = setTimeout(() => void pollRef.current(pid), 2500);
         } else if (next.job?.status === "failed") {
           toast(next.job.message || "Job failed");
         }
@@ -649,6 +705,11 @@ export function StudioProvider({ children }: { children: React.ReactNode }) {
   useEffect(() => {
     pollRef.current = poll;
   }, [poll]);
+  // Task 31: an unmounted studio must not leave poll timers firing — stale
+  // pollers would keep hitting getProject and corrupt the next test/run.
+  useEffect(() => () => {
+    if (pollTimerRef.current) clearTimeout(pollTimerRef.current);
+  }, []);
 
   const job = useCallback(
     async (post: () => Promise<{ jobId: string }>) => {
@@ -1006,46 +1067,6 @@ export function StudioProvider({ children }: { children: React.ReactNode }) {
 
   // --------------------------------------------- session steps (Task 29/31)
 
-  /** Task 31 review fix — TWO distinct pieces of state:
-   *  - requestInFlight: transient guard, true only while the HTTP request
-   *    itself is on the wire.
-   *  - pendingOperation: the operation identity (operation, sessionId, key)
-   *    kept while the OUTCOME is unknown. A lost response does NOT clear it:
-   *    resending the same logical action reuses the SAME key, so the backend
-   *    replays the existing attempt instead of buying new work. It clears
-   *    only when a terminal outcome is observed (via polling) or the session
-   *    is discarded. The record is mirrored to localStorage so a page reload
-   *    can still replay with the same identity. */
-  const requestInFlightRef = useRef(false);
-  const PENDING_OP_KEY = "cd-pending-operation";
-  type PendingOp = { operation: string; sessionId: string; key: string };
-  const pendingOpRef = useRef<PendingOp | null>(null);
-  const pendingCommitRef = useRef<{ sessionId: string; key: string } | null>(null);
-
-  const setPendingOp = useCallback((op: PendingOp | null) => {
-    pendingOpRef.current = op;
-    try {
-      if (op) localStorage.setItem(PENDING_OP_KEY, JSON.stringify(op));
-      else localStorage.removeItem(PENDING_OP_KEY);
-    } catch {
-      /* storage unavailable — in-memory identity still guards this tab */
-    }
-  }, []);
-
-  // Restore a pending operation after a page reload: the outcome is unknown,
-  // so the next explicit action for the same session reuses the same key.
-  useEffect(() => {
-    try {
-      const raw = localStorage.getItem(PENDING_OP_KEY);
-      if (raw) {
-        const op = JSON.parse(raw) as PendingOp;
-        if (op?.key && op?.sessionId) pendingOpRef.current = op;
-      }
-    } catch {
-      /* corrupted record — ignore */
-    }
-  }, []);
-
   /** Fire one session step (paid gates live server-side) as an async job. */
   const runSessionStep = useCallback(
     async (operation: string, step: (key: string) => Promise<{ jobId: string }>) => {
@@ -1065,8 +1086,16 @@ export function StudioProvider({ children }: { children: React.ReactNode }) {
       requestInFlightRef.current = true;
       try {
         await job(() => step(key));
-        // The request was ACCEPTED (queued). The terminal outcome arrives via
-        // polling; the post-job effect clears the pending identity then.
+        // The request was ACCEPTED (queued). Attach the allocated jobId to
+        // the pending record so the terminal effect clears it only when THIS
+        // job settles — not when an unrelated job finished meanwhile.
+        const jid = projectRef.current?.job?.id;
+        const pendingNow = pendingOpRef.current;
+        if (jid && pendingNow && pendingNow.key === key) {
+          setPendingOp({ ...pendingNow, jobId: jid });
+        }
+        // The terminal outcome arrives via polling; the post-job effect
+        // clears the pending identity then.
       } catch (err) {
         // A DEFINITE server rejection (our own API 4xx) means the work was
         // never admitted — drop the identity so the next confirm is a fresh
@@ -1213,7 +1242,11 @@ export function StudioProvider({ children }: { children: React.ReactNode }) {
     if (!terminal) return;
     if (lastRefreshedJobRef.current === jobId) return;
     lastRefreshedJobRef.current = jobId;
-    if (pendingOpRef.current) setPendingOp(null);
+    // Clear the pending identity only when the SETTLING job is the one the
+    // pending record belongs to; an unrelated job finishing meanwhile must
+    // not resolve someone else's unresolved operation.
+    const pending = pendingOpRef.current;
+    if (pending && (!pending.jobId || pending.jobId === jobId)) setPendingOp(null);
     if (projectRef.current && activeSession) void refreshSessions(projectRef.current.id);
   }, [jobId, jobStatus, activeSession, refreshSessions, setPendingOp]);
 

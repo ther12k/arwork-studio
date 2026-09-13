@@ -1747,3 +1747,21 @@ Work Log:
 
 Stage Summary:
 - The reviewer's challenge was correct: HTTP tests prove the server, not the hook. The frontend now provably retains operation identity across a lost response (both for generation steps and commit), cancel carries the targeted jobId, and every terminal state refreshes recovery without a manual reload. The smoke suite stands as the acceptance layer and will catch exactly the class of drift the reviewer called out. Remaining honest note: two CI-only timing flakes in the API tests now carry full diagnostic payloads; they pass consistently locally and are the first thing to watch in the next CI run.
+
+---
+Task ID: 35-closing
+Agent: main (ZCode)
+Task: Task-31/35 closing round — smoke suite promoted into CI, unique tmp writes, single-owner terminal publication moved inside the lock, deterministic cancel smoke split, and Task 35B browser-level recovery tests (the three reviewer-prioritized scenarios) wired into CI.
+
+Work Log:
+- CI now runs the WHOLE backend `tests/` directory (`python -m pytest tests -q`): the smoke suite is part of every CI run — collection shows 155 tests incl. the 8 smoke rows. The frontend job gains a `bun run test` (vitest) step so 35B is a standing gate, not a local-only proof.
+- write_json publishes through a UNIQUE tmp file (`{name}.{uuid4}.tmp`) with finally-cleanup: two concurrent writers can no longer clobber each other's tmp or leave a truncated target (closes the reviewer's two-writer probe).
+- Terminal publication has ONE owner INSIDE the lock: launch()'s finish() helper invokes on_terminal in the same critical section that publishes the job's terminal status. Persistence failures are no longer swallowed — they are written to `job-terminal-error.json` for diagnosis.
+- Smoke 4 split per review: 4a cancels BEFORE the first fragment finishes (threading.Event barrier holds the provider response until the cancel is stored — deterministic 'canceled' + draft_plan reset); 4b cancels AFTER the job finished and asserts the honest no-op (job stays done, no state change).
+- Task 35B (use-studio.recovery.test.tsx, vitest + RTL + jsdom, real StudioProvider with studio-api/detailed-board mocked at the module boundary): (1) lost generate response → the explicit retry REUSES the same idempotency key (identity survives unknown outcome); (2) known-failed generate (ApiError) → retry uses a NEW key and the pending identity is dropped; (3) an UNRELATED job-B terminal does NOT clear the pending identity while the MATCHING job-A terminal does (jobId-targeted resolution).
+- Hardening found BY 35B: the pending-operation record is now written to localStorage SYNCHRONOUSLY inside setPendingOp (ref + storage in one tick, no render flush) — replacing the state-mirror effect, which the test proved racy AND which left a crash window between click and re-render. Restore-after-reload routes through the same setter. Declarations moved above the poll callback that reads the ref (also the root cause of the react-hooks/immutability lint errors — no suppressions).
+- Honest note: waitActiveSession originally polled a FROZEN early context snapshot whose activeSession could never change; on this machine that race lost consistently (tests hang 10s then fail). It now polls the live captured context and returns only once the session list resolved — 3/3 consecutive green runs. The optimize API tests were restructured onto a shared _optimize_dense_fixture helper (also kills the PytestReturnNotNoneWarning); both call sites re-run green.
+- Suite at commit time: full backend suite 155 passed incl. smoke (run before the test_api fixture refactor; the two optimize tests re-ran 2/2 after; CI re-runs everything). Frontend: tsc / eslint / vitest 3 passed / vite build green.
+
+Stage Summary:
+- Every item from the final review round is closed with a regression test: the smoke matrix and the three browser-level recovery scenarios now run on every push. The frontend identity layer is simpler than the review found it — one synchronous setter owns ref + localStorage, one restore effect owns reload, the terminal effect owns matching-clear — and the lint errors are fixed at the root (declaration order), not suppressed. Remaining known limit: the two historical CI-only API timing flakes stay diagnosable via their enriched assertion payloads; watch them in this run.

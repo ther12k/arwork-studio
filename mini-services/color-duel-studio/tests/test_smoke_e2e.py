@@ -198,48 +198,96 @@ def test_smoke_3_commit_response_lost_same_revision(studio):
 #           reload anywhere — the project poll reflects every stage.
 # ---------------------------------------------------------------------------
 
-def test_smoke_4_cancel_then_continue(studio):
-    c, recorder = studio
-    pid = _new_project(c)
-    sid = _create_session(c, pid)
-    base = f'/api/projects/{pid}/generation/sessions/{sid}'
-    c.post(f'{base}/plan', headers=H, json={'confirm_paid': True, 'idempotency_key': 's4-plan'})
-    _wait(c, pid)
-    r = c.post(f'{base}/generate', headers=H,
-               json={'confirm_paid': True, 'idempotency_key': 's4-gen'})
-    job_id = r.json()['jobId']
-    # cancel targeted at the LIVE job id. The cancel may land before the
-    # worker's first tick (fast compose) — in that rare race the cooperative
-    # flag still wins and the job ends canceled; but if the whole generation
-    # slipped through first, the terminal was honestly 'done'. Both are
-    # accepted; the fragment-level cancel test asserts the canceled path.
-    c.post(f'/api/projects/{pid}/job/cancel', headers=H, json={'jobId': job_id})
-    p = _wait(c, pid)
-    if p['job']['status'] == 'done':
-        # worker outraced the cancel: verify resumable state directly
-        sess = c.get(base).json()
-        assert sess['status'] == 'ready_to_commit'
-    else:
-        assert p['job']['status'] == 'canceled'
+def test_smoke_4a_cancel_before_finish_is_deterministic(tmp_path, monkeypatch):
+    """Deterministic cancel-before-finish: the provider holds the FIRST
+    fragment response until the cancel has been stored — no timing race.
+    Job ends 'canceled', session returns to draft_plan, retry completes."""
+    import threading
+    monkeypatch.setenv('OPENAI_API_KEY', 'fake-key')
+    recorder = []
+    first_svg_seen = threading.Event()
+    release_first_svg = threading.Event()
+
+    def respond(req):
+        recorder.append({'path': req.url.path})
+        if req.url.path.endswith('/json'):
+            objects = [
+                {'name': 'sky', 'description': 'blue sky', 'z': 0,
+                 'bbox': [0, 0, 576, 300], 'shapes': 10, 'fills': ['#91CCDD']},
+                {'name': 'house', 'description': 'yellow house', 'z': 1,
+                 'bbox': [0, 380, 288, 388], 'shapes': 14, 'fills': ['#EBC681']},
+                {'name': 'grass', 'description': 'green field', 'z': 2,
+                 'bbox': [288, 380, 288, 388], 'shapes': 10, 'fills': ['#41A582']},
+            ]
+            return httpx.Response(200, json={'output': [{'content': [{'type': 'output_text',
+                'text': json.dumps({'objects': objects})}]}], 'usage': {'input_tokens': 120}})
+        if req.url.path.endswith('/svg'):
+            body = json.loads(req.content)
+            import re as _re
+            m = _re.search(r'viewBox="(\d+) (\d+) (\d+) (\d+)"', body.get('instructions', ''))
+            bx, by, bw, bh = (int(v) for v in m.groups()) if m else (0, 0, 100, 100)
+            if not first_svg_seen.is_set():
+                # HOLD the response until the cancel request has been stored:
+                # the provider work is provably in flight when cancel arrives.
+                first_svg_seen.set()
+                release_first_svg.wait(timeout=30)
+            pad = max(4, min(bw, bh) // 8)
+            svg = (f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="{bx} {by} {bw} {bh}">'
+                   f'<rect x="{bx+pad}" y="{by+pad}" width="{bw-2*pad}" height="{bh-2*pad}" fill="#3366AA"/></svg>')
+            return httpx.Response(200, json={'output': [{'content': [{'type': 'output_text', 'text': svg}]}],
+                                             'usage': {'input_tokens': 10}})
+        return httpx.Response(404, json={'error': {'code': 'no_route'}})
+
+    with TestClient(create_app(tmp_path, transport=httpx.MockTransport(respond))) as c:
+        pid = _new_project(c)
+        sid = _create_session(c, pid)
+        base = f'/api/projects/{pid}/generation/sessions/{sid}'
+        c.post(f'{base}/plan', headers=H, json={'confirm_paid': True, 'idempotency_key': 's4a-plan'})
+        _wait(c, pid)
+        r = c.post(f'{base}/generate', headers=H,
+                   json={'confirm_paid': True, 'idempotency_key': 's4a-gen'})
+        job_id = r.json()['jobId']
+        # deterministically wait for provider work to be IN FLIGHT, then cancel
+        assert first_svg_seen.wait(timeout=15), 'provider work never started'
+        c.post(f'/api/projects/{pid}/job/cancel', headers=H, json={'jobId': job_id})
+        release_first_svg.set()
+        p = _wait(c, pid)
+        assert p['job']['status'] == 'canceled', p['job']
         assert p['job']['message'] == 'Cancellation requested. No further generation steps will start.'
         sess = c.get(base).json()
         assert sess['status'] == 'draft_plan'
-    sess = c.get(base).json()
-    assert sess['status'] == 'draft_plan'
-    # continue with a new key: completes without any reload (skipped when the
-    # first generation already finished before the cancel landed)
-    if p['job']['status'] != 'done':
+        # retry with a new key completes (checkpointed fragments may be reused)
         r = c.post(f'{base}/generate', headers=H,
-                   json={'confirm_paid': True, 'idempotency_key': 's4-gen-retry'})
+                   json={'confirm_paid': True, 'idempotency_key': 's4a-retry'})
         assert r.status_code == 200
         p = _wait(c, pid)
         assert p['job']['status'] == 'done', p['job']
 
 
-# ---------------------------------------------------------------------------
-# Smoke 5 — Stale cancel arrives while a NEW job is active: the new job
-#           completes anyway.
-# ---------------------------------------------------------------------------
+def test_smoke_4b_cancel_after_finish_is_a_noop(tmp_path, monkeypatch):
+    """Deterministic cancel-after-finish: the job is already terminal when the
+    cancel arrives — the route is a no-op and the session stays
+    ready_to_commit (never forced back to draft, never 'canceled')."""
+    monkeypatch.setenv('OPENAI_API_KEY', 'fake-key')
+    with TestClient(create_app(tmp_path, transport=_transport([]))) as c:
+        pid = _new_project(c)
+        sid = _create_session(c, pid)
+        base = f'/api/projects/{pid}/generation/sessions/{sid}'
+        c.post(f'{base}/plan', headers=H, json={'confirm_paid': True, 'idempotency_key': 's4b-plan'})
+        _wait(c, pid)
+        r = c.post(f'{base}/generate', headers=H,
+                   json={'confirm_paid': True, 'idempotency_key': 's4b-gen'})
+        done_job = r.json()['jobId']
+        p = _wait(c, pid)
+        assert p['job']['status'] == 'done'
+        # late cancel targeted at the FINISHED job: no-op
+        r = c.post(f'/api/projects/{pid}/job/cancel', headers=H, json={'jobId': done_job})
+        assert r.status_code == 200
+        p = c.get(f'/api/projects/{pid}').json()
+        assert p['job']['status'] == 'done'
+        sess = c.get(base).json()
+        assert sess['status'] == 'ready_to_commit'
+
 
 def test_smoke_5_stale_cancel_does_not_kill_new_job(studio):
     c, recorder = studio
