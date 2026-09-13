@@ -393,3 +393,97 @@ def test_smoke_7_convert_fidelity_restore(studio):
     r = c.post(f'{base}/commit', headers=H, json={})
     assert r.status_code == 200, r.text
     assert sum(1 for x in recorder if x['path'].endswith('/svg')) == svg_before
+
+
+# ---------------------------------------------------------------------------
+# Smoke 8/9 — Task 32 review gates: inspector edits survive rebuild; layer
+# reorder is a VISUAL edit on overlapping objects.
+# ---------------------------------------------------------------------------
+
+SMOKE8_SVG = b'''<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 300 300">
+<g data-cd-object="obj-red" data-cd-name="Red">
+  <rect x="20" y="20" width="160" height="160" fill="#CC3333"/>
+</g>
+<g data-cd-object="obj-blue" data-cd-name="Blue">
+  <rect x="100" y="100" width="160" height="160" fill="#3366CC"/>
+</g>
+</svg>'''
+
+
+def _svg_project(c, svg=SMOKE8_SVG, target=30):
+    pid = _new_project(c)
+    r = c.post(f'/api/projects/{pid}/upload-svg', headers=H,
+               files={'file': ('m.svg', svg, 'image/svg+xml')}, data={'rights_confirmed': 'true'})
+    assert r.status_code == 200
+    r = c.post(f'/api/projects/{pid}/build', headers=H, json={
+        'target_regions': target, 'palette_colors': 4, 'paint_colors': 16, 'max_edge': 300,
+        'min_region_pixels': 4, 'min_label_radius': 1.0, 'auto_subdivide': False})
+    assert r.status_code == 200
+    p = _wait(c, pid)
+    assert p['job']['status'] == 'done', p['job']
+    return pid, p['currentRevision']
+
+
+def test_smoke_8_authoring_metadata_survives_rebuild(studio):
+    """Closing gate 4 (metadata edits -> rebuild -> reload): rename, reparent,
+    lock and detail budget made through /objects must still be present after
+    the ordinary /build rebuild, with stable object ids."""
+    c, _recorder = studio
+    pid, _rev = _svg_project(c)
+
+    def current():
+        return c.get(f'/api/projects/{pid}').json()['currentRevision']
+
+    for payload in (
+        {'object_id': 'obj-blue', 'name': 'Azure Sheet'},
+        {'object_id': 'obj-blue', 'parent_id': 'obj-red'},
+        {'object_id': 'obj-blue', 'locked': True},
+        {'object_id': 'obj-blue', 'detail_weight': 2.5, 'preferred_regions': 8},
+    ):
+        r = c.post(f'/api/projects/{pid}/objects', headers=H,
+                   json={'base_revision': current(), **payload})
+        assert r.status_code == 200, r.text
+        p = _wait(c, pid)
+        assert p['job']['status'] == 'done', (payload, p['job'])
+
+    r = c.post(f'/api/projects/{pid}/build', headers=H, json={
+        'target_regions': 30, 'palette_colors': 4, 'paint_colors': 16, 'max_edge': 300,
+        'min_region_pixels': 4, 'min_label_radius': 1.0, 'auto_subdivide': False})
+    assert r.status_code == 200
+    p = _wait(c, pid)
+    assert p['job']['status'] == 'done', p['job']
+    objs = c.get(f'/api/projects/{pid}/revisions/{p["currentRevision"]}/files/objects.json').json()['objects']
+    blue = next(o for o in objs if o['id'] == 'obj-blue')
+    assert blue['name'] == 'Azure Sheet'
+    assert blue.get('parentId') == 'obj-red'
+    assert blue.get('generation', {}).get('locked') is True
+    assert (blue.get('subdivision') or {}).get('detailWeight') == 2.5
+
+
+def test_smoke_9_layer_reorder_flips_overlap_in_preview(studio):
+    """Closing gate 1 (Front/Back on overlapping objects): send_to_back flips
+    the rendered overlap in the exported colored preview while the region
+    topology and QA stay valid."""
+    c, _recorder = studio
+    pid, rev = _svg_project(c)
+
+    def paint_layer_of(rev_id):
+        svg = c.get(f'/api/projects/{pid}/revisions/{rev_id}/files/colored.svg').text
+        return svg.split('<g data-layer="paint">', 1)[1]
+
+    regions0 = c.get(f'/api/projects/{pid}/revisions/{rev}/files/regions.json').json()['regions']
+    layer0 = paint_layer_of(rev)
+    assert layer0.rfind('#3366CC') > layer0.rfind('#CC3333'), 'fixture: blue starts in front'
+
+    r = c.post(f'/api/projects/{pid}/objects', headers=H, json={
+        'base_revision': rev, 'object_id': 'obj-blue', 'order_action': 'send_to_back'})
+    assert r.status_code == 200
+    p = _wait(c, pid)
+    assert p['job']['status'] == 'done', p['job']
+    rev2 = p['currentRevision']
+    layer2 = paint_layer_of(rev2)
+    assert layer2.rfind('#CC3333') > layer2.rfind('#3366CC'), 'red must render on top after send_to_back'
+    regions2 = c.get(f'/api/projects/{pid}/revisions/{rev2}/files/regions.json').json()['regions']
+    assert {x['id'] for x in regions2} == {x['id'] for x in regions0}
+    qa = c.get(f'/api/projects/{pid}/revisions/{rev2}/files/validation.json').json()
+    assert qa['passed'] is True

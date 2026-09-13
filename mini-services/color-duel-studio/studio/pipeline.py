@@ -2364,6 +2364,7 @@ def compile_image(source: Path, output: Path, *, artwork_id: str, version: str, 
                   settings: BuildSettings, provenance: dict | None = None,
                   segment_object_map: dict | None = None,
                   objects: list | None = None,
+                  authoring_sidecar: list | None = None,
                   segment_density: float = 1.0, color_merge_delta_e: float = 0.0,
                   progress: Callable = lambda *_: None) -> dict:
     progress(.04, 'Preparing approved master')
@@ -2467,9 +2468,20 @@ def compile_image(source: Path, output: Path, *, artwork_id: str, version: str, 
         # ScenePlan records carry the semantics (role/subdivision budgets);
         # actual rc-* ownership stays authoritative for shapeIds.
         objects = _objects_from_segment_map(segment_object_map, paint, objects)
+        # Task 32 review R3: rebuild-time sidecar overlay (semantic authority
+        # stays with the current revision's objects.json).
+        objects = _merge_authoring_sidecar(objects, authoring_sidecar)
         if objects:
             bundle['objects'] = objects
             manifest['objectsCount'] = len(objects)
+    elif authoring_sidecar:
+        # Plain raster rebuild: no derivation exists, but the current
+        # revision's authoring metadata must not be silently dropped — the
+        # sidecar survives verbatim and QA reports any missing shapes.
+        sidecar_objects = _merge_authoring_sidecar(None, authoring_sidecar)
+        if sidecar_objects:
+            bundle['objects'] = sidecar_objects
+            manifest['objectsCount'] = len(sidecar_objects)
     output.mkdir(parents=True, exist_ok=True)
     shutil.copy2(source, output / 'source-master.png')
     progress(.70, 'Checking topology, labels and runtime exports')
@@ -2529,6 +2541,7 @@ def _split_disconnected_master(cmds: List[Command], fit_tolerance: float):
 def compile_svg_master(source: Path, output: Path, *, artwork_id: str, version: str, title: str,
                         settings: BuildSettings, provenance: dict | None = None,
                         objects: list | None = None,
+                        authoring_sidecar: list | None = None,
                         progress: Callable = lambda *_: None) -> dict:
     """Compile a sanitized SVG master into the detailed-vector bundle.
 
@@ -2681,6 +2694,10 @@ def compile_svg_master(source: Path, output: Path, *, artwork_id: str, version: 
         objects = normalize_objects({'objects': merged})
     else:
         objects = derived
+    # Task 32 review R3: a rebuild overlays the current revision's authoring
+    # sidecar (objects.json) so inspector edits survive recompilation — the
+    # master keeps visual authority, the sidecar keeps semantic authority.
+    objects = _merge_authoring_sidecar(objects, authoring_sidecar)
     edges: List[dict] = []
     if settings.auto_subdivide:
         progress(.58, f'Subdividing large regions toward ~{settings.target_regions} tap targets')
@@ -3383,6 +3400,81 @@ def edit_bundle(source: Path, output: Path, request, version: str):
     return {'manifest': m, 'validation': qa}
 
 
+def _merge_authoring_sidecar(objects, sidecar) -> list | None:
+    """Task 32 review: the CURRENT revision's objects.json is the authoring
+    authority across rebuilds. Overlay its metadata (name/type/role/parentId/
+    subdivision/generation) onto the records the compiler derived from the
+    master, keeping the derived shapeIds as ownership truth. Sidecar-only ids
+    whose geometry no longer exists are dropped; when the master lost all
+    object groups the sidecar survives verbatim (QA then reports missing
+    shapes honestly instead of silently reverting the metadata)."""
+    if not sidecar:
+        return objects
+    side = {o['id']: o for o in sidecar}
+    if not objects:
+        return normalize_objects({'objects': sidecar})
+    out = []
+    for rec in objects:
+        a = side.get(rec['id'])
+        if a is None:
+            out.append(rec)
+            continue
+        merged = dict(rec)
+        for key in ('name', 'type', 'role', 'parentId', 'subdivision', 'generation'):
+            if a.get(key) is not None:
+                merged[key] = a[key]
+        out.append(merged)
+    ids = {r['id'] for r in out}
+    for r in out:  # prune parents that pointed at dropped records
+        parent = r.get('parentId')
+        if parent and (parent not in ids or parent == r['id']):
+            r.pop('parentId', None)
+    return normalize_objects({'objects': out}) or objects
+
+
+def _local_svg_tag(tag: str) -> str:
+    return tag.rsplit('}', 1)[-1] if isinstance(tag, str) else ''
+
+
+def _reorder_master_svg(master_text: str, object_order: List[str]) -> tuple[str, dict]:
+    """Layer reorder as a VISUAL edit (Task 32 review R1): rewrite the
+    SANITIZED source master (our own emit_master_svg output) so the document
+    drawing order of the ``<g data-cd-object>`` groups matches the requested
+    object order (index 0 renders behind, last renders on top — SVG paints
+    in document order). Shape ids are preserved verbatim; only the top-level
+    child sequence changes.
+
+    Returns (new_master_text, {shapeId: document_order_index}) so the caller
+    can remap paint z to the new drawing order.
+    """
+    import xml.etree.ElementTree as ET
+
+    ET.register_namespace('', 'http://www.w3.org/2000/svg')
+    root = ET.fromstring(master_text)
+    children = list(root)
+    groups = [c for c in children
+              if _local_svg_tag(c.tag) == 'g' and (c.get('data-cd-object') or '').strip()]
+    if not groups:
+        return master_text, {}
+    rank = {oid: i for i, oid in enumerate(object_order)}
+    ordered_groups = sorted(
+        groups,
+        key=lambda gnode: rank.get((gnode.get('data-cd-object') or '').strip(), len(rank)),
+    )
+    first_group_index = children.index(groups[0])
+    for gnode in groups:
+        root.remove(gnode)
+    for offset, gnode in enumerate(ordered_groups):
+        root.insert(first_group_index + offset, gnode)
+    # Document-order rank for every shape id (paths inside groups + root level).
+    shape_rank: dict = {}
+    for element in root.iter():
+        sid = element.get('id') or ''
+        if sid.startswith('s') and sid[1:].isdigit():
+            shape_rank.setdefault(sid, len(shape_rank))
+    return ET.tostring(root, encoding='unicode'), shape_rank
+
+
 def edit_objects_bundle(source: Path, output: Path, request, version: str) -> dict:
     """Task 32 — Semantic Object / Layer inspector edit engine.
 
@@ -3447,7 +3539,16 @@ def edit_objects_bundle(source: Path, output: Path, request, version: str) -> di
     if request.max_regions is not None:
         sub['maxRegions'] = max(0, int(request.max_regions))
 
-    # 5. Layer ordering
+    # 5. Layer ordering — a VISUAL edit, not a list reshuffle (Task 32 review
+    # R1): the objects.json array order (index 0 = back, last = front) is
+    # mirrored into (a) the source master's group drawing order and (b) the
+    # paint layer's z values, so the board, the exported colored preview and
+    # any later rebuild all render the new overlap. Shape ids and each
+    # object's internal shape order are preserved. Tap surfaces are the
+    # non-overlapping visible partition derived at compile time, so topology
+    # is untouched by definition; occlusion was resolved once at import time
+    # and stays consistent because reorder never resurrects occluded shapes.
+    rewritten_master: str | None = None
     if request.order_action:
         idx = next(i for i, o in enumerate(objects) if o['id'] == request.object_id)
         popped = objects.pop(idx)
@@ -3464,6 +3565,40 @@ def edit_objects_bundle(source: Path, output: Path, request, version: str) -> di
             insert_at = t_idx + 1 if request.order_action == 'above' else t_idx
             objects.insert(insert_at, popped)
 
+        object_order = [o['id'] for o in objects]
+        master_file = source / 'source-master.svg'
+        shape_rank: dict | None = None
+        if master_file.is_file():
+            try:
+                rewritten_master, shape_rank = _reorder_master_svg(
+                    master_file.read_text(encoding='utf-8'), object_order)
+            except ValueError:
+                raise
+            except Exception as exc:
+                raise ValueError(f'Layer reorder failed while rewriting the source master: {exc}')
+        paint_entries = (bundle['paint'].get('paths') or []) + (bundle['paint'].get('inkPaths') or [])
+        if shape_rank is not None:
+            # SVG master build: paint z follows the rewritten document order.
+            for p in paint_entries:
+                sid = p.get('shapeId')
+                if sid in shape_rank:
+                    p['z'] = shape_rank[sid]
+        else:
+            # Raster/convert build (no SVG master): remap z directly — stable
+            # sort by (object rank, previous z); unassigned shapes keep their
+            # previous relative position behind the assigned ones.
+            owner: dict = {}
+            for i, o in enumerate(objects):
+                for sid in o.get('shapeIds') or []:
+                    owner[sid] = i
+            decorated = sorted(
+                ((p.get('z') if p.get('z') is not None else 10 ** 9, i, p)
+                 for i, p in enumerate(paint_entries)),
+                key=lambda t: (owner.get(t[2].get('shapeId'), len(objects)), t[0], t[1]),
+            )
+            for new_z, (_old_z, _i, p) in enumerate(decorated):
+                p['z'] = new_z
+
     # Re-normalize and update bundle
     bundle['objects'] = normalize_objects({'objects': objects})
     m['version'] = version
@@ -3474,7 +3609,11 @@ def edit_objects_bundle(source: Path, output: Path, request, version: str) -> di
     output.mkdir(parents=True, exist_ok=True)
     master_name = m['assets'].get('sourceMaster', 'source-master.png')
     for f in {master_name, 'build-settings.json', 'source-master.svg'}:
-        if (source / f).is_file():
+        if f == 'source-master.svg' and rewritten_master is not None:
+            # Layer reorder rewrote the master's drawing order — persist the
+            # reordered master so later rebuilds inherit the new visual order.
+            (output / f).write_text(rewritten_master, encoding='utf-8')
+        elif (source / f).is_file():
             shutil.copy2(source / f, output / f)
 
     qa = emit_bundle(output, bundle)

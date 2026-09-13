@@ -3104,3 +3104,191 @@ def test_locked_object_refuses_targeted_regeneration(tmp_path, monkeypatch):
         p = wait(c, pid)
         assert p['job']['status'] == 'failed'
         assert 'is locked' in p['job']['message']
+
+
+TASK32_OVERLAP_SVG = b'''<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 300 300">
+<g data-cd-object="obj-red" data-cd-name="Red">
+  <rect x="20" y="20" width="160" height="160" fill="#CC3333"/>
+</g>
+<g data-cd-object="obj-blue" data-cd-name="Blue">
+  <rect x="100" y="100" width="160" height="160" fill="#3366CC"/>
+</g>
+</svg>'''
+
+
+def _task32_overlap_project(client):
+    pid = new(client)
+    r = client.post(f'/api/projects/{pid}/upload-svg', headers=H,
+                    files={'file': ('overlap.svg', TASK32_OVERLAP_SVG, 'image/svg+xml')},
+                    data={'rights_confirmed': 'true'})
+    assert r.status_code == 200, r.text
+    r = client.post(f'/api/projects/{pid}/build', headers=H, json={
+        'target_regions': 30, 'palette_colors': 4, 'paint_colors': 16, 'max_edge': 300,
+        'min_region_pixels': 4, 'min_label_radius': 1.0, 'auto_subdivide': False})
+    assert r.status_code == 200, r.text
+    p = wait(client, pid, timeout=120)
+    assert p['job']['status'] == 'done', p['job']
+    return pid, p['currentRevision']
+
+
+def test_layer_reorder_changes_visual_overlap_and_keeps_topology(client):
+    """Task 32 review R1 closing gate: Front/Back on two OVERLAPPING objects
+    changes the rendered overlap (paint z, colored.svg draw order), while the
+    gameplay topology (region ids/count) and QA stay valid."""
+    pid, rev = _task32_overlap_project(client)
+    base = f'/api/projects/{pid}/revisions/{rev}'
+    paint0 = client.get(f'{base}/files/paint.json').json()
+    regions0 = client.get(f'{base}/files/regions.json').json()['regions']
+    objs0 = client.get(f'{base}/files/objects.json').json()['objects']
+    assert {o['id'] for o in objs0} == {'obj-red', 'obj-blue'}
+
+    def z_range(paint, obj_id):
+        shape_ids = set(next(o for o in paint['_objects'] if o['id'] == obj_id).get('shapeIds') or [])
+        zs = [p['z'] for p in paint['_paths'] if p.get('shapeId') in shape_ids]
+        return min(zs), max(zs)
+
+    def snapshot(paint_text):
+        paint = json.loads(paint_text)
+        paint['_paths'] = paint['paths']
+        paint['_objects'] = client.get(f'{base_curr}/files/objects.json').json()['objects']
+        return paint
+
+    # blue is drawn AFTER red in the source -> blue in front initially
+    base_curr = base
+    paint0 = snapshot(client.get(f'{base}/files/paint.json').text)
+    rmin, rmax = z_range(paint0, 'obj-red')
+    bmin, bmax = z_range(paint0, 'obj-blue')
+    assert bmin > rmax, 'fixture: blue must start in front of red'
+
+    # Send blue to BACK: overlap must flip (red renders on top)
+    r = client.post(f'/api/projects/{pid}/objects', headers=H, json={
+        'base_revision': rev, 'object_id': 'obj-blue', 'order_action': 'send_to_back'})
+    assert r.status_code == 200, r.text
+    p = wait(client, pid)
+    assert p['job']['status'] == 'done', p['job']
+    rev2 = p['currentRevision']
+    base_curr = f'/api/projects/{pid}/revisions/{rev2}'
+    paint2 = snapshot(client.get(f'{base_curr}/files/paint.json').text)
+    rmin2, rmax2 = z_range(paint2, 'obj-red')
+    bmin2, bmax2 = z_range(paint2, 'obj-blue')
+    assert bmax2 < rmin2, 'send_to_back must move blue BEHIND red in paint z'
+    objs2 = client.get(f'{base_curr}/files/objects.json').json()['objects']
+    assert objs2[0]['id'] == 'obj-blue'
+
+    # topology untouched: same region ids and count, QA passes
+    regions2 = client.get(f'{base_curr}/files/regions.json').json()['regions']
+    assert {r_['id'] for r_ in regions2} == {r_['id'] for r_ in regions0}
+    assert len(regions2) == len(regions0)
+    qa = client.get(f'{base_curr}/files/validation.json').json()
+    assert qa['passed'] is True
+
+    # exported colored preview agrees: within the paint layer, red's fill is
+    # drawn AFTER blue's (red on top)
+    colored = client.get(f'{base_curr}/files/colored.svg').text
+    paint_layer = colored.split('<g data-layer="paint">', 1)[1]
+    assert paint_layer.rfind('#CC3333') > paint_layer.rfind('#3366CC'), \
+        'colored.svg must draw red AFTER blue (red on top)'
+
+    # Bring blue back to FRONT: overlap flips again
+    r = client.post(f'/api/projects/{pid}/objects', headers=H, json={
+        'base_revision': rev2, 'object_id': 'obj-blue', 'order_action': 'bring_to_front'})
+    p = wait(client, pid)
+    assert p['job']['status'] == 'done', p['job']
+    rev3 = p['currentRevision']
+    base_curr = f'/api/projects/{pid}/revisions/{rev3}'
+    paint3 = snapshot(client.get(f'{base_curr}/files/paint.json').text)
+    rmin3, rmax3 = z_range(paint3, 'obj-red')
+    bmin3, bmax3 = z_range(paint3, 'obj-blue')
+    assert bmin3 > rmax3, 'bring_to_front must put blue back on top of red'
+    colored3 = client.get(f'{base_curr}/files/colored.svg').text
+    paint_layer3 = colored3.split('<g data-layer="paint">', 1)[1]
+    assert paint_layer3.rfind('#3366CC') > paint_layer3.rfind('#CC3333')
+    # shape ids survived the reorder (stable ownership)
+    assert {q.get('shapeId') for q in paint3['_paths']} == {q.get('shapeId') for q in paint0['_paths']}
+
+
+def test_rebuild_preserves_authoring_metadata(client):
+    """Task 32 review R3 closing gate: rename/reparent/lock/detail edits made
+    through /objects SURVIVE the ordinary /build rebuild (sidecar overlay),
+    with stable ids — and survive a second rebuild (round trip)."""
+    pid, rev = _task32_project(client)
+    # authoring edits through the inspector route
+    for payload in (
+        {'object_id': 'obj-flower', 'name': 'Crimson Rose'},
+        {'object_id': 'obj-flower', 'parent_id': 'obj-sky'},
+        {'object_id': 'obj-flower', 'locked': True},
+        {'object_id': 'obj-flower', 'detail_weight': 3.5, 'min_regions': 5,
+         'preferred_regions': 12, 'max_regions': 20},
+    ):
+        r = client.post(f'/api/projects/{pid}/objects', headers=H,
+                        json={'base_revision': client.get(f'/api/projects/{pid}').json()['currentRevision'], **payload})
+        assert r.status_code == 200, r.text
+        p = wait(client, pid)
+        assert p['job']['status'] == 'done', (payload, p['job'])
+
+    # ordinary rebuild from the project master
+    r = client.post(f'/api/projects/{pid}/build', headers=H, json={
+        'target_regions': 40, 'palette_colors': 4, 'paint_colors': 16, 'max_edge': 300,
+        'min_region_pixels': 4, 'min_label_radius': 1.0, 'auto_subdivide': False})
+    assert r.status_code == 200, r.text
+    p = wait(client, pid, timeout=120)
+    assert p['job']['status'] == 'done', p['job']
+    rebuilt = p['currentRevision']
+
+    objs = client.get(f'/api/projects/{pid}/revisions/{rebuilt}/files/objects.json').json()['objects']
+    flower = next(o for o in objs if o['id'] == 'obj-flower')
+    assert flower['name'] == 'Crimson Rose'
+    assert flower.get('parentId') == 'obj-sky'
+    assert flower.get('generation', {}).get('locked') is True
+    sub = flower.get('subdivision') or {}
+    assert sub.get('detailWeight') == 3.5 and sub.get('minRegions') == 5
+    assert sub.get('preferredRegions') == 12 and sub.get('maxRegions') == 20
+
+    # second rebuild (round trip) still retains every authoring value
+    r = client.post(f'/api/projects/{pid}/build', headers=H, json={
+        'target_regions': 40, 'palette_colors': 4, 'paint_colors': 16, 'max_edge': 300,
+        'min_region_pixels': 4, 'min_label_radius': 1.0, 'auto_subdivide': False})
+    p = wait(client, pid, timeout=120)
+    assert p['job']['status'] == 'done', p['job']
+    rebuilt2 = p['currentRevision']
+    flower2 = next(o for o in client.get(
+        f'/api/projects/{pid}/revisions/{rebuilt2}/files/objects.json').json()['objects']
+        if o['id'] == 'obj-flower')
+    assert flower2['name'] == 'Crimson Rose'
+    assert flower2.get('generation', {}).get('locked') is True
+
+
+def test_committed_revision_lock_blocks_linked_regeneration(tmp_path, monkeypatch):
+    """Task 32 review R4: locking through the inspector route (/objects) on a
+    committed revision whose provenance points at the session must be enforced
+    in that same generation context — refused BEFORE any provider call."""
+    monkeypatch.setenv('OPENAI_API_KEY', 'fake-key')
+    seen = []
+    with TestClient(create_app(tmp_path, transport=_task29_transport(seen))) as c:
+        pid = new(c)
+        sid = _plan_and_generate(c, pid, [])
+        base = f'/api/projects/{pid}/generation/sessions/{sid}'
+        r = c.post(f'{base}/commit', headers=H, json={})
+        assert r.status_code == 200, r.text
+        rev_id = r.json()['revision']['id']
+        manifest = client_manifest = c.get(
+            f'/api/projects/{pid}/revisions/{rev_id}/files/artwork.json').json()
+        assert manifest['generation']['sessionId'] == sid, \
+            'committed revision must carry session provenance for the linkage'
+
+        # lock through the inspector path on the committed revision
+        r = c.post(f'/api/projects/{pid}/objects', headers=H, json={
+            'base_revision': rev_id, 'object_id': 'obj-house', 'locked': True})
+        assert r.status_code == 200
+        p = wait(c, pid)
+        assert p['job']['status'] == 'done'
+
+        svg_before = sum(1 for x in seen if x.endswith('/svg'))
+        r = c.post(f'{base}/regenerate-object', headers=H, json={
+            'confirm_paid': True, 'objectId': 'obj-house'})
+        assert r.status_code == 200  # accepted as a job; the job refuses
+        p = wait(c, pid)
+        assert p['job']['status'] == 'failed'
+        assert 'is locked' in p['job']['message'], p['job']
+        assert sum(1 for x in seen if x.endswith('/svg')) == svg_before, \
+            'the lock guard must fire BEFORE any provider call'

@@ -34,12 +34,25 @@ import {
 } from "lucide-react";
 import { toast } from "sonner";
 
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from "@/components/ui/alert-dialog";
 import { Button } from "@/components/ui/button";
+import { Checkbox } from "@/components/ui/checkbox";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Switch } from "@/components/ui/switch";
+import { Textarea } from "@/components/ui/textarea";
 import type { SemanticObject } from "@/lib/studio-api";
+import { computeObjectVisibility } from "@/lib/detailed-board";
 import { useStudioContext } from "./use-studio";
 
 const DETAIL_WEIGHT_PRESETS = [
@@ -66,6 +79,22 @@ export function ObjectInspector() {
   } = useStudioContext();
 
   const objects = useMemo(() => bundle?.objects?.objects || [], [bundle]);
+
+  // Task 32 R2/R4 — subtree-aware effective visibility (hide/isolate on a
+  // parent covers its descendants) and the revision→draft linkage gate.
+  const effectiveHidden = useMemo(
+    () => computeObjectVisibility(objects, hiddenObjectIds, isolatedObjectId),
+    [objects, hiddenObjectIds, isolatedObjectId]
+  );
+  const derivedSessionId = bundle?.manifest.generation?.sessionId;
+  const linkedToRevision =
+    !!derivedSessionId &&
+    !!activeSession &&
+    activeSession.id === derivedSessionId &&
+    activeSession.status !== "committed";
+  const [regenDialogOpen, setRegenDialogOpen] = useState(false);
+  const [regenInstructions, setRegenInstructions] = useState("");
+  const [regenPaidConsent, setRegenPaidConsent] = useState(false);
 
   // Compute region counts per object
   const regionCounts = useMemo(() => {
@@ -199,17 +228,28 @@ export function ObjectInspector() {
   };
 
   const handleRegenerate = async (obj: SemanticObject) => {
-    if (!activeSession) {
-      toast("No active AI creation session found.");
-      return;
-    }
+    // Task 32 review R4: targeted regeneration must run against an AI draft
+    // DERIVED FROM THE DISPLAYED REVISION — an unrelated active draft is
+    // never reused, and the paid provider call happens only after the
+    // explicit confirmation below (zero calls until confirmed).
     if (obj.generation?.locked) {
       toast("Object is locked. Unlock it before regenerating.");
       return;
     }
+    if (!linkedToRevision) {
+      toast("No AI draft derived from this revision is active.");
+      return;
+    }
+    if (!regenPaidConsent) {
+      toast("Confirm the paid provider request first.");
+      return;
+    }
     try {
-      await regenerateObject(obj.id, "", true);
+      await regenerateObject(obj.id, regenInstructions, true);
       toast(`Regenerating "${obj.name}"...`);
+      setRegenDialogOpen(false);
+      setRegenInstructions("");
+      setRegenPaidConsent(false);
     } catch (e) {
       toast((e as Error).message);
     }
@@ -220,7 +260,7 @@ export function ObjectInspector() {
     const hasChildren = (childrenMap.get(obj.id) || []).length > 0;
     const isExpanded = expandedIds.has(obj.id);
     const isSelected = selectedObjectId === obj.id;
-    const isHidden = isolatedObjectId ? isolatedObjectId !== obj.id : hiddenObjectIds.has(obj.id);
+    const isHidden = effectiveHidden.has(obj.id);
     const isIsolated = isolatedObjectId === obj.id;
     const regCount = regionCounts.get(obj.id) || 0;
     const shpCount = obj.shapeIds?.length || 0;
@@ -574,8 +614,11 @@ export function ObjectInspector() {
                 </p>
               </div>
 
-              {/* AI Targeted Regeneration */}
-              {activeSession && (
+              {/* AI Targeted Regeneration — bound to the displayed revision
+                  (Task 32 review R4). Enabled only when the active AI draft is
+                  the one this revision's provenance points at; the paid call
+                  fires only after the explicit confirmation dialog. */}
+              {(activeSession || linkedToRevision) && (
                 <div className="pt-2 border-t border-[#e1e8e5] space-y-1.5">
                   <div className="flex items-center justify-between">
                     <span className="text-[10px] font-semibold text-[#657671] uppercase tracking-wider">
@@ -589,12 +632,24 @@ export function ObjectInspector() {
                     size="sm"
                     variant="outline"
                     className="w-full h-7 text-xs bg-white text-[#087f74] border-[#cce7dc] hover:bg-[#e5f3ed] gap-1.5"
-                    onClick={() => void handleRegenerate(selectedObject)}
-                    disabled={busy || !!selectedObject.generation?.locked}
+                    onClick={() => setRegenDialogOpen(true)}
+                    disabled={busy || !!selectedObject.generation?.locked || !linkedToRevision}
                   >
                     <Sparkles className="size-3.5" />
                     Regenerate "{selectedObject.name}"
                   </Button>
+                  {selectedObject.generation?.locked ? (
+                    <p className="text-[9px] text-amber-700 leading-tight">
+                      This object is locked, so AI regeneration is refused — in the draft and in
+                      the committed artwork.
+                    </p>
+                  ) : !linkedToRevision ? (
+                    <p className="text-[9px] text-[#778481] leading-tight">
+                      Targeted regeneration needs an active AI draft derived from THIS revision.
+                      Unrelated drafts are never reused — resume the AI workspace from this
+                      revision to regenerate its objects.
+                    </p>
+                  ) : null}
                 </div>
               )}
 
@@ -613,6 +668,57 @@ export function ObjectInspector() {
           )}
         </div>
       )}
+
+      {/* Paid-action confirmation (Task 32 review R4): instructions + explicit
+          consent BEFORE the provider is called — the established creation
+          workspace experience, zero provider calls until confirmed. */}
+      <AlertDialog open={regenDialogOpen} onOpenChange={setRegenDialogOpen}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>Regenerate "{selectedObject?.name}" with AI?</AlertDialogTitle>
+            <AlertDialogDescription>
+              This replaces the object's shapes in the linked AI draft with a freshly generated
+              fragment (objectId is preserved) and may incur provider charges. Confirm to send the
+              request.
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <div className="space-y-2.5">
+            <Label htmlFor="regen-instructions" className="text-[11px] text-[#183837]">
+              Change instructions (optional)
+            </Label>
+            <Textarea
+              id="regen-instructions"
+              value={regenInstructions}
+              onChange={(e) => setRegenInstructions(e.target.value)}
+              placeholder="e.g. make the roof steeper and darker"
+              className="min-h-[60px] text-xs"
+            />
+            <div className="flex items-start gap-2">
+              <Checkbox
+                id="regen-paid-consent"
+                checked={regenPaidConsent}
+                onCheckedChange={(v) => setRegenPaidConsent(v === true)}
+              />
+              <Label htmlFor="regen-paid-consent" className="text-[11px] font-normal leading-snug text-[#526460]">
+                I understand this sends a paid request to the AI provider for
+                "{selectedObject?.name}".
+              </Label>
+            </div>
+          </div>
+          <AlertDialogFooter>
+            <AlertDialogCancel>Cancel</AlertDialogCancel>
+            <AlertDialogAction
+              disabled={!regenPaidConsent || busy}
+              onClick={(e) => {
+                e.preventDefault();
+                if (selectedObject) void handleRegenerate(selectedObject);
+              }}
+            >
+              Regenerate object
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
     </div>
   );
 }

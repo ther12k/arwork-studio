@@ -64,6 +64,9 @@ let mockBundle: Bundle | null = {
     regionCount: 3,
     assets: { regions: "regions.json", palette: "palette.json", paint: "paint.json" },
     contentHash: "hash-123",
+    // Task 32 review R4: the revision's generation provenance links it to the
+    // active AI draft (sess-1) — regeneration gating reads this.
+    generation: { sessionId: "sess-1" },
   },
   geometry: {
     schemaVersion: 1,
@@ -173,6 +176,42 @@ describe("Task 32 — ObjectInspector Component", () => {
     const regenBtn = screen.getByRole("button", { name: /Regenerate "Cottage"/i });
     expect(regenBtn.hasAttribute("disabled")).toBe(true);
     expect(screen.getByText(/Unlock to regenerate/i)).toBeDefined();
+  });
+
+  it("disables regeneration when the active draft is NOT derived from this revision", () => {
+    mockSelectedObjectId = "obj-roof";
+    const prev = mockBundle;
+    mockBundle = { ...prev!, manifest: { ...prev!.manifest, generation: undefined } };
+    render(<ObjectInspector />);
+
+    const regenBtn = screen.getByRole("button", { name: /Regenerate "Roof"/i });
+    expect(regenBtn.hasAttribute("disabled")).toBe(true);
+    // honest explanation instead of silently targeting the unrelated draft
+    expect(screen.getByText(/Unrelated drafts are never reused/i)).toBeDefined();
+    expect(mockRegenerateObject).not.toHaveBeenCalled();
+    mockBundle = prev;
+  });
+
+  it("opens the paid confirmation dialog and fires only after explicit consent", () => {
+    mockSelectedObjectId = "obj-roof"; // linked via manifest.generation.sessionId
+    render(<ObjectInspector />);
+
+    const regenBtn = screen.getByRole("button", { name: /Regenerate "Roof"/i });
+    expect(regenBtn.hasAttribute("disabled")).toBe(false);
+    fireEvent.click(regenBtn);
+
+    // dialog is open, the paid action is gated on the consent checkbox
+    expect(screen.getByText(/may incur provider charges/i)).toBeDefined();
+    const confirmBtn = screen.getByRole("button", { name: /Regenerate object/i });
+    expect((confirmBtn as HTMLButtonElement).disabled).toBe(true);
+
+    fireEvent.click(screen.getByRole("checkbox"));
+    const confirmReady = screen.getByRole("button", { name: /Regenerate object/i });
+    expect((confirmReady as HTMLButtonElement).disabled).toBe(false);
+    fireEvent.click(confirmReady);
+
+    expect(mockRegenerateObject).toHaveBeenCalledTimes(1);
+    expect(mockRegenerateObject).toHaveBeenCalledWith("obj-roof", "", true);
   });
 
   it("invokes hide and isolate callbacks without network calls", () => {

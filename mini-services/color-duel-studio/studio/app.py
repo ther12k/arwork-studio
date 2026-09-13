@@ -14,7 +14,7 @@ from .models import *
 from . import STUDIO_VERSION
 from .pipeline import (BACKENDS, clean_image, compile_image, compile_svg_master,
                         difficulty_profile, edit_bundle, edit_objects_bundle, read_json, write_json, make_export,
-                        load_bundle, validate_bundle, legacy_geometry, checksum)
+                        load_bundle, normalize_objects, validate_bundle, legacy_geometry, checksum)
 from .svg_master import clean_svg
 from .ai import Provider
 from .generation import (
@@ -542,16 +542,28 @@ def create_app(workspace: Path|None=None, transport=None):
             if changed:
                 effective=body.model_copy(update=changed)
         def run(tick):
+            # Task 32 review R3: the CURRENT revision's objects.json is the
+            # authoring sidecar — a rebuild overlays it so inspector edits
+            # (rename/reparent/lock/detail budgets) survive recompilation
+            # instead of silently reverting to the original import metadata.
+            sidecar=None
+            if p.get('currentRevision'):
+                sc=folder(pid)/'revisions'/p['currentRevision']/'objects.json'
+                if sc.is_file():
+                    try:sidecar=normalize_objects(read_json(sc))
+                    except Exception:sidecar=None
             if is_svg:
                 result=compile_svg_master(folder(pid)/p['master']['file'],folder(pid)/'revisions'/rev,
                     artwork_id=pid,version=version,title=p['title'],settings=effective,
                     provenance={'source':p['master']['source'],'sourceHash':p['master']['sha256'],
-                        'rightsConfirmedByUser':p['master'].get('rightsConfirmed',False),'legalClearanceVerified':False},progress=tick)
+                        'rightsConfirmedByUser':p['master'].get('rightsConfirmed',False),'legalClearanceVerified':False},
+                    authoring_sidecar=sidecar,progress=tick)
             else:
                 result=compile_image(folder(pid)/p['master']['file'],folder(pid)/'revisions'/rev,
                     artwork_id=pid,version=version,title=p['title'],settings=effective,
                     provenance={'source':p['master']['source'],'sourceHash':p['master']['sha256'],
-                        'rightsConfirmedByUser':p['master'].get('rightsConfirmed',False),'legalClearanceVerified':False},progress=tick)
+                        'rightsConfirmedByUser':p['master'].get('rightsConfirmed',False),'legalClearanceVerified':False},
+                    authoring_sidecar=sidecar,progress=tick)
             reply={'revision':{'id':rev,'version':version,'createdAt':now(),'kind':'build','sourceHash':p['master']['sha256'],
                 'regionCount':result['manifest']['regionCount'],'qa':result['validation'],
                 'manifestUrl':f'/api/projects/{pid}/revisions/{rev}/files/artwork.json'}}
@@ -1093,6 +1105,35 @@ def create_app(workspace: Path|None=None, transport=None):
             sm = GenerationSessionManager(folder(pid), pid)
 
         def run(tick):
+            # Task 32 review R4: the same lock must be enforced in the AUTHORING
+            # context. A committed revision whose provenance points at THIS
+            # session (manifest.generation.sessionId) carries inspector locks in
+            # its objects.json — enforce them here, before any provider call,
+            # so locking through /objects protects regeneration of that art.
+            rev_root = folder(pid) / 'revisions'
+            if rev_root.is_dir():
+                for rdir in sorted(rev_root.glob('rev-*')):
+                    mfile = rdir / 'artwork.json'
+                    if not mfile.is_file():
+                        continue
+                    try:
+                        manifest = read_json(mfile)
+                    except Exception:
+                        continue
+                    if (manifest.get('generation') or {}).get('sessionId') != sid:
+                        continue
+                    ofile = rdir / 'objects.json'
+                    if not ofile.is_file():
+                        continue
+                    try:
+                        records = normalize_objects(read_json(ofile)) or []
+                    except Exception:
+                        continue
+                    for rec in records:
+                        if rec['id'] == object_id and (rec.get('generation') or {}).get('locked'):
+                            raise ValueError(
+                                f'"{rec.get("name") or object_id}" is locked in the committed '
+                                'artwork. Unlock it in the Objects & Layers inspector before regenerating.')
             session, usage = sm.regenerate_session_object(sid, provider, object_id,
                                                           instructions=str(body.get('instructions') or ''),
                                                           progress=tick)

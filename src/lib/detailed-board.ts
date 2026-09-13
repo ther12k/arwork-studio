@@ -18,7 +18,7 @@
  *    is applied once at gesture end (see bindGestures).
  */
 
-import type { DifficultyProfile, ObjectsFile } from "./studio-api";
+import type { DifficultyProfile, ObjectsFile, SemanticObject } from "./studio-api";
 
 const NS = "http://www.w3.org/2000/svg";
 let sequence = 0;
@@ -261,6 +261,10 @@ export interface Manifest {
   /** Stage 3 (contract B): true once at least one completed play-test run
    *  has been recorded for this revision. */
   difficultyValidatedByPlaytest?: boolean;
+  /** Generation provenance on AI-created revisions — `sessionId` is the
+   *  linkage the Object Inspector requires before offering targeted
+   *  regeneration (an unrelated draft must never be reused). */
+  generation?: { sessionId?: string } & Record<string, unknown>;
 }
 
 export interface Bundle {
@@ -433,6 +437,153 @@ export interface BoardOptions {
 }
 
 // ---------------------------------------------------------------------------
+// Object visibility (Task 32 review R2) — one authoritative, transient state
+// ---------------------------------------------------------------------------
+
+/** Contract: hiding or isolating a PARENT operates on its subtree; selecting
+ *  or hiding an individual child still operates on that child alone. Ids the
+ *  catalog no longer knows (dropped in a newer revision) are ignored — the
+ *  catalog stays authoritative over stale hidden state. */
+export function computeObjectVisibility(
+  objects: SemanticObject[],
+  hiddenIds: Set<string>,
+  isolatedId: string | null
+): Set<string> {
+  const known = new Set(objects.map((o) => o.id));
+  const isolated = isolatedId && known.has(isolatedId) ? isolatedId : null;
+  const childrenOf = new Map<string, string[]>();
+  for (const o of objects) {
+    if (o.parentId && o.parentId !== o.id) {
+      const arr = childrenOf.get(o.parentId) ?? [];
+      arr.push(o.id);
+      childrenOf.set(o.parentId, arr);
+    }
+  }
+  const subtree = (root: string): Set<string> => {
+    const out = new Set<string>();
+    const stack = [root];
+    while (stack.length) {
+      const id = stack.pop()!;
+      if (out.has(id)) continue;
+      out.add(id);
+      for (const child of childrenOf.get(id) ?? []) stack.push(child);
+    }
+    return out;
+  };
+  const effective = new Set<string>();
+  if (isolated) {
+    const keep = subtree(isolated);
+    for (const o of objects) if (!keep.has(o.id)) effective.add(o.id);
+    return effective;
+  }
+  for (const id of hiddenIds) {
+    if (!known.has(id)) continue;
+    for (const id2 of subtree(id)) effective.add(id2);
+  }
+  return effective;
+}
+
+/**
+ * Authoritative editor-side visibility state for semantic objects. The board
+ * consults it for artwork (cached underpainting or live paths), region
+ * overlays, labels, hit-testing and keyboard focus; it survives zoom, resize,
+ * palette changes and completion refreshes because every one of those paths
+ * re-reads this state instead of one-off DOM classes.
+ */
+export class ObjectVisibilityController {
+  private objects: SemanticObject[] = [];
+  private hidden = new Set<string>();
+  private isolated: string | null = null;
+  private highlightId: string | null = null;
+  private hiddenRegions = new Set<string>();
+  private hiddenShapes = new Set<string>();
+  private unownedHidden = false;
+  private owners = new Map<string, string>();
+
+  /** Refresh the object catalog after a bundle load; recomputes derived sets. */
+  setCatalog(objects: SemanticObject[]): void {
+    this.objects = objects ?? [];
+    this.recompute();
+  }
+
+  setHiddenObjects(hidden: Set<string>, isolated: string | null): void {
+    this.hidden = new Set(hidden);
+    this.isolated = isolated;
+    this.recompute();
+  }
+
+  setHighlightedObject(objectId: string | null): void {
+    this.highlightId = objectId;
+  }
+
+  isRegionHidden(id: string): boolean {
+    return this.hiddenRegions.has(id);
+  }
+
+  hiddenShapeIds(): Set<string> {
+    return this.hiddenShapes;
+  }
+
+  unownedArtHidden(): boolean {
+    return this.unownedHidden;
+  }
+
+  shapeOwner(shapeId: string): string | undefined {
+    return this.owners.get(shapeId);
+  }
+
+  highlight(): string | null {
+    return this.highlightId;
+  }
+
+  ownedShapeIds(objectId: string): Set<string> {
+    return new Set(this.objects.find((o) => o.id === objectId)?.shapeIds ?? []);
+  }
+
+  /** True when a shape belongs to no object (drives isolate on unowned art). */
+  isShapeHidden(shapeId: string | undefined): boolean {
+    if (shapeId && this.hiddenShapes.has(shapeId)) return true;
+    if (this.unownedHidden) {
+      if (!shapeId) return true;
+      if (!this.owners.has(shapeId)) return true;
+    }
+    return false;
+  }
+
+  private recompute(): void {
+    this.owners = new Map();
+    for (const o of this.objects) {
+      for (const sid of o.shapeIds ?? []) this.owners.set(sid, o.id);
+    }
+    const effective = computeObjectVisibility(this.objects, this.hidden, this.isolated);
+    this.hiddenRegions = new Set();
+    for (const [id, region] of this.regionsLookup()) {
+      const oid = region.objectId;
+      if (!oid || oid === "unassigned") {
+        // Isolate hides art outside the isolated subtree — including
+        // regions that belong to no object at all.
+        if (this.isolated) this.hiddenRegions.add(id);
+        continue;
+      }
+      if (effective.has(oid)) this.hiddenRegions.add(id);
+    }
+    this.hiddenShapes = new Set();
+    for (const o of this.objects) {
+      if (!effective.has(o.id)) continue;
+      for (const sid of o.shapeIds ?? []) this.hiddenShapes.add(sid);
+    }
+    this.unownedHidden = this.isolated != null;
+  }
+
+  private regionsLookup(): Iterable<[string, { objectId?: string }]> {
+    // The controller stays DOM-free: the board injects its region map here.
+    return this.regionsSource ? this.regionsSource() : [];
+  }
+
+  regionsSource: (() => Iterable<[string, { objectId?: string }]> ) | null = null;
+}
+
+// ---------------------------------------------------------------------------
 // VectorBoard
 // ---------------------------------------------------------------------------
 
@@ -478,6 +629,11 @@ export class VectorBoard {
   private suppressTap = false;
   /** Set by the wrapper (clientToArt override) — last art-space point of a tap. */
   lastTapPoint: DOMPoint | null = null;
+  /** Task 32 R2 — authoritative transient object visibility/hover state. */
+  private visibility = new ObjectVisibilityController();
+  /** Active underpainting blob URL per layer id — revoked when the cached
+   *  appearance is regenerated (visibility change) or on destroy. */
+  private underpaintUrls = new Map<string, string>();
 
   constructor(svg: SVGSVGElement, bundle: Bundle, options: BoardOptions = {}) {
     if (!(svg instanceof SVGSVGElement)) throw new Error("Pass an <svg> element to VectorBoard");
@@ -508,6 +664,8 @@ export class VectorBoard {
     this.view = [...this.base];
     this.detailed = bundle.manifest.format === "color-duel-detailed-vector-1";
     this.edgesMode = Array.isArray(bundle.geometry.edges) && bundle.geometry.edges.length > 0;
+    this.visibility.regionsSource = () => this.regions;
+    this.visibility.setCatalog(bundle.objects?.objects ?? []);
     this.mount();
     this.bindGestures();
     this.refresh();
@@ -817,6 +975,13 @@ export class VectorBoard {
       node.setAttribute("data-completed", String(done));
       node.setAttribute("tabindex", done && this.mode !== "free" ? "-1" : "0");
       node.setAttribute("aria-pressed", String(done));
+      // Task 32 R2: hidden objects keep their regions/labels hidden across
+      // completion refreshes, palette changes and preview switches.
+      if (this.visibility.isRegionHidden(id)) {
+        if (label) label.style.display = "none";
+        node.setAttribute("tabindex", "-1");
+        continue;
+      }
       if (label) label.style.display = done || this.preview || this.mode !== "number" ? "none" : "";
     }
     this.updateLabelVisibility();
@@ -834,7 +999,12 @@ export class VectorBoard {
     for (const [id, r] of this.regions) {
       const label = this.labels.get(id);
       if (!label) continue;
-      const visible = !this.completed.has(id) && !this.preview && this.mode === "number" && r.label.fontSize * scale >= 9;
+      const visible =
+        !this.completed.has(id) &&
+        !this.preview &&
+        this.mode === "number" &&
+        !this.visibility.isRegionHidden(id) &&
+        r.label.fontSize * scale >= 9;
       label.style.display = visible ? "" : "none";
     }
   }
@@ -898,8 +1068,10 @@ export class VectorBoard {
   private hitTest(x: number, y: number): string | null {
     // Iterate in reverse document order: the topmost region wins. Regions
     // are visible surfaces (non-overlapping masks), so this only matters at
-    // shared boundaries; per-region fill rules are honoured.
+    // shared boundaries; per-region fill rules are honoured. Task 32 R2:
+    // regions of hidden/isolated-away objects are not reachable by pointer.
     for (const [id, r] of [...this.regions].reverse()) {
+      if (this.visibility.isRegionHidden(id)) continue;
       const b = r.bbox;
       const rule = r.fillRule ?? "evenodd";
       if (x >= b[0] && x <= b[2] && y >= b[1] && y <= b[3] && this.ctx!.isPointInPath(this.paths.get(id)!, x, y, rule))
@@ -980,56 +1152,60 @@ export class VectorBoard {
     return id;
   }
 
-  /** Task 32: Highlight all regions and visual shapes belonging to a semantic object. */
+  /** Task 32 R2 — highlight all regions and visual shapes of one object. */
   setHighlightedObject(objectId: string | null) {
+    this.visibility.setHighlightedObject(objectId);
+    this.applyObjectHighlight();
+  }
+
+  /** Task 32 R2 — transient hide/isolate backed by ONE authoritative state:
+   *  artwork (cached underpainting is REGENERATED with the hidden shapes
+   *  removed), region overlays, labels, hit-testing and keyboard focus all
+   *  follow it, and it survives zoom/resize/palette/completion refreshes. */
+  setHiddenObjects(hiddenIds: Set<string>, isolatedId: string | null) {
+    this.visibility.setHiddenObjects(hiddenIds, isolatedId);
+    this.applyObjectVisibility();
+    this.applyObjectHighlight();
+  }
+
+  /** Push the controller's visibility state into the DOM + cached artwork. */
+  private applyObjectVisibility() {
+    for (const [id, el] of this.elements) {
+      const hidden = this.visibility.isRegionHidden(id);
+      el.classList.toggle("object-hidden", hidden);
+      if (hidden) el.setAttribute("tabindex", "-1");
+    }
+    // Live-path fallback (before the underpainting image loads or when it
+    // failed): classes hide the individual shape nodes.
+    const shapeNodes = this.svg.querySelectorAll<SVGPathElement>("[data-shape-id]");
+    shapeNodes.forEach((node) => {
+      const hidden = this.visibility.isShapeHidden(node.getAttribute("data-shape-id") ?? undefined);
+      node.classList.toggle("object-hidden", hidden);
+    });
+    // Labels: hidden regions lose theirs; visible ones get ONE authoritative
+    // pass (never a per-region reset inside the loop — that was the bug where
+    // a later visible region switched earlier hidden labels back on).
+    for (const [id, label] of this.labels) {
+      if (this.visibility.isRegionHidden(id)) label.style.display = "none";
+    }
+    this.updateLabelVisibility();
+    // Cached appearance: regenerate so hidden shapes disappear from the
+    // underpainting <image> too (replacing paths with an image makes
+    // per-shape classes moot in Colored/Inspect view).
+    this.buildUnderpainting();
+  }
+
+  private applyObjectHighlight() {
+    const objectId = this.visibility.highlight();
+    const owned = objectId ? this.visibility.ownedShapeIds(objectId) : new Set<string>();
     for (const [id, el] of this.elements) {
       const reg = this.regions.get(id);
       el.classList.toggle("object-highlight-region", !!objectId && reg?.objectId === objectId);
     }
-    const root = this.svg;
-    const ownedShapes = new Set(
-      objectId && this.bundle.objects
-        ? this.bundle.objects.objects.find((o) => o.id === objectId)?.shapeIds || []
-        : []
-    );
-    const paths = root.querySelectorAll<SVGPathElement>("[data-shape-id]");
-    paths.forEach((p) => {
-      const sid = p.getAttribute("data-shape-id");
-      p.classList.toggle("object-highlight-shape", !!sid && ownedShapes.has(sid));
-    });
-  }
-
-  /** Task 32: Temporarily hide or isolate objects in editor view (in-memory DOM state). */
-  setHiddenObjects(hiddenIds: Set<string>, isolatedId: string | null) {
-    const isHidden = (oid?: string) => {
-      if (!oid) return false;
-      if (isolatedId) return oid !== isolatedId;
-      return hiddenIds.has(oid);
-    };
-
-    for (const [id, el] of this.elements) {
-      const reg = this.regions.get(id);
-      const hidden = isHidden(reg?.objectId);
-      el.classList.toggle("object-hidden", hidden);
-      const label = this.labels.get(id);
-      if (label) {
-        if (hidden) label.style.display = "none";
-        else this.updateLabelVisibility();
-      }
-    }
-
-    const hiddenShapes = new Set<string>();
-    if (this.bundle.objects) {
-      for (const obj of this.bundle.objects.objects) {
-        if (isHidden(obj.id)) {
-          for (const sid of obj.shapeIds || []) hiddenShapes.add(sid);
-        }
-      }
-    }
-    const paths = this.svg.querySelectorAll<SVGPathElement>("[data-shape-id]");
-    paths.forEach((p) => {
-      const sid = p.getAttribute("data-shape-id");
-      p.classList.toggle("object-hidden", !!sid && hiddenShapes.has(sid));
+    const shapeNodes = this.svg.querySelectorAll<SVGPathElement>("[data-shape-id]");
+    shapeNodes.forEach((node) => {
+      const sid = node.getAttribute("data-shape-id");
+      node.classList.toggle("object-highlight-shape", !!sid && owned.has(sid));
     });
   }
 
@@ -1247,15 +1423,21 @@ export class VectorBoard {
     const paint = this.bundle.paint;
     const defs = serializeGradientDefs(paint.gradients ?? []);
     const [bx, by, bw, bh] = this.base;
+    // Task 32 R2: hidden/isolated-away shapes are EXCLUDED from the cached
+    // appearance — replacing live paths with an <image> makes per-shape
+    // classes moot, so visibility must be baked into the cached SVG.
+    const shapeVisible = (p: PaintPath) => !this.visibility.isShapeHidden(p.shapeId);
     // Art layer (below the masks): closed fills, z-sorted — mirrors mount().
-    const artEntries = [...paint.paths, ...paint.inkPaths].sort((a, b) => (a.z ?? Infinity) - (b.z ?? Infinity));
+    const artEntries = [...paint.paths, ...paint.inkPaths]
+      .filter(shapeVisible)
+      .sort((a, b) => (a.z ?? Infinity) - (b.z ?? Infinity));
     const artBody: string[] = [];
     for (const p of artEntries) {
       const serialized = serializeArtPath(p);
       if (serialized) artBody.push(serialized);
     }
     // Ink layer (above the masks): open line art + closed ink shapes.
-    const inkBody = paint.inkPaths.map((p) => serializeInkPath(p));
+    const inkBody = paint.inkPaths.filter(shapeVisible).map((p) => serializeInkPath(p));
     if (this.artLayer && artBody.length)
       this.mountUnderpaintImage(this.artLayer, wrapStandaloneSvg(defs, artBody, bx, by, bw, bh), "underpaint-art");
     if (this.inkLayer && inkBody.length)
@@ -1271,6 +1453,14 @@ export class VectorBoard {
     } catch {
       return; // silent fallback: live paths stay mounted
     }
+    // A visibility change regenerates the cached appearance — revoke the
+    // previous layer URL so repeated toggles do not leak blobs.
+    const previous = this.underpaintUrls.get(id);
+    if (previous) {
+      this.blobUrls = this.blobUrls.filter((u) => u !== previous);
+      URL.revokeObjectURL(previous);
+    }
+    this.underpaintUrls.set(id, url);
     this.blobUrls.push(url);
     const probe = new Image();
     probe.onload = () => {
@@ -1312,6 +1502,7 @@ export class VectorBoard {
     // Release the underpainting blob URLs (also covers re-measure/re-mount).
     for (const url of this.blobUrls) URL.revokeObjectURL(url);
     this.blobUrls = [];
+    this.underpaintUrls.clear();
     this.pointers.clear();
   }
 }
