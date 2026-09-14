@@ -178,7 +178,7 @@ export function polylineNearestDistance(pts: FlatPoint[], p: FlatPoint): number 
   if (pts.length === 1) return Math.hypot(p.x - pts[0].x, p.y - pts[0].y);
   let best = Infinity;
   for (let i = 1; i < pts.length; i++) {
-    const d = pointSegmentDistance(pts[i - 1], pts[i], p);
+    const d = pointSegmentDistance(p, pts[i - 1], pts[i]);
     if (d < best) best = d;
   }
   return best;
@@ -207,6 +207,7 @@ export function parsePathCommands(d: string): PathCommand[] {
   const tokens = tokenize(d);
   let i = 0;
   let cur: FlatPoint = { x: 0, y: 0 };
+  let start: FlatPoint = { x: 0, y: 0 };
   while (i < tokens.length) {
     const tok = tokens[i];
     if (tok.kind !== "cmd") {
@@ -220,10 +221,13 @@ export function parsePathCommands(d: string): PathCommand[] {
     if (argPairs === undefined) continue;
     if (op === "Z") {
       out.push({ op: "Z", pts: [] });
+      // Closepath returns the current point to the subpath start (a following
+      // relative move is relative to it), mirroring flattenPath.
+      cur = { x: start.x, y: start.y };
       continue;
     }
     // M follows SVG semantics: only the first pair is a moveto, subsequent
-    // pairs are linetos.
+    // pairs are linetos. C/Q accept repeated parameter groups.
     let first = true;
     for (;;) {
       const coords: FlatPoint[] = [];
@@ -239,12 +243,12 @@ export function parsePathCommands(d: string): PathCommand[] {
         coords.push({ x: rel ? cur.x + a.value : a.value, y: rel ? cur.y + b.value : b.value });
       }
       if (!complete) break;
+      if (op === "M" && first) start = { x: coords[0].x, y: coords[0].y };
       const outOp: PathCommand["op"] = op === "M" && !first ? "L" : (op as PathCommand["op"]);
       out.push({ op: outOp, pts: coords });
       const last = coords[coords.length - 1];
       cur = { x: last.x, y: last.y };
       first = false;
-      if (argPairs > 1) break; // C/Q take exactly one set per command token
     }
   }
   return out;

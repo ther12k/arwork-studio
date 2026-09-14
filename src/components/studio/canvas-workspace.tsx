@@ -412,6 +412,9 @@ export function CanvasWorkspace() {
     dirty: boolean;
   } | null>(null);
   const [artSaveOpen, setArtSaveOpen] = useState(false);
+  /** Base revision of an in-flight shape save. The settle-watch below uses it
+   *  to tell "job accepted" from "edited revision published". */
+  const artSaveBaseRef = useRef<string | null>(null);
 
   const pickArtPath = (clientX: number, clientY: number) => {
     const board = boardRef.current;
@@ -483,16 +486,31 @@ export function CanvasWorkspace() {
   };
 
   /** Save: submit the edited path (edit action "shape", keyed by the stable
-   *  shapeId — the 409 stale-base guard is the shared edit-route check). */
+   *  shapeId — the 409 stale-base guard is the shared edit-route check).
+   *  The draft is NOT dropped here: it stays mounted and editable until the
+   *  edit's job settles. A rejected request (validation / stale base) or a
+   *  failed job keeps the artist's changes on screen for correction. */
   const saveArtPath = () => {
     const path = artPath;
     if (!path || !path.dirty) return;
     setArtSaveOpen(false);
-    setArtPath(null);
-    void editShape(path.shapeId, serializePathCommands(path.commands)).catch((e: Error) =>
-      toast(e.message)
-    );
+    artSaveBaseRef.current = project?.currentRevision ?? null;
+    void editShape(path.shapeId, serializePathCommands(path.commands)).catch((e: Error) => {
+      artSaveBaseRef.current = null;
+      toast(e.message);
+    });
   };
+
+  // Shape-save settle-watch: runEdit resolves when the job is ACCEPTED, not
+  // when it finishes. Discard the draft only when the project settles idle on
+  // a NEW revision (the edited geometry is live); an unchanged revision means
+  // the job failed (its error is toasted by the poller) — keep the draft.
+  useEffect(() => {
+    const base = artSaveBaseRef.current;
+    if (!base || busy) return;
+    artSaveBaseRef.current = null;
+    if (project?.currentRevision && project.currentRevision !== base) setArtPath(null);
+  }, [busy, project?.currentRevision]);
 
   const toolActive = view === "inspect" && hasBundle && tool !== "select" && !busy;
 
@@ -830,8 +848,10 @@ export function CanvasWorkspace() {
 
   // Artwork-node overlay geometry (Task 33): the path's control points in
   // client px. Anchors (command endpoints) render solid; Bézier handles
-  // (control points) render hollow with thin connector lines. Flattening
-  // samples each C/Q segment for the preview outline.
+  // (control points) render hollow with thin connector lines. The preview
+  // polyline flattens the WHOLE serialized path in one pass so commands chain
+  // from the real current point (a per-command flatten would evaluate every
+  // segment from (0,0)) and the Z closure is drawn as a real segment.
   const artGeometry =
     artPath && nodeTransform
       ? (() => {
@@ -839,26 +859,25 @@ export function CanvasWorkspace() {
             x: nodeTransform.a * p.x + nodeTransform.c * p.y + nodeTransform.e - nodeTransform.ox,
             y: nodeTransform.b * p.x + nodeTransform.d * p.y + nodeTransform.f - nodeTransform.oy,
           });
-          const pts: Array<{ x: number; y: number }> = [];
-          for (const c of artPath.commands) {
-            if (c.op === "Z") continue;
-            for (const q of flattenPath(
-              serializePathCommands([c])
-            )) {
-              pts.push(q);
-            }
-          }
+          const pts = flattenPath(serializePathCommands(artPath.commands));
           const handles: Array<{ from: { x: number; y: number }; to: { x: number; y: number }; cmd: number; pt: number }> = [];
           const controls: Array<{ x: number; y: number; cmd: number; pt: number }> = [];
+          const tethers: Array<{ x: number; y: number }> = [];
           artPath.commands.forEach((c, ci) => {
             if ((c.op === "C" || c.op === "Q") && ci > 0) {
               const prevEnd = artPath.commands[ci - 1].pts;
-              const prev = prevEnd[prevEnd.length - 1];
+              const startAnchor = prevEnd[prevEnd.length - 1];
+              const endAnchor = c.pts[c.pts.length - 1];
               c.pts.forEach((q, pi) => {
                 const isEnd = pi === c.pts.length - 1;
                 if (isEnd) return;
-                handles.push({ from: prev, to: q, cmd: ci, pt: pi });
+                // The cubic's second control belongs to the segment's END
+                // anchor; every other control (cubic c1, the quadratic
+                // control) hangs off the segment's start anchor.
+                const anchor = c.op === "C" && pi === c.pts.length - 2 ? endAnchor : startAnchor;
+                handles.push({ from: anchor, to: q, cmd: ci, pt: pi });
                 controls.push({ ...toClient(q), cmd: ci, pt: pi });
+                tethers.push(toClient(anchor));
               });
             }
           });
@@ -870,6 +889,7 @@ export function CanvasWorkspace() {
               .map(({ c, ci }) => ({ ...toClient(c.pts[c.pts.length - 1]), cmd: ci, pt: c.pts.length - 1 })),
             handles,
             controls,
+            tethers,
           };
         })()
       : null;
@@ -1276,30 +1296,17 @@ export function CanvasWorkspace() {
                       strokeLinecap="round"
                       strokeLinejoin="round"
                     />
-                    {artGeometry.handles.map((h, i) => {
-                      const from = artGeometry.previewLine.length ? null : null;
-                      void from;
-                      const a = artPath.commands[h.cmd - 1]?.pts.slice(-1)[0];
-                      if (!a) return null;
-                      const tc = (() => {
-                        const t = nodeTransform!;
-                        return {
-                          x: t.a * a.x + t.c * a.y + t.e - t.ox,
-                          y: t.b * a.x + t.d * a.y + t.f - t.oy,
-                        };
-                      })();
-                      return (
-                        <line
-                          key={`h-${i}`}
-                          x1={tc.x}
-                          y1={tc.y}
-                          x2={artGeometry.controls[i]?.x}
-                          y2={artGeometry.controls[i]?.y}
-                          stroke="#9aa7a1"
-                          strokeWidth={1}
-                        />
-                      );
-                    })}
+                    {artGeometry.handles.map((h, i) => (
+                      <line
+                        key={`h-${i}`}
+                        x1={artGeometry.tethers[i]?.x}
+                        y1={artGeometry.tethers[i]?.y}
+                        x2={artGeometry.controls[i]?.x}
+                        y2={artGeometry.controls[i]?.y}
+                        stroke="#9aa7a1"
+                        strokeWidth={1}
+                      />
+                    ))}
                   </g>
                   {artGeometry.controls.map((p, i) => (
                     <circle
@@ -1338,34 +1345,6 @@ export function CanvasWorkspace() {
                 </g>
               )}
             </svg>
-          </div>
-        )}
-        {/* Artwork path Save/Cancel bar (Task 33): explicit confirmation —
-            Save submits the edited path (server validates + recompiles),
-            Cancel discards the in-editor changes. */}
-        {tool === "artnode" && artPath && (
-          <div className="mt-2.5 flex flex-wrap items-center gap-2">
-            <span className="text-[10px] text-[#657671]">
-              Shape <code className="font-mono text-[10px] text-[#183837]">{artPath.shapeId}</code>
-              {artPath.dirty ? " · modified" : " · unchanged"}
-            </span>
-            <Button
-              size="sm"
-              className="h-7 rounded-md bg-[#087f74] px-3 text-[10px] font-semibold text-white hover:bg-[#056a60]"
-              disabled={busy || !artPath.dirty}
-              onClick={() => setArtSaveOpen(true)}
-            >
-              Save path
-            </Button>
-            <Button
-              size="sm"
-              variant="outline"
-              className="h-7 rounded-md bg-white px-3 text-[10px]"
-              disabled={busy}
-              onClick={() => setArtPath(null)}
-            >
-              Cancel
-            </Button>
           </div>
         )}
         {/* Pen confirm popover (contract §3): anchored at the drawn shape's
@@ -1613,6 +1592,38 @@ export function CanvasWorkspace() {
           </div>
         )}
       </div>
+
+      {/* Artwork path Save/Cancel bar (Task 33): explicit confirmation — Save
+          submits the edited path (server validates + recompiles), Cancel
+          discards the in-editor changes. Rendered as a SIBLING BELOW the
+          canvas: inside the canvas box the tool overlay (z-3, full canvas
+          area) intercepts every pointer event, so an in-canvas bar would be
+          visible but unclickable whenever a tool is active. */}
+      {tool === "artnode" && artPath && (
+        <div className="mt-2.5 flex flex-wrap items-center gap-2">
+          <span className="text-[10px] text-[#657671]">
+            Shape <code className="font-mono text-[10px] text-[#183837]">{artPath.shapeId}</code>
+            {artPath.dirty ? " · modified" : " · unchanged"}
+          </span>
+          <Button
+            size="sm"
+            className="h-7 rounded-md bg-[#087f74] px-3 text-[10px] font-semibold text-white hover:bg-[#056a60]"
+            disabled={busy || !artPath.dirty}
+            onClick={() => setArtSaveOpen(true)}
+          >
+            Save path
+          </Button>
+          <Button
+            size="sm"
+            variant="outline"
+            className="h-7 rounded-md bg-white px-3 text-[10px]"
+            disabled={busy}
+            onClick={() => setArtPath(null)}
+          >
+            Cancel
+          </Button>
+        </div>
+      )}
 
       {/* Compact difficulty mini-panel (contract §5) — full metrics live in
           the right panel (DifficultyPanel). */}

@@ -977,9 +977,11 @@ export function StudioProvider({ children }: { children: React.ReactNode }) {
       if (isBusyProject(p)) throw new Error("Wait for the current job.");
       if (!p.currentRevision) throw new Error("Build the vector regions first.");
       // Cut/draw supply their own region ids (the target region / none);
+      // 'shape' is keyed by shape_id and never touches region selection;
       // everything else uses the current selection.
       const ids = regionIds ?? [...selectedRef.current];
-      if (!ids.length && action !== "draw") throw new Error("Select at least one region in Edit regions.");
+      if (!ids.length && action !== "draw" && action !== "shape")
+        throw new Error("Select at least one region in Edit regions.");
       const body: EditPayload = {
         base_revision: p.currentRevision,
         action,
@@ -1333,11 +1335,13 @@ export function StudioProvider({ children }: { children: React.ReactNode }) {
     [runEdit]
   );
 
-  /** Task 33 — Artwork Path node mode: replace one source shape's closed path
-   *  by its stable id. Server-side validation + full recompile; the 409
+  /** Task 33 — Artwork Path node edit: replace one source shape's closed path
+   *  by its stable id. region_ids is intentionally EMPTY — the action is
+   *  shape-addressed, so it must never borrow (or require) the gameplay
+   *  region selection. Server-side validation + full recompile; the 409
    *  stale-base guard is the shared edit-route revision check. */
   const editShape = useCallback(
-    (shapeId: string, d: string) => runEdit("shape", { shape_id: shapeId, d }),
+    (shapeId: string, d: string) => runEdit("shape", { shape_id: shapeId, d }, []),
     [runEdit]
   );
 

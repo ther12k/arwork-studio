@@ -5,6 +5,7 @@ import { defineConfig } from "@playwright/test";
  *  server; no Studio/AI stack involved. */
 export default defineConfig({
   testDir: "tests/browser",
+  testMatch: /board\.spec\.ts$/,
   timeout: 30_000,
   forbidOnly: true,
   use: {

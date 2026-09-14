@@ -10,7 +10,8 @@
     "test": "vitest run",
     "browser:build": "bun build tests/browser/harness.ts --outfile tests/browser/dist/harness.js && cp tests/browser/harness.html tests/browser/dist/harness.html",
     "browser:install": "bunx playwright install chromium",
-    "test:browser": "bun run browser:build && bunx playwright test -c playwright.board.config.ts"
+    "test:browser": "bun run browser:build && bunx playwright test -c playwright.board.config.ts",
+    "test:studio-browser": "bun run build && bunx playwright test -c playwright.studio.config.ts"
   },
   "dependencies": {
     "@fontsource-variable/geist": "^5.3.0",
