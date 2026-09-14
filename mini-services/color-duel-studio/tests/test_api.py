@@ -3257,6 +3257,232 @@ def test_layer_reorder_provenance_persisted_in_artifact(client):
     assert exported['provenance']['layerReorder']['reconstructedVisibleSurfaces'] is True
 
 
+def test_recolor_direct_build_durability(client):
+    """Task 32 review round-4 P1-1: the revision CREATED by a recolor already
+    contains the edited source — no intervening reorder is needed. Direct
+    Build (twice) compiles the CURRENT artwork: orange immediately and after
+    both rebuilds."""
+    pid, rev = _task32_overlap_project(client)
+    base = f'/api/projects/{pid}/revisions/{rev}'
+    regions = client.get(f'{base}/files/regions.json').json()['regions']
+    red_region = next(r_ for r_ in regions if r_['objectId'] == 'obj-red')
+    red_shapes = {sid for sid, oid in _shape_ownership(client, pid, rev).items()
+                  if oid == 'obj-red'}
+
+    r = client.post(f'/api/projects/{pid}/edit', headers=H, json={
+        'base_revision': rev, 'action': 'recolor', 'color': '#E8804C',
+        'region_ids': [red_region['id']]})
+    assert r.status_code == 200, r.text
+    p = wait(client, pid)
+    assert p['job']['status'] == 'done', p['job']
+    recolored = p['currentRevision']
+
+    # IMMEDIATELY: the saved source master in the recolor's own revision
+    import xml.etree.ElementTree as ET
+    src_text = client.get(
+        f'/api/projects/{pid}/revisions/{recolored}/files/source-master.svg').text
+    root = ET.fromstring(src_text)
+    fills = {el.get('fill') for el in root.iter()
+             if el.tag.rsplit('}', 1)[-1] == 'path' and el.get('id') in red_shapes}
+    assert fills == {'#E8804C'}, f'source must carry the orange fill at publication: {fills}'
+
+    build_body = {'target_regions': 30, 'palette_colors': 4, 'paint_colors': 16, 'max_edge': 300,
+                  'min_region_pixels': 4, 'min_label_radius': 1.0, 'auto_subdivide': False}
+    for round_no in (1, 2):
+        r = client.post(f'/api/projects/{pid}/build', headers=H, json=build_body)
+        p = wait(client, pid, timeout=120)
+        assert p['job']['status'] == 'done', p['job']
+        reb = p['currentRevision']
+        paint = client.get(f'/api/projects/{pid}/revisions/{reb}/files/paint.json').json()
+        fills_b = {q['fill'] for q in paint['paths'] if q.get('shapeId') in red_shapes}
+        assert fills_b == {'#E8804C'}, f'direct build round {round_no} reverted the recolor: {fills_b}'
+        colored = client.get(f'/api/projects/{pid}/revisions/{reb}/files/colored.svg').text
+        assert '#E8804C' in colored and '#CC3333' not in colored
+
+
+def test_pen_direct_build_durability(client):
+    """Task 32 review round-4 P1-1: the revision CREATED by an artwork-pen
+    stroke already contains the new source shape — direct Build (twice) keeps
+    the shape, its stable id, ownership and appearance without any reorder."""
+    pid, rev = _task32_overlap_project(client)
+    r = client.post(f'/api/projects/{pid}/edit', headers=H, json={
+        'base_revision': rev, 'action': 'draw', 'region_ids': [], 'palette_id': 2,
+        'paint': True, 'color': '#FFD24D',
+        'd': 'M 40,220 L 90,220 L 90,270 L 40,270 Z'})
+    assert r.status_code == 200, r.text
+    p = wait(client, pid)
+    assert p['job']['status'] == 'done', p['job']
+    drawn = p['currentRevision']
+
+    paint = client.get(f'/api/projects/{pid}/revisions/{drawn}/files/paint.json').json()
+    pen = next(q for q in paint['paths'] if (q.get('shapeId') or '').startswith('sp-'))
+    pen_shape, pen_d = pen['shapeId'], pen['d']
+    pen_owner = _shape_ownership(client, pid, drawn)[pen_shape]
+
+    # IMMEDIATELY: the saved source master contains the pen path with its id
+    src_text = client.get(
+        f'/api/projects/{pid}/revisions/{drawn}/files/source-master.svg').text
+    assert f'id="{pen_shape}"' in src_text and '#FFD24D' in src_text, \
+        'the pen revision must carry its artwork in the source at publication'
+
+    build_body = {'target_regions': 30, 'palette_colors': 4, 'paint_colors': 16, 'max_edge': 300,
+                  'min_region_pixels': 4, 'min_label_radius': 1.0, 'auto_subdivide': False}
+    for round_no in (1, 2):
+        r = client.post(f'/api/projects/{pid}/build', headers=H, json=build_body)
+        p = wait(client, pid, timeout=120)
+        assert p['job']['status'] == 'done', p['job']
+        reb = p['currentRevision']
+        paint_b = client.get(f'/api/projects/{pid}/revisions/{reb}/files/paint.json').json()
+        pen_b = next(q for q in paint_b['paths'] if q.get('shapeId') == pen_shape)
+        assert pen_b['d'] == pen_d and pen_b['fill'] == '#FFD24D', \
+            f'direct build round {round_no} lost the pen artwork'
+        assert _shape_ownership(client, pid, reb).get(pen_shape) == pen_owner
+        colored = client.get(f'/api/projects/{pid}/revisions/{reb}/files/colored.svg').text
+        assert '#FFD24D' in colored
+
+
+TASK32_GRADIENT_SVG = b'''<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 300 200">
+<defs>
+<linearGradient id="sunset" x1="0" y1="0" x2="1" y2="0">
+<stop offset="0" stop-color="#112233"/>
+<stop offset="1" stop-color="#445566"/>
+</linearGradient>
+</defs>
+<g data-cd-object="obj-sky" data-cd-name="Sky">
+<rect x="0" y="0" width="300" height="140" fill="url(#sunset)"/>
+</g>
+<g data-cd-object="obj-ground" data-cd-name="Ground">
+<rect x="0" y="140" width="300" height="60" fill="#44AA66"/>
+</g>
+</svg>'''
+
+
+def _gradient_project(client):
+    pid = new(client)
+    r = client.post(f'/api/projects/{pid}/upload-svg', headers=H,
+                    files={'file': ('grad.svg', TASK32_GRADIENT_SVG, 'image/svg+xml')},
+                    data={'rights_confirmed': 'true'})
+    assert r.status_code == 200, r.text
+    r = client.post(f'/api/projects/{pid}/build', headers=H, json={
+        'target_regions': 30, 'palette_colors': 4, 'paint_colors': 16, 'max_edge': 300,
+        'min_region_pixels': 4, 'min_label_radius': 1.0, 'auto_subdivide': False})
+    assert r.status_code == 200, r.text
+    p = wait(client, pid, timeout=120)
+    assert p['job']['status'] == 'done', p['job']
+    return pid, p['currentRevision']
+
+
+def _source_stops(client, pid, rev):
+    import xml.etree.ElementTree as ET
+    src = client.get(f'/api/projects/{pid}/revisions/{rev}/files/source-master.svg').text
+    root = ET.fromstring(src)
+    for el in root.iter():
+        if el.tag.rsplit('}', 1)[-1] in ('linearGradient', 'radialGradient'):
+            return [c.get('stop-color') for c in el if c.tag.rsplit('}', 1)[-1] == 'stop']
+    return []
+
+
+def _paint_gradient_stops(client, pid, rev):
+    paint = client.get(f'/api/projects/{pid}/revisions/{rev}/files/paint.json').json()
+    for g in paint.get('gradients') or []:
+        if g.get('ref'):
+            return [s['color'] for s in g['stops']]
+    return []
+
+
+def test_gradient_preserve_shading_survives_full_chain(client):
+    """Task 32 review round-4 P1-2: preserve-shading recolor must reach the
+    SOURCE definition (paint instance ids never match the source def — the
+    sync resolves through the recorded ref). The tint survives: saved source
+    stops, direct Build, reorder, and Build again — comparing ACTUAL stops
+    and rendered appearance, not just url(#) presence."""
+    pid, rev = _gradient_project(client)
+    assert _source_stops(client, pid, rev) == ['#112233', '#445566'], \
+        'fixture: original gradient stops must be the authored ones'
+
+    regions = client.get(f'/api/projects/{pid}/revisions/{rev}/files/regions.json').json()['regions']
+    sky_region = next(r_ for r_ in regions if r_['objectId'] == 'obj-sky')
+    r = client.post(f'/api/projects/{pid}/edit', headers=H, json={
+        'base_revision': rev, 'action': 'recolor', 'color': '#E8804C',
+        'preserve_shading': True, 'region_ids': [sky_region['id']]})
+    assert r.status_code == 200, r.text
+    p = wait(client, pid)
+    assert p['job']['status'] == 'done', p['job']
+    tinted = p['currentRevision']
+
+    tinted_paint_stops = _paint_gradient_stops(client, pid, tinted)
+    assert tinted_paint_stops != ['#112233', '#445566'], 'recolor must tint the stops'
+    # the SOURCE definition (via ref) carries the same tint at publication
+    assert _source_stops(client, pid, tinted) == tinted_paint_stops, \
+        'saved source stops must equal the tinted paint stops immediately'
+
+    build_body = {'target_regions': 30, 'palette_colors': 4, 'paint_colors': 16, 'max_edge': 300,
+                  'min_region_pixels': 4, 'min_label_radius': 1.0, 'auto_subdivide': False}
+
+    # direct Build — tint survives
+    r = client.post(f'/api/projects/{pid}/build', headers=H, json=build_body)
+    p = wait(client, pid, timeout=120)
+    assert p['job']['status'] == 'done', p['job']
+    built = p['currentRevision']
+    assert _paint_gradient_stops(client, pid, built) == tinted_paint_stops, \
+        'direct build must re-derive the TINTED gradient, not the original'
+    assert _source_stops(client, pid, built) == tinted_paint_stops
+    colored = client.get(f'/api/projects/{pid}/revisions/{built}/files/colored.svg').text
+    assert tinted_paint_stops[0] in colored and tinted_paint_stops[1] in colored
+    assert '#112233' not in colored
+
+    # reorder — full recompile keeps the tint
+    r = client.post(f'/api/projects/{pid}/objects', headers=H, json={
+        'base_revision': built, 'object_id': 'obj-ground', 'order_action': 'bring_to_front'})
+    p = wait(client, pid)
+    assert p['job']['status'] == 'done', p['job']
+    reordered = p['currentRevision']
+    assert _paint_gradient_stops(client, pid, reordered) == tinted_paint_stops
+    assert _source_stops(client, pid, reordered) == tinted_paint_stops
+
+    # Build again — still tinted
+    r = client.post(f'/api/projects/{pid}/build', headers=H, json=build_body)
+    p = wait(client, pid, timeout=120)
+    assert p['job']['status'] == 'done', p['job']
+    final = p['currentRevision']
+    assert _paint_gradient_stops(client, pid, final) == tinted_paint_stops
+    colored_f = client.get(f'/api/projects/{pid}/revisions/{final}/files/colored.svg').text
+    assert tinted_paint_stops[0] in colored_f and '#112233' not in colored_f
+
+
+def test_import_master_rejects_duplicate_internal_ids():
+    """Task 32 review round-4 P2: a duplicate internal identity in an internal
+    document is rejected with an actionable error, never silently reassigned."""
+    from studio.svg_master import import_master
+    text = ('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100">'
+            '<path id="s0000" d="M 0,0 L 50,0 L 50,50 Z" fill="#123456"/>'
+            '<path id="s0000" d="M 10,10 L 60,10 L 60,60 Z" fill="#654321"/>'
+            '</svg>')
+    with pytest.raises(ValueError, match='Duplicate shape identity'):
+        import_master(text, preserve_shape_ids=True)
+
+
+def test_import_master_fallback_allocation_is_collision_safe():
+    """Task 32 review round-4 P2: genuine allocation reserves existing valid
+    ids and yields an unused one (probe cases s0001+s0001 and s0001+missing)."""
+    from studio.svg_master import import_master
+    # preserved s0001 first, then a path WITHOUT an id: the fallback must not
+    # reuse s0001 (the old allocator produced s0001, s0001 here).
+    text = ('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100">'
+            '<path id="s0001" d="M 0,0 L 50,0 L 50,50 Z" fill="#123456"/>'
+            '<path d="M 10,10 L 60,10 L 60,60 Z" fill="#654321"/>'
+            '</svg>')
+    doc = import_master(text, preserve_shape_ids=True)
+    ids = [s['id'] for s in doc.shapes]
+    assert ids == ['s0001', 's0000'] or ids == ['s0001', 's0002'], ids
+    assert len(ids) == len(set(ids)), 'allocated ids must never collide'
+
+    # external import (no preserve): allocation unchanged, sequential
+    doc_ext = import_master(text, preserve_shape_ids=False)
+    ext_ids = [s['id'] for s in doc_ext.shapes]
+    assert ext_ids == ['s0000', 's0001'], ext_ids
+
+
 def test_unparented_object_stays_root_across_rebuilds(client):
     """Task 32 review round-2 R3B: moving a genuinely nested imported object
     back to the root is an AUTHORITATIVE deletion — the derived parentId from

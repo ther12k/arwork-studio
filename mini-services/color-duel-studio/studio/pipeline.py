@@ -3397,8 +3397,19 @@ def edit_bundle(source: Path, output: Path, request, version: str):
     m['provenance']['lastEdit'] = request.action
     output.mkdir(parents=True, exist_ok=True)
     master_name = m['assets'].get('sourceMaster', 'source-master.png')
+    # Task 32 review round-4 P1-1: artwork edits (recolor fills + gradient
+    # tints, artwork-pen shapes) are synchronized into the authoritative
+    # source AT PUBLICATION TIME — the revision an edit creates already
+    # carries the edited master, so a direct Build (no intervening reorder)
+    # compiles the CURRENT artwork instead of reverting it. Validation/QA of
+    # the candidate revision runs on the synced snapshot below.
+    synced_master = _sync_source_master(bundle, source)
+    if synced_master is not None:
+        (output / 'source-master.svg').write_text(synced_master, encoding='utf-8')
+    elif (source / 'source-master.svg').is_file():
+        shutil.copy2(source / 'source-master.svg', output / 'source-master.svg')
     for f in {master_name, 'build-settings.json'}:
-        if (source / f).is_file(): shutil.copy2(source / f, output / f)
+        if f != 'source-master.svg' and (source / f).is_file(): shutil.copy2(source / f, output / f)
     qa = emit_bundle(output, bundle)
     if pen_warning:
         qa.setdefault('warnings', []).append(pen_warning)
@@ -3503,12 +3514,20 @@ def _sync_source_master(bundle: dict, source: Path) -> str | None:
             el.set('stroke-width', str(p['strokeWidth']))
             changed = True
 
-    # gradient stop sync (preserve_shading recolors tint stops in paint.json)
-    grads = {g.get('id'): g for g in (paint.get('gradients') or [])}
+    # gradient stop sync (preserve_shading recolors tint stops in paint.json).
+    # Round-4 P1-2: paint gradient INSTANCE ids are regenerated per import
+    # (g-0000-g-0000-sunset ≠ the source def g-0000-sunset), so the lookup
+    # resolves through the RECORDED SOURCE REFERENCE (g['ref']) — the exact
+    # definition that supplies the shape — never the instance id, and never
+    # an approximate name match.
+    grads_by_ref: dict = {}
+    for g in (paint.get('gradients') or []):
+        if g.get('ref'):
+            grads_by_ref.setdefault(g['ref'], g)
     for el in root.iter():
         if _local_svg_tag(el.tag) not in ('linearGradient', 'radialGradient'):
             continue
-        g = grads.get(el.get('id'))
+        g = grads_by_ref.get(el.get('id'))
         if not g:
             continue
         stops = [c for c in el if _local_svg_tag(c.tag) == 'stop']

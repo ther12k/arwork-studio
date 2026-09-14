@@ -310,8 +310,11 @@ class MasterDoc:
                              'notes': ['Imported SVG masters keep original curve commands; '
                                        'nothing is rasterized or retraced.']}
         self.source_text: str = ''
-        # Identity bookkeeping for internal round-trips (uniqueness guard).
+        # Identity bookkeeping for internal round-trips: ids already claimed
+        # during this import, and every internal-format id present in the
+        # document (allocation must yield to them).
         self.seen_shape_ids: set = set()
+        self.reserved_ids: set = set()
 
     def summary(self) -> dict:
         curved = sum(1 for s in self.shapes + self.ink_shapes
@@ -534,6 +537,10 @@ def import_master(text: str, preserve_shape_ids: bool = False) -> MasterDoc:
     total_elements = sum(1 for _ in root.iter())
     if total_elements > _MAX_ELEMENTS:
         raise ValueError(f'SVG exceeds {_MAX_ELEMENTS} elements.')
+    if preserve_shape_ids:
+        # Allocation must yield to every internal-format id present in the
+        # document — a fallback sNNNN may never collide with a preserved one.
+        doc.reserved_ids = {eid for eid in id_map if _INTERNAL_ID_RE.match(eid)}
 
     order = 0
     seen_use: set = set()
@@ -596,12 +603,27 @@ def import_master(text: str, preserve_shape_ids: bool = False) -> MasterDoc:
             return
         if sum(len(s['commands']) for s in doc.shapes) + sum(len(s['commands']) for s in doc.ink_shapes) + len(cmds) > _MAX_COMMANDS:
             raise ValueError('SVG master is too complex (command budget exceeded).')
-        shape_id = f's{ordn:04d}'          # generated: never emitted from source text
+        shape_id = None
         source_id = sattrs.get('id')        # kept for reports only
-        if preserve_shape_ids and source_id and _INTERNAL_ID_RE.match(source_id) \
-                and source_id not in doc.seen_shape_ids:
-            # Internal authoring round-trip: keep the allocated identity.
+        if preserve_shape_ids and source_id and _INTERNAL_ID_RE.match(source_id):
+            # Internal round-trip: keep the allocated identity. A duplicate
+            # identity in an internal document is corruption — reject it with
+            # an actionable error instead of silently reassigning a shape.
+            if source_id in doc.seen_shape_ids:
+                raise ValueError(
+                    f'Duplicate shape identity "{source_id}" in the source master — every shape '
+                    'must carry a unique id. Re-import the artwork to reallocate identities.')
             shape_id = source_id
+        if shape_id is None:
+            # Genuine allocation (external import, or an element without an
+            # internal id): reserve existing valid ids and allocate an unused
+            # one — the traversal index is the starting point, never a right.
+            n = ordn
+            candidate = f's{n:04d}'
+            while candidate in doc.seen_shape_ids or candidate in doc.reserved_ids:
+                n += 1
+                candidate = f's{n:04d}'
+            shape_id = candidate
         doc.seen_shape_ids.add(shape_id)
         role = sattrs.get('data-cd-role') or None
         if role not in (None, 'gameplay', 'shading', 'ink'):
