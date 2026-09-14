@@ -860,7 +860,6 @@ export function CanvasWorkspace() {
             y: nodeTransform.b * p.x + nodeTransform.d * p.y + nodeTransform.f - nodeTransform.oy,
           });
           const pts = flattenPath(serializePathCommands(artPath.commands));
-          const handles: Array<{ from: { x: number; y: number }; to: { x: number; y: number }; cmd: number; pt: number }> = [];
           const controls: Array<{ x: number; y: number; cmd: number; pt: number }> = [];
           const tethers: Array<{ x: number; y: number }> = [];
           artPath.commands.forEach((c, ci) => {
@@ -875,7 +874,6 @@ export function CanvasWorkspace() {
                 // anchor; every other control (cubic c1, the quadratic
                 // control) hangs off the segment's start anchor.
                 const anchor = c.op === "C" && pi === c.pts.length - 2 ? endAnchor : startAnchor;
-                handles.push({ from: anchor, to: q, cmd: ci, pt: pi });
                 controls.push({ ...toClient(q), cmd: ci, pt: pi });
                 tethers.push(toClient(anchor));
               });
@@ -887,7 +885,6 @@ export function CanvasWorkspace() {
               .map((c, ci) => ({ c, ci }))
               .filter(({ c }) => c.op !== "Z" && c.pts.length > 0)
               .map(({ c, ci }) => ({ ...toClient(c.pts[c.pts.length - 1]), cmd: ci, pt: c.pts.length - 1 })),
-            handles,
             controls,
             tethers,
           };
@@ -1296,7 +1293,7 @@ export function CanvasWorkspace() {
                       strokeLinecap="round"
                       strokeLinejoin="round"
                     />
-                    {artGeometry.handles.map((h, i) => (
+                    {artGeometry.controls.map((_, i) => (
                       <line
                         key={`h-${i}`}
                         x1={artGeometry.tethers[i]?.x}
