@@ -82,7 +82,7 @@ export const VIEW_LABELS: Record<StudioView, string> = {
 const PROJECT_STORAGE_KEY = "studio-project";
 const RECENT_COLORS_KEY = "cd-studio-recent-colors";
 const FREE_HEX_RE = /^#[0-9A-Fa-f]{6}$/;
-export type StudioTool = "select" | "cut" | "pen" | "node";
+export type StudioTool = "select" | "cut" | "pen" | "node" | "artnode";
 const DEFAULT_BRIEF =
   "An original detailed woodland treehouse beside a waterfall, with warm lanterns, a winding staircase and flowering plants. Clear contours, coherent architecture, rich shading. No text, UI, palette or gameplay numbers.";
 
@@ -131,6 +131,7 @@ export interface StudioApi {
   /** Rebuild the shared boundary between two regions (dragged anchors):
    *  edit action "node" with the new open boundary path d. */
   nodeEdit: (regionIds: [string, string], d: string) => Promise<void>;
+  editShape: (shapeId: string, d: string) => Promise<void>;
   // free color (true custom colors, contract §4)
   freeColor: string;
   setBoardFreeColor: (hex: string) => void;
@@ -1332,6 +1333,14 @@ export function StudioProvider({ children }: { children: React.ReactNode }) {
     [runEdit]
   );
 
+  /** Task 33 — Artwork Path node mode: replace one source shape's closed path
+   *  by its stable id. Server-side validation + full recompile; the 409
+   *  stale-base guard is the shared edit-route revision check. */
+  const editShape = useCallback(
+    (shapeId: string, d: string) => runEdit("shape", { shape_id: shapeId, d }),
+    [runEdit]
+  );
+
   /** Apply a custom free-mode color (contract §4) and remember it in the
    *  recent list (capped at 10, persisted in localStorage OUTSIDE the board). */
   const setBoardFreeColor = useCallback((hex: string) => {
@@ -1584,6 +1593,7 @@ export function StudioProvider({ children }: { children: React.ReactNode }) {
     cutRegion,
     drawRegion,
     nodeEdit,
+    editShape,
     freeColor,
     setBoardFreeColor,
     recentColors,

@@ -58,11 +58,11 @@ class PromoteRequest(StrictModel):
 
 class EditRequest(StrictModel):
     base_revision: str
-    action: Literal['merge', 'group', 'palette', 'recolor', 'label', 'decorate', 'split', 'cut', 'draw', 'node']
+    action: Literal['merge', 'group', 'palette', 'recolor', 'label', 'decorate', 'split', 'cut', 'draw', 'node', 'shape']
     region_ids: list[str] = Field(max_length=1600,
         description='Validated per action: merge>=2, split/cut/label=1, node=2 (the two regions sharing the dragged boundary), draw=0, others>=1.')
     d: str | None = Field(None, pattern=r'^M[\s\d.,eE+\-MLQCZ]+$',
-        description="SVG path data in master units: 'cut' = open line crossing the region, 'draw' = closed pen shape (Z closes it), 'node' = the dragged new shared-boundary polyline.")
+        description="SVG path data in master units: 'cut' = open line crossing the region, 'draw' = closed pen shape (Z closes it), 'node' = the dragged new shared-boundary polyline, 'shape' = the edited closed master path (M…Z).")
     group: str = Field('unassigned', pattern=r'^[a-z][a-z0-9_-]{0,39}$')
     palette_id: int | None = None
     x: float | None = Field(None, allow_inf_nan=False)
@@ -80,6 +80,10 @@ class EditRequest(StrictModel):
         description="'draw' with paint=true: draw an ink outline of this width on the paint path (0 or null = no outline).")
     z_behind: bool = Field(False,
         description="'draw' with paint=true: place the new paint path BEHIND the existing art (min z - 1) instead of on top (max z + 1).")
+    # Task 33 — Artwork Path node mode: edit ONE source shape's geometry by
+    # its stable internal id. The full recompile re-derives paint + visible
+    # gameplay surfaces; shapeId and object ownership are preserved.
+    shape_id: str | None = Field(None, min_length=1, max_length=64)
 
 class ReviewRequest(StrictModel):
     revision: str

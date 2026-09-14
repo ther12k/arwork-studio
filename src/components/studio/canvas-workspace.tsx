@@ -44,7 +44,13 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 import { Textarea } from "@/components/ui/textarea";
 import type { BoardMode, EdgeEntry, VectorBoard } from "@/lib/detailed-board";
 import { imageUrl, masterSvgUrl, type DifficultyProfile } from "@/lib/studio-api";
-import { flattenPath, polylineNearestDistance } from "@/lib/svg-path";
+import {
+  flattenPath,
+  parsePathCommands,
+  polylineNearestDistance,
+  serializePathCommands,
+  type PathCommand,
+} from "@/lib/svg-path";
 import { VIEW_LABELS, type StudioTool, type StudioView, useStudioContext } from "./use-studio";
 import { sessionResumeCopy } from "./create-artwork";
 import {
@@ -63,6 +69,7 @@ const TOOL_HINTS: Record<StudioTool, string> = {
   cut: "Drag a line across a region — outside one edge to outside the opposite edge",
   pen: "Draw a closed shape — the artwork pen paints it, the region pen is gameplay-only",
   node: "Tap a boundary between two regions, then drag its anchor points.",
+  artnode: "Tap a region to load its source shape, then drag its anchors or handles — Save recompiles.",
 };
 
 const MODE_HINTS: Record<BoardMode, string> = {
@@ -300,6 +307,7 @@ export function CanvasWorkspace() {
     cutRegion,
     drawRegion,
     nodeEdit,
+    editShape,
     recordPlaytest,
     freeColor,
     setBoardFreeColor,
@@ -389,6 +397,103 @@ export function CanvasWorkspace() {
    *  coordinate space (viewBox undefined), so its rect defines the origin. */
   const overlaySvgRef = useRef<SVGSVGElement | null>(null);
 
+  // --------------------------------------------- artwork node tool (Task 33)
+
+  /** The artwork path being node-edited: the SOURCE shape id (stable), the
+   *  parsed commands (M/L/C/Q/Z, absolute), and which control point (command
+   *  index + point index) is being dragged. Anchor = command endpoint,
+   *  handle = a Bézier control point. */
+  const [artPath, setArtPath] = useState<{
+    shapeId: string;
+    /** Region whose masterShapeId selected the shape (for the caption). */
+    regionId: string | null;
+    commands: PathCommand[];
+    dragging: { cmd: number; pt: number } | null;
+    dirty: boolean;
+  } | null>(null);
+  const [artSaveOpen, setArtSaveOpen] = useState(false);
+
+  const pickArtPath = (clientX: number, clientY: number) => {
+    const board = boardRef.current;
+    if (!board || !bundle?.paint) return;
+    const p = board.clientToArt(clientX, clientY);
+    if (!p) return;
+    // nearest paint path within ~20 art units of the tap (reverse z = topmost)
+    const entries = [...bundle.paint.paths]
+      .filter((q) => q.shapeId)
+      .sort((a, b) => (b.z ?? -Infinity) - (a.z ?? -Infinity));
+    let best: { shapeId: string; d: string; dist: number } | null = null;
+    for (const q of entries) {
+      const pts = flattenPath(q.d);
+      if (pts.length < 2) continue;
+      const dist = polylineNearestDistance(pts, { x: p.x, y: p.y });
+      if (!best || dist < best.dist) best = { shapeId: q.shapeId!, d: q.d, dist };
+    }
+    if (!best || best.dist > 20) {
+      setArtPath(null);
+      toast("Tap directly on an artwork shape outline.");
+      return;
+    }
+    const commands = parsePathCommands(best.d);
+    if (!commands.length || commands[commands.length - 1].op !== "Z") {
+      toast("This shape is not a closed path — only closed artwork is editable in this slice.");
+      return;
+    }
+    captureNodeTransform();
+    setArtPath({ shapeId: best.shapeId, regionId: null, commands, dragging: null, dirty: false });
+  };
+
+  const beginArtDrag = (e: React.PointerEvent<SVGCircleElement>, cmd: number, pt: number) => {
+    e.stopPropagation();
+    try {
+      e.currentTarget.setPointerCapture(e.pointerId);
+    } catch {
+      /* synthetic events / stale ids — continue without capture */
+    }
+    setArtPath((prev) => (prev ? { ...prev, dragging: { cmd, pt } } : prev));
+  };
+
+  const extendArtDrag = (e: React.PointerEvent<SVGCircleElement>) => {
+    const board = boardRef.current;
+    if (!board) return;
+    const p = board.clientToArt(e.clientX, e.clientY);
+    if (!p) return;
+    setArtPath((prev) => {
+      if (!prev || !prev.dragging) return prev;
+      const { cmd, pt } = prev.dragging;
+      return {
+        ...prev,
+        dirty: true,
+        commands: prev.commands.map((c, i) =>
+          i === cmd ? { ...c, pts: c.pts.map((q, j) => (j === pt ? { x: p.x, y: p.y } : q)) } : c
+        ),
+      };
+    });
+  };
+
+  const endArtDrag = (e: React.PointerEvent<SVGCircleElement>) => {
+    if (e.currentTarget.hasPointerCapture?.(e.pointerId)) {
+      try {
+        e.currentTarget.releasePointerCapture(e.pointerId);
+      } catch {
+        /* pointer already released */
+      }
+    }
+    setArtPath((prev) => (prev && prev.dragging ? { ...prev, dragging: null } : prev));
+  };
+
+  /** Save: submit the edited path (edit action "shape", keyed by the stable
+   *  shapeId — the 409 stale-base guard is the shared edit-route check). */
+  const saveArtPath = () => {
+    const path = artPath;
+    if (!path || !path.dirty) return;
+    setArtSaveOpen(false);
+    setArtPath(null);
+    void editShape(path.shapeId, serializePathCommands(path.commands)).catch((e: Error) =>
+      toast(e.message)
+    );
+  };
+
   const toolActive = view === "inspect" && hasBundle && tool !== "select" && !busy;
 
   const strokeWidthArt = (() => {
@@ -400,10 +505,11 @@ export function CanvasWorkspace() {
   const beginStroke = (e: React.PointerEvent<SVGSVGElement>) => {
     const board = boardRef.current;
     if (!board) return;
-    // Node tool: the pointerdown only bookmarks the tap — the boundary is
-    // picked on pointerup IF the pointer did not drag (anchor handles stop
-    // propagation before this, so drags never bookmark).
-    if (tool === "node") {
+    // Node tools: the pointerdown only bookmarks the tap — the target
+    // (gameplay boundary / artwork shape) is picked on pointerup IF the
+    // pointer did not drag (anchor handles stop propagation before this,
+    // so drags never bookmark).
+    if (tool === "node" || tool === "artnode") {
       nodeTapRef.current = { x: e.clientX, y: e.clientY };
       return;
     }
@@ -436,13 +542,14 @@ export function CanvasWorkspace() {
   };
 
   const endStroke = (e: React.PointerEvent<SVGSVGElement>) => {
-    // Node tool: resolve the bookmarked tap (down+up without a significant
-    // drag). Tapping empty canvas clears the current boundary selection.
-    if (tool === "node") {
+    // Node tools: resolve the bookmarked tap (down+up without a significant
+    // drag). Tapping empty canvas clears the current selection.
+    if (tool === "node" || tool === "artnode") {
       const tap = nodeTapRef.current;
       nodeTapRef.current = null;
       if (tap && Math.hypot(e.clientX - tap.x, e.clientY - tap.y) < 8) {
-        pickNodeEdge(e.clientX, e.clientY);
+        if (tool === "node") pickNodeEdge(e.clientX, e.clientY);
+        else pickArtPath(e.clientX, e.clientY);
       }
       return;
     }
@@ -662,12 +769,15 @@ export function CanvasWorkspace() {
   // resets the overlay to client-space coordinates (viewBox undefined →
   // 1 user unit = 1 client px).
   const nodeSessionKey =
-    tool === "node" && view === "inspect" && bundle ? `${bundle.manifest.id}:${bundle.manifest.version}` : null;
+    (tool === "node" || tool === "artnode") && view === "inspect" && bundle
+      ? `${bundle.manifest.id}:${bundle.manifest.version}`
+      : null;
   const [syncedNodeSession, setSyncedNodeSession] = useState<string | null>(null);
   if (nodeSessionKey !== syncedNodeSession) {
     setSyncedNodeSession(nodeSessionKey);
     setNodeEdge(null);
     setNodeConfirmOpen(false);
+    setArtPath(null);
     if (nodeSessionKey != null) setStrokeViewBox(null);
   }
 
@@ -675,8 +785,9 @@ export function CanvasWorkspace() {
   // underneath (toolbar zoom / fit / focus — the overlay itself blocks
   // direct board gestures) and when the window resizes the canvas.
   const nodeEdgeId = nodeEdge?.edgeId ?? null;
+  const artPathActive = tool === "artnode" && !!artPath;
   useEffect(() => {
-    if (!nodeEdgeId) return;
+    if (!nodeEdgeId && !artPathActive) return;
     const svg = boardRef.current?.svg;
     if (!svg) return;
     captureNodeTransform();
@@ -691,7 +802,7 @@ export function CanvasWorkspace() {
       observer?.disconnect();
       window.removeEventListener("resize", refresh);
     };
-  }, [nodeEdgeId, boardRef, captureNodeTransform]);
+  }, [nodeEdgeId, artPathActive, boardRef, captureNodeTransform]);
 
   // Node overlay geometry: pure art → client px application of the captured
   // transform — the anchor handles keep a constant on-screen size at any
@@ -713,6 +824,52 @@ export function CanvasWorkspace() {
             baseLine: closeRing(base),
             anchorLine: closeRing(anchors),
             anchors,
+          };
+        })()
+      : null;
+
+  // Artwork-node overlay geometry (Task 33): the path's control points in
+  // client px. Anchors (command endpoints) render solid; Bézier handles
+  // (control points) render hollow with thin connector lines. Flattening
+  // samples each C/Q segment for the preview outline.
+  const artGeometry =
+    artPath && nodeTransform
+      ? (() => {
+          const toClient = (p: { x: number; y: number }) => ({
+            x: nodeTransform.a * p.x + nodeTransform.c * p.y + nodeTransform.e - nodeTransform.ox,
+            y: nodeTransform.b * p.x + nodeTransform.d * p.y + nodeTransform.f - nodeTransform.oy,
+          });
+          const pts: Array<{ x: number; y: number }> = [];
+          for (const c of artPath.commands) {
+            if (c.op === "Z") continue;
+            for (const q of flattenPath(
+              serializePathCommands([c])
+            )) {
+              pts.push(q);
+            }
+          }
+          const handles: Array<{ from: { x: number; y: number }; to: { x: number; y: number }; cmd: number; pt: number }> = [];
+          const controls: Array<{ x: number; y: number; cmd: number; pt: number }> = [];
+          artPath.commands.forEach((c, ci) => {
+            if ((c.op === "C" || c.op === "Q") && ci > 0) {
+              const prevEnd = artPath.commands[ci - 1].pts;
+              const prev = prevEnd[prevEnd.length - 1];
+              c.pts.forEach((q, pi) => {
+                const isEnd = pi === c.pts.length - 1;
+                if (isEnd) return;
+                handles.push({ from: prev, to: q, cmd: ci, pt: pi });
+                controls.push({ ...toClient(q), cmd: ci, pt: pi });
+              });
+            }
+          });
+          return {
+            previewLine: pts.map(toClient),
+            anchors: artPath.commands
+              .map((c, ci) => ({ c, ci }))
+              .filter(({ c }) => c.op !== "Z" && c.pts.length > 0)
+              .map(({ c, ci }) => ({ ...toClient(c.pts[c.pts.length - 1]), cmd: ci, pt: c.pts.length - 1 })),
+            handles,
+            controls,
           };
         })()
       : null;
@@ -1105,7 +1262,110 @@ export function CanvasWorkspace() {
                   ))}
                 </g>
               )}
+              {/* Artwork Path node overlay (Task 33): live Bézier preview +
+                  draggable anchors (solid) and handles (hollow, tethered).
+                  Same constant-screen-size handles as the boundary tool. */}
+              {tool === "artnode" && artPath && artGeometry && (
+                <g role="group" aria-label={`Artwork path anchors for shape ${artPath.shapeId}`}>
+                  <g style={{ pointerEvents: "none" }}>
+                    <polyline
+                      points={artGeometry.previewLine.map((p) => `${p.x},${p.y}`).join(" ")}
+                      fill="none"
+                      stroke={artPath.dirty ? "#ba463f" : "#087f74"}
+                      strokeWidth={2}
+                      strokeLinecap="round"
+                      strokeLinejoin="round"
+                    />
+                    {artGeometry.handles.map((h, i) => {
+                      const from = artGeometry.previewLine.length ? null : null;
+                      void from;
+                      const a = artPath.commands[h.cmd - 1]?.pts.slice(-1)[0];
+                      if (!a) return null;
+                      const tc = (() => {
+                        const t = nodeTransform!;
+                        return {
+                          x: t.a * a.x + t.c * a.y + t.e - t.ox,
+                          y: t.b * a.x + t.d * a.y + t.f - t.oy,
+                        };
+                      })();
+                      return (
+                        <line
+                          key={`h-${i}`}
+                          x1={tc.x}
+                          y1={tc.y}
+                          x2={artGeometry.controls[i]?.x}
+                          y2={artGeometry.controls[i]?.y}
+                          stroke="#9aa7a1"
+                          strokeWidth={1}
+                        />
+                      );
+                    })}
+                  </g>
+                  {artGeometry.controls.map((p, i) => (
+                    <circle
+                      key={`c-${i}`}
+                      cx={p.x}
+                      cy={p.y}
+                      r={artPath.dragging?.cmd === p.cmd && artPath.dragging?.pt === p.pt ? 6 : 4}
+                      fill={artPath.dragging?.cmd === p.cmd && artPath.dragging?.pt === p.pt ? "#ba463f" : "white"}
+                      stroke="#ba463f"
+                      strokeWidth={1.5}
+                      style={{ cursor: "grab" }}
+                      aria-label={`Bézier handle ${i + 1}`}
+                      onPointerDown={(e) => beginArtDrag(e, p.cmd, p.pt)}
+                      onPointerMove={extendArtDrag}
+                      onPointerUp={endArtDrag}
+                      onPointerCancel={endArtDrag}
+                    />
+                  ))}
+                  {artGeometry.anchors.map((p) => (
+                    <circle
+                      key={`a-${p.cmd}`}
+                      cx={p.x}
+                      cy={p.y}
+                      r={artPath.dragging?.cmd === p.cmd && artPath.dragging?.pt === p.pt ? 7 : 5}
+                      fill={artPath.dragging?.cmd === p.cmd && artPath.dragging?.pt === p.pt ? "#087f74" : "white"}
+                      stroke="#087f74"
+                      strokeWidth={1.5}
+                      style={{ cursor: artPath.dragging?.cmd === p.cmd ? "grabbing" : "grab" }}
+                      aria-label={`Anchor ${p.cmd + 1}`}
+                      onPointerDown={(e) => beginArtDrag(e, p.cmd, p.pt)}
+                      onPointerMove={extendArtDrag}
+                      onPointerUp={endArtDrag}
+                      onPointerCancel={endArtDrag}
+                    />
+                  ))}
+                </g>
+              )}
             </svg>
+          </div>
+        )}
+        {/* Artwork path Save/Cancel bar (Task 33): explicit confirmation —
+            Save submits the edited path (server validates + recompiles),
+            Cancel discards the in-editor changes. */}
+        {tool === "artnode" && artPath && (
+          <div className="mt-2.5 flex flex-wrap items-center gap-2">
+            <span className="text-[10px] text-[#657671]">
+              Shape <code className="font-mono text-[10px] text-[#183837]">{artPath.shapeId}</code>
+              {artPath.dirty ? " · modified" : " · unchanged"}
+            </span>
+            <Button
+              size="sm"
+              className="h-7 rounded-md bg-[#087f74] px-3 text-[10px] font-semibold text-white hover:bg-[#056a60]"
+              disabled={busy || !artPath.dirty}
+              onClick={() => setArtSaveOpen(true)}
+            >
+              Save path
+            </Button>
+            <Button
+              size="sm"
+              variant="outline"
+              className="h-7 rounded-md bg-white px-3 text-[10px]"
+              disabled={busy}
+              onClick={() => setArtPath(null)}
+            >
+              Cancel
+            </Button>
           </div>
         )}
         {/* Pen confirm popover (contract §3): anchored at the drawn shape's
@@ -1377,6 +1637,7 @@ export function CanvasWorkspace() {
                 { key: "cut", label: "Cut", icon: Scissors },
                 { key: "pen", label: "Pen", icon: PenTool },
                 { key: "node", label: "Node", icon: Waypoints },
+                { key: "artnode", label: "Art node", icon: PenTool },
               ] as Array<{ key: StudioTool; label: string; icon: typeof MousePointer2 }>
             ).map((t) => (
               <button
@@ -1384,12 +1645,20 @@ export function CanvasWorkspace() {
                 type="button"
                 aria-pressed={tool === t.key}
                 disabled={busy}
+                title={
+                  t.key === "node"
+                    ? "Gameplay Boundary — drag the shared boundary between two regions"
+                    : t.key === "artnode"
+                      ? "Artwork Path — edit the Bézier anchors of the underlying source shape"
+                      : undefined
+                }
                 onClick={() => {
                   // Switching tools discards any pending cut/pen/node confirm.
                   setPendingCut(null);
                   setPendingDraw(null);
                   setNodeEdge(null);
                   setNodeConfirmOpen(false);
+                  setArtPath(null);
                   setTool(t.key);
                 }}
                 className={`flex min-h-11 items-center gap-1.5 rounded-md px-3 text-[10px] font-medium transition-colors disabled:opacity-50 ${
@@ -1490,6 +1759,42 @@ export function CanvasWorkspace() {
             >
               <Waypoints className="size-3.5" aria-hidden />
               {busy ? "Applying…" : "Apply boundary"}
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+
+      {/* Artwork path save confirmation (Task 33) — explicit consequence
+          statement: the recompile re-derives paint and gameplay surfaces. */}
+      <AlertDialog
+        open={artSaveOpen}
+        onOpenChange={(open) => {
+          if (!open) setArtSaveOpen(false);
+        }}
+      >
+        <AlertDialogContent className="rounded-xl border-[#cfe6db] sm:max-w-md">
+          <AlertDialogHeader>
+            <AlertDialogTitle className="text-left text-sm text-[#183837]">
+              Save the edited artwork path?
+            </AlertDialogTitle>
+            <AlertDialogDescription className="text-left text-[11px] leading-relaxed text-[#657671]">
+              Shape {artPath?.shapeId} is recompiled from the edited outline: the finished illustration
+              updates and its playable surfaces are re-derived — manual subdivisions inside the changed
+              outline are superseded. The shape id and object ownership are preserved, and undo is
+              revision history.
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter className="gap-2 sm:justify-end">
+            <AlertDialogCancel className="h-9 rounded-md border-[#e1e5df] bg-white text-[10px]">
+              Cancel
+            </AlertDialogCancel>
+            <AlertDialogAction
+              className="h-9 rounded-md bg-[#087f74] text-[10px] font-semibold text-white hover:bg-[#056c62]"
+              disabled={busy}
+              onClick={saveArtPath}
+            >
+              <PenTool className="size-3.5" aria-hidden />
+              {busy ? "Saving…" : "Save path"}
             </AlertDialogAction>
           </AlertDialogFooter>
         </AlertDialogContent>

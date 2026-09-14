@@ -2970,12 +2970,90 @@ def _recolor_bundle(bundle: dict, chosen, color: str, preserve_shading: bool) ->
 
 
 
+def _edit_master_shape(source: Path, output: Path, request, version: str) -> dict:
+    """Task 33 — Artwork Path node editing (narrow first slice): replace one
+    closed master shape's path data by stable shapeId and FULLY RECOMPILE.
+
+    Safety contract (spec §Safety):
+    - validate BEFORE publishing: closed (Z-terminated), M/L/C/Q-only,
+      flattens to a simple (non-self-intersecting) ring, keeps enough area;
+    - shapeId and object ownership are preserved by the identity contract;
+    - any failure raises before the output revision exists — the last healthy
+      revision is untouched and undo is revision history as usual.
+    """
+    bundle = load_bundle(source)
+    m = bundle['manifest']
+    shape_id = (request.shape_id or '').strip()
+    if not shape_id:
+        raise ValueError('Select an artwork shape to edit (shape_id is required).')
+    new_d = (request.d or '').strip()
+    if not new_d:
+        raise ValueError('The edited path is empty — move an anchor first, or Cancel.')
+    if not new_d.upper().endswith('Z'):
+        raise ValueError('Artwork paths must stay closed for this slice: the path does not end with Z.')
+    # flatten + simplicity via the same geometry kernel the compiler uses
+    try:
+        rings = flatten_d(new_d)
+    except Exception as exc:
+        raise ValueError(f'The edited path could not be parsed: {exc}')
+    if not rings or len(rings[0]) < 3:
+        raise ValueError('The edited path has no drawable outline.')
+    poly = Polygon(rings[0], rings[1:]) if len(rings) > 1 else Polygon(rings[0])
+    if not poly.is_simple:
+        raise ValueError('The edited path crosses itself; smooth out the crossing before saving.')
+    if poly.is_empty or poly.area <= 1e-6:
+        raise ValueError('The edited path collapses to nothing — move the anchors further apart.')
+    try:
+        poly = make_valid(poly)
+    except Exception:
+        pass
+    if poly.geom_type != 'Polygon' or poly.is_empty:
+        raise ValueError('The edited path is not a single simple outline.')
+
+    master_file = source / 'source-master.svg'
+    if not master_file.is_file():
+        raise ValueError('Artwork path editing needs a vector master; converted raster artwork '
+                         '(rc-* shapes) is not path-editable. Redraw with the pen instead.')
+    synced = _sync_source_master(bundle, source)
+    base_text = synced if synced is not None else master_file.read_text(encoding='utf-8')
+    edited_master = _edit_master_shape_d(base_text, shape_id, new_d)
+
+    objects = bundle.get('objects') or []
+    result = _recompile_from_master(
+        edited_master, source, output, bundle, objects, version,
+        provenance_extra={
+            'lastEdit': 'shape',
+            'shapeEdit': {
+                'shapeId': shape_id,
+                'note': ('One artwork path was edited in Artwork Node mode; the revision was '
+                         'recompiled from the updated master, re-deriving paint and visible '
+                         'gameplay surfaces. Shape identity and object ownership are preserved.')}})
+    qa = result['validation']
+    # Honest accounting, same as reorder: gameplay reconstruction is explicit.
+    qa.setdefault('warnings', []).append(
+        f'Artwork path "{shape_id}" was edited; the visible partition was re-derived from the '
+        'updated master and manual subdivisions inside its changed outline were superseded.')
+    write_json(output / 'validation.json', qa)
+    return result
+
+
 def edit_bundle(source: Path, output: Path, request, version: str):
     bundle = load_bundle(source); g = bundle['geometry']; m = bundle['manifest']
     settings = read_json(source / 'build-settings.json') if (source / 'build-settings.json').is_file() else {}
     fit_tolerance = float(settings.get('curve_tolerance', 1.0))
     min_px = float(settings.get('min_region_pixels', 35))
     pen_warning: str | None = None
+
+    # Task 33 — Artwork Path node mode (first slice: move existing anchors
+    # and Bézier handles of ONE closed master shape). This is a SOURCE edit,
+    # not a gameplay edit: the shape's master `d` is replaced by stable id and
+    # the revision is fully recompiled, so paint + visible gameplay surfaces
+    # re-derive together, shapeId and object ownership stay identical, and
+    # invalid results (open, degenerate or self-intersecting) are REJECTED
+    # before anything is published — the last healthy revision is untouched.
+    if request.action == 'shape':
+        return _edit_master_shape(source, output, request, version)
+
     regs = {r['id']: r for r in g['regions']}
     chosen_ids = list(dict.fromkeys(request.region_ids))
     if any(rid not in regs for rid in chosen_ids) and request.action != 'draw':
@@ -3653,6 +3731,57 @@ def _reorder_master_svg(master_text: str, object_order: List[str]) -> tuple[str,
     return ET.tostring(root, encoding='unicode'), shape_rank
 
 
+def _recompile_from_master(master_text: str, source: Path, output: Path, bundle: dict,
+                           objects: list, version: str, provenance_extra: dict) -> dict:
+    """Full recompile from an edited source master (shared by layer reorder
+    and Task 33 artwork-path node editing): writes the master to a temp dir
+    (the compiler copies it into the revision itself), carries build-settings
+    and playtests, overlays the authoring sidecar so semantic edits survive,
+    and returns {'manifest', 'validation'} with review state cleared."""
+    m = bundle['manifest']
+    output.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory() as tmpdir:
+        master_path = Path(tmpdir) / 'source-master.svg'
+        master_path.write_text(master_text, encoding='utf-8')
+        settings = BuildSettings(**(read_json(source / 'build-settings.json')
+                                    if (source / 'build-settings.json').is_file() else {}))
+        if (source / 'playtests.json').is_file():
+            shutil.copy2(source / 'playtests.json', output / 'playtests.json')
+        provenance = dict(m.get('provenance') or {})
+        provenance.update(provenance_extra)
+        result = compile_svg_master(
+            master_path, output,
+            artwork_id=m['id'], version=version, title=m.get('title', ''),
+            settings=settings, provenance=provenance,
+            authoring_sidecar=normalize_objects({'objects': objects}),
+            progress=lambda *_: None)
+    result['manifest'].pop('review', None)
+    return result
+
+
+def _edit_master_shape_d(master_text: str, shape_id: str, new_d: str) -> str:
+    """Task 33 artwork-path node editing: replace ONE master path's geometry
+    by its stable internal id. The id attribute is preserved verbatim (shape
+    identity survives the edit); only the ``d`` changes. Raises ValueError
+    with an actionable message when the shape is absent."""
+    ET.register_namespace('', 'http://www.w3.org/2000/svg')
+    try:
+        root = ET.fromstring(master_text)
+    except Exception as exc:
+        raise ValueError(f'The source master is not well-formed XML: {exc}')
+    target = None
+    for el in root.iter():
+        if _local_svg_tag(el.tag) == 'path' and el.get('id') == shape_id:
+            target = el
+            break
+    if target is None:
+        raise ValueError(
+            f'Shape "{shape_id}" was not found in the source master. Shapes from converted '
+            'raster artwork (rc-*) are not path-editable; redraw them with the pen instead.')
+    target.set('d', new_d)
+    return ET.tostring(root, encoding='unicode')
+
+
 def edit_objects_bundle(source: Path, output: Path, request, version: str) -> dict:
     """Task 32 — Semantic Object / Layer inspector edit engine.
 
@@ -3767,35 +3896,17 @@ def edit_objects_bundle(source: Path, output: Path, request, version: str) -> di
 
         # Full recompilation from the reordered master (ids preserved verbatim
         # by _reorder_master_svg, so objects/ownership stay identity-stable).
-        # The compile input lives OUTSIDE the output folder — the compiler
-        # copies the master into the revision itself.
-        output.mkdir(parents=True, exist_ok=True)
-        with tempfile.TemporaryDirectory() as tmpdir:
-            reordered_path = Path(tmpdir) / 'source-master.svg'
-            reordered_path.write_text(rewritten_master, encoding='utf-8')
-            settings = BuildSettings(**(read_json(source / 'build-settings.json')
-                                        if (source / 'build-settings.json').is_file() else {}))
-            if (source / 'playtests.json').is_file():
-                shutil.copy2(source / 'playtests.json', output / 'playtests.json')
-            # R3-3: the reorder provenance is part of the compile input so
-            # emit_bundle persists it into artwork.json (a post-hoc mutation
-            # of the returned dict never reached the artifact).
-            reorder_provenance = dict(m.get('provenance') or {})
-            reorder_provenance['lastEdit'] = 'object_update'
-            reorder_provenance['layerReorder'] = {
-                'action': request.order_action,
-                'reconstructedVisibleSurfaces': True,
-                'note': ('Drawing order changed: the visible partition was re-derived from the '
-                         'reordered master; manual subdivisions inside changed overlaps were '
-                         'superseded. Region ids may differ from the previous revision.')}
-            result = compile_svg_master(
-                reordered_path, output,
-                artwork_id=m['id'], version=version, title=m.get('title', ''),
-                settings=settings, provenance=reorder_provenance,
-                authoring_sidecar=normalize_objects({'objects': objects}),
-                progress=lambda *_: None)
+        result = _recompile_from_master(
+            rewritten_master, source, output, bundle, objects, version,
+            provenance_extra={
+                'lastEdit': 'object_update',
+                'layerReorder': {
+                    'action': request.order_action,
+                    'reconstructedVisibleSurfaces': True,
+                    'note': ('Drawing order changed: the visible partition was re-derived from the '
+                             'reordered master; manual subdivisions inside changed overlaps were '
+                             'superseded. Region ids may differ from the previous revision.')}})
         out_m = result['manifest']
-        out_m.pop('review', None)
         qa = result['validation']
         # Honest visibility accounting: a reorder can fully cover an object
         # (opaque neighbours above it) — the compiler then derives no visible

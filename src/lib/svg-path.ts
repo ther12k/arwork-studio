@@ -178,8 +178,89 @@ export function polylineNearestDistance(pts: FlatPoint[], p: FlatPoint): number 
   if (pts.length === 1) return Math.hypot(p.x - pts[0].x, p.y - pts[0].y);
   let best = Infinity;
   for (let i = 1; i < pts.length; i++) {
-    const d = pointSegmentDistance(p, pts[i - 1], pts[i]);
+    const d = pointSegmentDistance(pts[i - 1], pts[i], p);
     if (d < best) best = d;
   }
   return best;
+}
+
+// ---------------------------------------------------------------------------
+// Task 33 — Artwork Path node editing: parse into editable commands and back.
+// ---------------------------------------------------------------------------
+
+/** One editable path command. Points are ABSOLUTE artwork coordinates:
+ *  M/L carry their endpoint, C its 3 points (c1, c2, end), Q its 2 (ctrl, end),
+ *  Z none. Serialization always emits absolute commands. */
+export interface PathCommand {
+  op: "M" | "L" | "C" | "Q" | "Z";
+  pts: FlatPoint[];
+}
+
+const CMD_ARG_PAIRS: Record<string, number> = { M: 1, L: 1, C: 3, Q: 2, Z: 0 };
+
+/** Parse the studio's safe subset into commands (relative input normalized to
+ *  absolute). Malformed input never throws — the commands parsed so far are
+ *  returned, mirroring flattenPath's tolerance. */
+export function parsePathCommands(d: string): PathCommand[] {
+  const out: PathCommand[] = [];
+  if (typeof d !== "string" || d.length === 0) return out;
+  const tokens = tokenize(d);
+  let i = 0;
+  let cur: FlatPoint = { x: 0, y: 0 };
+  while (i < tokens.length) {
+    const tok = tokens[i];
+    if (tok.kind !== "cmd") {
+      i++;
+      continue;
+    }
+    const rel = tok.ch === tok.ch.toLowerCase();
+    const op = tok.ch.toUpperCase();
+    i++;
+    const argPairs = CMD_ARG_PAIRS[op];
+    if (argPairs === undefined) continue;
+    if (op === "Z") {
+      out.push({ op: "Z", pts: [] });
+      continue;
+    }
+    // M follows SVG semantics: only the first pair is a moveto, subsequent
+    // pairs are linetos.
+    let first = true;
+    for (;;) {
+      const coords: FlatPoint[] = [];
+      let complete = true;
+      for (let c = 0; c < argPairs; c++) {
+        const a = tokens[i];
+        const b = tokens[i + 1];
+        if (!a || !b || a.kind !== "num" || b.kind !== "num") {
+          complete = false;
+          break;
+        }
+        i += 2;
+        coords.push({ x: rel ? cur.x + a.value : a.value, y: rel ? cur.y + b.value : b.value });
+      }
+      if (!complete) break;
+      const outOp: PathCommand["op"] = op === "M" && !first ? "L" : (op as PathCommand["op"]);
+      out.push({ op: outOp, pts: coords });
+      const last = coords[coords.length - 1];
+      cur = { x: last.x, y: last.y };
+      first = false;
+      if (argPairs > 1) break; // C/Q take exactly one set per command token
+    }
+  }
+  return out;
+}
+
+/** Serialize commands back to path data (absolute, 2-decimal coordinates,
+ *  leading M guaranteed by the caller). Round-trips parsePathCommands. */
+export function serializePathCommands(cmds: PathCommand[]): string {
+  const n = (v: number) => String(Math.round(v * 100) / 100);
+  const parts: string[] = [];
+  for (const c of cmds) {
+    if (c.op === "Z") {
+      parts.push("Z");
+      continue;
+    }
+    parts.push(c.op + " " + c.pts.map((p) => `${n(p.x)},${n(p.y)}`).join(" "));
+  }
+  return parts.join(" ");
 }

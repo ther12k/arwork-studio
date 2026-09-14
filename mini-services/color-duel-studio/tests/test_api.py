@@ -3483,6 +3483,124 @@ def test_import_master_fallback_allocation_is_collision_safe():
     assert ext_ids == ['s0000', 's0001'], ext_ids
 
 
+TASK33_CURVE_SVG = b'''<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 300 300">
+<g data-cd-object="obj-blob" data-cd-name="Blob">
+  <path d="M 50,100 C 50,60 120,40 160,70 C 200,100 200,160 160,190 C 120,220 50,190 50,100 Z" fill="#77AA55"/>
+</g>
+<g data-cd-object="obj-plain" data-cd-name="Plain">
+  <rect x="40" y="220" width="220" height="60" fill="#CC8844"/>
+</g>
+</svg>'''
+
+
+def _task33_project(client):
+    pid = new(client)
+    r = client.post(f'/api/projects/{pid}/upload-svg', headers=H,
+                    files={'file': ('curve.svg', TASK33_CURVE_SVG, 'image/svg+xml')},
+                    data={'rights_confirmed': 'true'})
+    assert r.status_code == 200, r.text
+    r = client.post(f'/api/projects/{pid}/build', headers=H, json={
+        'target_regions': 30, 'palette_colors': 4, 'paint_colors': 16, 'max_edge': 300,
+        'min_region_pixels': 4, 'min_label_radius': 1.0, 'auto_subdivide': False})
+    assert r.status_code == 200, r.text
+    p = wait(client, pid, timeout=120)
+    assert p['job']['status'] == 'done', p['job']
+    return pid, p['currentRevision']
+
+
+def test_artwork_node_edit_round_trip(client):
+    """Task 33 first-slice acceptance: edit one Bézier shape's anchors →
+    reload (fetch the revision) → ordinary Build. The same shape id survives
+    with the edited geometry, object ownership is retained, the visible
+    gameplay ownership stays correct, and QA passes."""
+    pid, rev = _task33_project(client)
+    objs = client.get(f'/api/projects/{pid}/revisions/{rev}/files/objects.json').json()['objects']
+    blob = next(o for o in objs if o['id'] == 'obj-blob')
+    blob_shape = blob['shapeIds'][0]
+    owner_before = _shape_ownership(client, pid, rev)
+
+    # move the first anchor (30,150 → 10,170) keeping the curve commands
+    new_d = ('M 10,170 C 30,60 130,30 180,80 '
+             'C 230,130 270,180 200,230 C 130,280 30,240 10,170 Z')
+    r = client.post(f'/api/projects/{pid}/edit', headers=H, json={
+        'base_revision': rev, 'action': 'shape', 'region_ids': [],
+        'shape_id': blob_shape, 'd': new_d})
+    assert r.status_code == 200, r.text
+    p = wait(client, pid)
+    assert p['job']['status'] == 'done', p['job']
+    edited = p['currentRevision']
+
+    # reload: the revision's saved artifacts carry the edit + same identity
+    paint = client.get(f'/api/projects/{pid}/revisions/{edited}/files/paint.json').json()
+    entry = next(q for q in paint['paths'] if q.get('shapeId') == blob_shape)
+    assert entry['d'].startswith('M 10,170'), 'edited geometry must be in paint'
+    assert 'C ' in entry['d'], 'curve commands are preserved, not flattened'
+    assert _shape_ownership(client, pid, edited) == owner_before, \
+        'object ownership must survive the source-path edit'
+    src = client.get(f'/api/projects/{pid}/revisions/{edited}/files/source-master.svg').text
+    assert f'id="{blob_shape}"' in src and 'M 10,170' in src, \
+        'the edit must be in the authoritative source at publication'
+    qa = client.get(f'/api/projects/{pid}/revisions/{edited}/files/validation.json').json()
+    assert qa['passed'] is True
+    assert any('visible partition was re-derived' in w for w in qa['warnings'])
+
+    # visible gameplay ownership: a point inside the edited shape's surface
+    from shapely.geometry import Polygon, Point
+    regions = client.get(f'/api/projects/{pid}/revisions/{edited}/files/regions.json').json()['regions']
+    blob_regions = [r_ for r_ in regions if r_['objectId'] == 'obj-blob']
+    assert blob_regions, 'the edited object keeps visible gameplay surfaces'
+    inside_blob = next(r_ for r_ in blob_regions
+                       if Polygon(r_['rings'][0], r_['rings'][1:]).contains(Point(150, 200)))
+    assert inside_blob['objectId'] == 'obj-blob'
+
+    # ordinary Build — same shape id, edited geometry, ownership intact
+    r = client.post(f'/api/projects/{pid}/build', headers=H, json={
+        'target_regions': 30, 'palette_colors': 4, 'paint_colors': 16, 'max_edge': 300,
+        'min_region_pixels': 4, 'min_label_radius': 1.0, 'auto_subdivide': False})
+    p = wait(client, pid, timeout=120)
+    assert p['job']['status'] == 'done', p['job']
+    rebuilt = p['currentRevision']
+    paint_b = client.get(f'/api/projects/{pid}/revisions/{rebuilt}/files/paint.json').json()
+    entry_b = next(q for q in paint_b['paths'] if q.get('shapeId') == blob_shape)
+    assert entry_b['d'].startswith('M 10,170'), 'the node edit must survive the rebuild'
+    assert _shape_ownership(client, pid, rebuilt) == owner_before
+    colored = client.get(f'/api/projects/{pid}/revisions/{rebuilt}/files/colored.svg').text
+    assert 'M 10,170' in colored, 'the finished illustration reflects the edit'
+
+
+def test_artwork_node_edit_safety_rejections(client):
+    """Task 33 safety: invalid edits (open path, self-intersecting bowtie,
+    unknown shape) fail BEFORE anything is published — the last healthy
+    revision stays current."""
+    pid, rev = _task33_project(client)
+    objs = client.get(f'/api/projects/{pid}/revisions/{rev}/files/objects.json').json()['objects']
+    blob_shape = next(o for o in objs if o['id'] == 'obj-blob')['shapeIds'][0]
+    build_cur = {'base_revision': rev, 'action': 'shape', 'region_ids': [], 'shape_id': blob_shape}
+
+    # open path
+    r = client.post(f'/api/projects/{pid}/edit', headers=H, json={
+        **build_cur, 'd': 'M 30,150 C 30,60 130,30 180,80'})
+    assert r.status_code == 200
+    p = wait(client, pid)
+    assert p['job']['status'] == 'failed' and 'closed' in p['job']['message']
+    # self-intersecting bowtie
+    r = client.post(f'/api/projects/{pid}/edit', headers=H, json={
+        **build_cur, 'd': 'M 20,20 L 280,20 L 20,280 L 280,280 L 20,20 Z'})
+    p = wait(client, pid)
+    assert p['job']['status'] == 'failed' and 'crosses itself' in p['job']['message']
+    # unknown shape
+    r = client.post(f'/api/projects/{pid}/edit', headers=H, json={
+        **build_cur, 'shape_id': 's9999',
+        'd': 'M 20,20 L 80,20 L 80,80 L 20,80 Z'})
+    p = wait(client, pid)
+    assert p['job']['status'] == 'failed' and 'was not found' in p['job']['message']
+    # nothing was published: the current revision is unchanged and healthy
+    p_now = client.get(f'/api/projects/{pid}').json()
+    assert p_now['currentRevision'] == rev
+    qa = client.get(f'/api/projects/{pid}/revisions/{rev}/files/validation.json').json()
+    assert qa['passed'] is True
+
+
 def test_unparented_object_stays_root_across_rebuilds(client):
     """Task 32 review round-2 R3B: moving a genuinely nested imported object
     back to the root is an AUTHORITATIVE deletion — the derived parentId from
