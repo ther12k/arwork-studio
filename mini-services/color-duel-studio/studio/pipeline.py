@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import hashlib
 import uuid, json, math, random, shutil, tempfile, zipfile
+import xml.etree.ElementTree as ET
 from collections import defaultdict
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
@@ -2558,7 +2559,12 @@ def compile_svg_master(source: Path, output: Path, *, artwork_id: str, version: 
     """
     from .svg_master import import_master, shape_solids, _solid_union
     progress(.06, 'Sanitizing the SVG master (curves are never rasterized)')
-    doc = import_master(source.read_text(encoding='utf-8'))
+    # Internal round-trip identity contract (Task 32 review round 3): ids
+    # allocated by this pipeline (sanitized sNNNN, artwork pen sp-*) are
+    # PRESERVED so the same shape keeps its identity across reorder and
+    # rebuilds; document order drives z, never identity. External uploads
+    # allocate identities during sanitize (clean_svg), not here.
+    doc = import_master(source.read_text(encoding='utf-8'), preserve_shape_ids=True)
     x, y, w, h = (float(v) for v in doc.view_box)
     if w > 4096 or h > 4096:
         raise ValueError('Scale the SVG master down to at most 4096 user units per side.')
@@ -3453,6 +3459,142 @@ def _local_svg_tag(tag: str) -> str:
     return tag.rsplit('}', 1)[-1] if isinstance(tag, str) else ''
 
 
+def _sync_source_master(bundle: dict, source: Path) -> str | None:
+    """Task 32 review round-3 R3-2: keep the AUTHORITATIVE source master in
+    step with artwork edits before any source-based rebuild. Recolor updates
+    the matching master path's appearance (and gradient stops for
+    preserve-shading tints); artwork-pen shapes (sp-*) are APPENDED with
+    their stable ids and object ownership. Without this, a later layer
+    reorder or ordinary Build would recompile the stale master and silently
+    revert the color or lose the drawn shape — an artwork-loss bug, not a
+    documented topology reconstruction. Returns the updated master text, or
+    None when the master already represents the artwork (nothing to write)."""
+    master = source / 'source-master.svg'
+    if not master.is_file():
+        return None
+    try:
+        root = ET.fromstring(master.read_text(encoding='utf-8'))
+    except Exception:
+        return None
+    ET.register_namespace('', 'http://www.w3.org/2000/svg')
+    paint = bundle.get('paint') or {}
+    changed = False
+
+    path_by_id: dict = {}
+    for el in root.iter():
+        if _local_svg_tag(el.tag) == 'path' and el.get('id'):
+            path_by_id[el.get('id')] = el
+
+    # 1) appearance sync for shapes already in the master (recolor)
+    for p in (paint.get('paths') or []):
+        el = path_by_id.get(p.get('shapeId') or '')
+        if el is None:
+            continue
+        fill = p.get('fill')
+        if isinstance(fill, str) and fill.startswith('#') and (el.get('fill') or '') != fill:
+            el.set('fill', fill)
+            changed = True
+        fr = p.get('fillRule')
+        if fr and (el.get('fill-rule') or 'nonzero') != fr:
+            el.set('fill-rule', fr)
+            changed = True
+        if p.get('stroke') and p.get('strokeWidth'):
+            el.set('stroke', p['stroke'])
+            el.set('stroke-width', str(p['strokeWidth']))
+            changed = True
+
+    # gradient stop sync (preserve_shading recolors tint stops in paint.json)
+    grads = {g.get('id'): g for g in (paint.get('gradients') or [])}
+    for el in root.iter():
+        if _local_svg_tag(el.tag) not in ('linearGradient', 'radialGradient'):
+            continue
+        g = grads.get(el.get('id'))
+        if not g:
+            continue
+        stops = [c for c in el if _local_svg_tag(c.tag) == 'stop']
+        for stop, want in zip(stops, g.get('stops') or []):
+            color = want.get('color')
+            if color and (stop.get('stop-color') or '') != color:
+                stop.set('stop-color', color)
+                changed = True
+            op = want.get('opacity')
+            if op is not None:
+                current = stop.get('stop-opacity')
+                try:
+                    if current is None or abs(float(current) - float(op)) > 1e-6:
+                        stop.set('stop-opacity', str(op))
+                        changed = True
+                except (TypeError, ValueError):
+                    pass
+
+    # 2) append shapes missing from the master (artwork pen, sp-*)
+    regions_by_shape: dict = {}
+    for r in (bundle['geometry'].get('regions') or []) + (bundle['geometry'].get('decorations') or []):
+        msid = r.get('masterShapeId')
+        if msid:
+            regions_by_shape.setdefault(msid, r)
+    group_by_object: dict = {}
+    for el in list(root):
+        if _local_svg_tag(el.tag) == 'g' and el.get('data-cd-object'):
+            group_by_object[el.get('data-cd-object')] = el
+    known_zs = [float(p.get('z', 0) or 0) for p in (paint.get('paths') or []) + (paint.get('inkPaths') or [])
+                if (p.get('shapeId') or '') in path_by_id]
+
+    def append_entry(p: dict, ink: bool) -> None:
+        nonlocal changed
+        sid = p.get('shapeId') or ''
+        if not sid or sid in path_by_id:
+            return
+        node = ET.Element('path')
+        node.set('id', sid)
+        node.set('d', p.get('d', ''))
+        if ink:
+            node.set('fill', 'none')
+            node.set('stroke', p.get('fill') or '#29383E')
+            node.set('stroke-width', str(p.get('strokeWidth') or 1.5))
+            node.set('stroke-linecap', 'round')
+            node.set('stroke-linejoin', 'round')
+        else:
+            node.set('fill', p.get('fill') or '#808080')
+            node.set('fill-rule', p.get('fillRule') or 'evenodd')
+            if p.get('stroke') and p.get('strokeWidth'):
+                node.set('stroke', p['stroke'])
+                node.set('stroke-width', str(p['strokeWidth']))
+                node.set('stroke-linejoin', 'round')
+        region = regions_by_shape.get(sid)
+        object_id = (region or {}).get('objectId') or ''
+        parent = group_by_object.get(object_id) if object_id and object_id != 'unassigned' else None
+        if parent is None and object_id and object_id != 'unassigned':
+            # Pen strokes own a NEW semantic object — wrap them in a group so
+            # recompiles re-derive ownership instead of orphaning the shape.
+            parent = ET.Element('g')
+            parent.set('data-cd-object', object_id)
+            name = next((o.get('name') for o in (bundle.get('objects') or [])
+                         if o.get('id') == object_id), None)
+            if name:
+                parent.set('data-cd-name', name)
+            behind = known_zs and float(p.get('z', 0) or 0) < min(known_zs)
+            root.insert(0, parent) if behind else root.append(parent)
+            group_by_object[object_id] = parent
+        if parent is not None:
+            parent.append(node)
+        else:
+            # z below every known shape ⇒ the artist drew BEHIND the art
+            if known_zs and float(p.get('z', 0) or 0) < min(known_zs):
+                root.insert(0, node)
+            else:
+                root.append(node)
+        path_by_id[sid] = node
+        changed = True
+
+    for p in (paint.get('paths') or []):
+        append_entry(p, ink=False)
+    for p in (paint.get('inkPaths') or []):
+        append_entry(p, ink=True)
+
+    return ET.tostring(root, encoding='unicode') if changed else None
+
+
 def _reorder_master_svg(master_text: str, object_order: List[str]) -> tuple[str, dict]:
     """Layer reorder as a VISUAL edit (Task 32 review R1): rewrite the
     SANITIZED source master (our own emit_master_svg output) so the document
@@ -3591,9 +3733,14 @@ def edit_objects_bundle(source: Path, output: Path, request, version: str) -> di
                 'Layer ordering needs a vector master: converted raster artwork derives its tap '
                 'surfaces at Convert time, so a pure re-sort would leave the overlap owned by the '
                 'wrong object. Re-run Convert with the new layer order instead.')
+        # R3-2: fold artwork edits (recolor fills, pen shapes) into the master
+        # FIRST — recompiling a stale master would revert the color or drop
+        # the drawn shape (artwork loss, not topology reconstruction).
+        synced = _sync_source_master(bundle, source)
+        base_master_text = synced if synced is not None else master_file.read_text(encoding='utf-8')
         try:
             rewritten_master, _shape_rank = _reorder_master_svg(
-                master_file.read_text(encoding='utf-8'), object_order)
+                base_master_text, object_order)
         except ValueError:
             raise
         except Exception as exc:
@@ -3611,22 +3758,24 @@ def edit_objects_bundle(source: Path, output: Path, request, version: str) -> di
                                         if (source / 'build-settings.json').is_file() else {}))
             if (source / 'playtests.json').is_file():
                 shutil.copy2(source / 'playtests.json', output / 'playtests.json')
-            result = compile_svg_master(
-                reordered_path, output,
-                artwork_id=m['id'], version=version, title=m.get('title', ''),
-                settings=settings, provenance=dict(m.get('provenance') or {}),
-                authoring_sidecar=normalize_objects({'objects': objects}),
-                progress=lambda *_: None)
-        out_m = result['manifest']
-        out_m.setdefault('provenance', {}).update({
-            'lastEdit': 'object_update',
-            'layerReorder': {
+            # R3-3: the reorder provenance is part of the compile input so
+            # emit_bundle persists it into artwork.json (a post-hoc mutation
+            # of the returned dict never reached the artifact).
+            reorder_provenance = dict(m.get('provenance') or {})
+            reorder_provenance['lastEdit'] = 'object_update'
+            reorder_provenance['layerReorder'] = {
                 'action': request.order_action,
                 'reconstructedVisibleSurfaces': True,
                 'note': ('Drawing order changed: the visible partition was re-derived from the '
                          'reordered master; manual subdivisions inside changed overlaps were '
-                         'superseded. Region ids may differ from the previous revision.')},
-        })
+                         'superseded. Region ids may differ from the previous revision.')}
+            result = compile_svg_master(
+                reordered_path, output,
+                artwork_id=m['id'], version=version, title=m.get('title', ''),
+                settings=settings, provenance=reorder_provenance,
+                authoring_sidecar=normalize_objects({'objects': objects}),
+                progress=lambda *_: None)
+        out_m = result['manifest']
         out_m.pop('review', None)
         qa = result['validation']
         # Honest visibility accounting: a reorder can fully cover an object
@@ -3658,8 +3807,15 @@ def edit_objects_bundle(source: Path, output: Path, request, version: str) -> di
 
     output.mkdir(parents=True, exist_ok=True)
     master_name = m['assets'].get('sourceMaster', 'source-master.png')
+    # R3-2: artwork edits (recolor fills, pen shapes) are folded into the
+    # authoritative master BEFORE publishing — the next source-based rebuild
+    # (layer reorder, ordinary Build) then compiles the CURRENT artwork
+    # instead of silently reverting it.
+    synced_master = _sync_source_master(bundle, source)
     for f in {master_name, 'build-settings.json', 'source-master.svg'}:
-        if (source / f).is_file():
+        if f == 'source-master.svg' and synced_master is not None:
+            (output / f).write_text(synced_master, encoding='utf-8')
+        elif (source / f).is_file():
             shutil.copy2(source / f, output / f)
 
     qa = emit_bundle(output, bundle)

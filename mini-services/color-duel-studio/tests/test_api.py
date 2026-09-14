@@ -3080,6 +3080,183 @@ def test_reorder_fully_covered_object_is_dropped_with_warning(client):
     assert 'obj-flower' not in {o['id'] for o in objs2}
 
 
+def _paint_fingerprint(client, pid, rev):
+    """shapeId -> {d, fill} for every paint path (z excluded: drawing order
+    is EXPECTED to change across a reorder; the shapes themselves are not)."""
+    paint = client.get(f'/api/projects/{pid}/revisions/{rev}/files/paint.json').json()
+    return {p['shapeId']: {'d': p['d'], 'fill': p['fill']} for p in paint['paths'] if p.get('shapeId')}
+
+
+def _shape_ownership(client, pid, rev):
+    """shapeId -> owning objectId from objects.json."""
+    objs = client.get(f'/api/projects/{pid}/revisions/{rev}/files/objects.json').json()['objects']
+    out = {}
+    for o in objs:
+        for sid in o.get('shapeIds') or []:
+            out[sid] = o['id']
+    return out
+
+
+def test_shape_identity_is_stable_across_reorder_and_rebuilds(client):
+    """Task 32 review round-3 P1-1: the same shape keeps its IDENTITY across
+    reorder and repeated rebuilds — shape→object mapping and shape geometry/
+    appearance (keyed by id, z excluded) are compared ACROSS revisions, not
+    just checked for internal consistency within one revision."""
+    pid, rev = _task32_overlap_project(client)
+    before_shapes = _paint_fingerprint(client, pid, rev)
+    before_owner = _shape_ownership(client, pid, rev)
+
+    r = client.post(f'/api/projects/{pid}/objects', headers=H, json={
+        'base_revision': rev, 'object_id': 'obj-blue', 'order_action': 'send_to_back'})
+    p = wait(client, pid)
+    assert p['job']['status'] == 'done', p['job']
+    rev2 = p['currentRevision']
+
+    assert _shape_ownership(client, pid, rev2) == before_owner, \
+        'shape→object mapping must be identical across the reorder'
+    after_shapes = _paint_fingerprint(client, pid, rev2)
+    assert set(after_shapes) == set(before_shapes), 'shape ids must not be reassigned'
+    for sid, snap in before_shapes.items():
+        assert after_shapes[sid] == snap, f'shape {sid} changed geometry/appearance'
+
+    build_body = {'target_regions': 30, 'palette_colors': 4, 'paint_colors': 16, 'max_edge': 300,
+                  'min_region_pixels': 4, 'min_label_radius': 1.0, 'auto_subdivide': False}
+    for _ in range(2):  # repeated rebuilds keep the identity too
+        r = client.post(f'/api/projects/{pid}/build', headers=H, json=build_body)
+        p = wait(client, pid, timeout=120)
+        assert p['job']['status'] == 'done', p['job']
+        assert _paint_fingerprint(client, pid, p['currentRevision']) == after_shapes
+        assert _shape_ownership(client, pid, p['currentRevision']) == before_owner
+
+
+def test_recolor_survives_reorder_and_rebuild(client):
+    """Task 32 review round-3 P1-2: recolor red → orange, then reorder, then
+    ordinary Build — the artwork stays orange throughout (no silent revert
+    to the original red from a stale source master)."""
+    pid, rev = _task32_overlap_project(client)
+    base = f'/api/projects/{pid}/revisions/{rev}'
+    regions = client.get(f'{base}/files/regions.json').json()['regions']
+    red_region = next(r_ for r_ in regions if r_['objectId'] == 'obj-red')
+
+    r = client.post(f'/api/projects/{pid}/edit', headers=H, json={
+        'base_revision': rev, 'action': 'recolor', 'color': '#E8804C',
+        'region_ids': [red_region['id']]})
+    assert r.status_code == 200, r.text
+    p = wait(client, pid)
+    assert p['job']['status'] == 'done', p['job']
+    recolored = p['currentRevision']
+
+    paint = client.get(f'/api/projects/{pid}/revisions/{recolored}/files/paint.json').json()
+    red_shapes = {sid for sid, oid in _shape_ownership(client, pid, recolored).items()
+                  if oid == 'obj-red'}
+    fills = {q['fill'] for q in paint['paths'] if q.get('shapeId') in red_shapes}
+    assert fills == {'#E8804C'}, f'recolor must paint the red object orange: {fills}'
+
+    # reorder blue to back — the recompile must compile the RECOLORED master
+    r = client.post(f'/api/projects/{pid}/objects', headers=H, json={
+        'base_revision': recolored, 'object_id': 'obj-blue', 'order_action': 'send_to_back'})
+    p = wait(client, pid)
+    assert p['job']['status'] == 'done', p['job']
+    reordered = p['currentRevision']
+    paint2 = client.get(f'/api/projects/{pid}/revisions/{reordered}/files/paint.json').json()
+    fills2 = {q['fill'] for q in paint2['paths'] if q.get('shapeId') in red_shapes}
+    assert fills2 == {'#E8804C'}, f'orange must survive the reorder: {fills2}'
+    colored = client.get(f'/api/projects/{pid}/revisions/{reordered}/files/colored.svg').text
+    layer = colored.split('<g data-layer="paint">', 1)[1]
+    assert '#E8804C' in layer and '#CC3333' not in layer, \
+        'exported preview must show orange, not the original red'
+
+    # ordinary Build — still orange
+    r = client.post(f'/api/projects/{pid}/build', headers=H, json={
+        'target_regions': 30, 'palette_colors': 4, 'paint_colors': 16, 'max_edge': 300,
+        'min_region_pixels': 4, 'min_label_radius': 1.0, 'auto_subdivide': False})
+    p = wait(client, pid, timeout=120)
+    assert p['job']['status'] == 'done', p['job']
+    rebuilt = p['currentRevision']
+    paint3 = client.get(f'/api/projects/{pid}/revisions/{rebuilt}/files/paint.json').json()
+    fills3 = {q['fill'] for q in paint3['paths'] if q.get('shapeId') in red_shapes}
+    assert fills3 == {'#E8804C'}, f'orange must survive the rebuild: {fills3}'
+    # identity stayed put through all three revisions
+    assert _shape_ownership(client, pid, rebuilt) == _shape_ownership(client, pid, recolored)
+
+
+def test_pen_artwork_survives_reorder_and_rebuild(client):
+    """Task 32 review round-3 P1-2: draw a pen shape, reorder an existing
+    object, then ordinary Build — the pen shape's id, ownership and
+    appearance all survive (no artwork loss from a stale source master)."""
+    pid, rev = _task32_overlap_project(client)
+    # draw a closed pen shape with paint on open canvas (no region selection)
+    r = client.post(f'/api/projects/{pid}/edit', headers=H, json={
+        'base_revision': rev, 'action': 'draw', 'region_ids': [], 'palette_id': 2,
+        'paint': True, 'color': '#FFD24D',
+        'd': 'M 40,220 L 90,220 L 90,270 L 40,270 Z'})
+    assert r.status_code == 200, r.text
+    p = wait(client, pid)
+    assert p['job']['status'] == 'done', p['job']
+    drawn = p['currentRevision']
+
+    paint = client.get(f'/api/projects/{pid}/revisions/{drawn}/files/paint.json').json()
+    pen_entries = [q for q in paint['paths'] if (q.get('shapeId') or '').startswith('sp-')]
+    assert len(pen_entries) == 1, 'fixture: exactly one pen shape'
+    pen = pen_entries[0]
+    pen_shape = pen['shapeId']
+    assert pen['fill'] == '#FFD24D'
+    pen_owner = _shape_ownership(client, pid, drawn)[pen_shape]
+    assert pen_owner and pen_owner.startswith('obj-'), 'pen shape owns a semantic object'
+
+    # reorder blue to back — recompile must include the pen shape
+    r = client.post(f'/api/projects/{pid}/objects', headers=H, json={
+        'base_revision': drawn, 'object_id': 'obj-blue', 'order_action': 'send_to_back'})
+    p = wait(client, pid)
+    assert p['job']['status'] == 'done', p['job']
+    reordered = p['currentRevision']
+    paint2 = client.get(f'/api/projects/{pid}/revisions/{reordered}/files/paint.json').json()
+    pen2 = next(q for q in paint2['paths'] if q.get('shapeId') == pen_shape)
+    assert pen2['fill'] == '#FFD24D' and pen2['d'] == pen['d'], 'pen shape geometry+appearance lost'
+    assert _shape_ownership(client, pid, reordered).get(pen_shape) == pen_owner, \
+        'pen shape ownership lost'
+
+    # ordinary Build — still present with the same identity
+    r = client.post(f'/api/projects/{pid}/build', headers=H, json={
+        'target_regions': 30, 'palette_colors': 4, 'paint_colors': 16, 'max_edge': 300,
+        'min_region_pixels': 4, 'min_label_radius': 1.0, 'auto_subdivide': False})
+    p = wait(client, pid, timeout=120)
+    assert p['job']['status'] == 'done', p['job']
+    rebuilt = p['currentRevision']
+    paint3 = client.get(f'/api/projects/{pid}/revisions/{reordered}/files/paint.json').json()
+    paint3 = client.get(f'/api/projects/{pid}/revisions/{rebuilt}/files/paint.json').json()
+    pen3 = next(q for q in paint3['paths'] if q.get('shapeId') == pen_shape)
+    assert pen3['fill'] == '#FFD24D', 'pen artwork lost across rebuild'
+    assert _shape_ownership(client, pid, rebuilt).get(pen_shape) == pen_owner
+    colored = client.get(f'/api/projects/{pid}/revisions/{rebuilt}/files/colored.svg').text
+    assert '#FFD24D' in colored, 'pen artwork missing from the exported preview'
+
+
+def test_layer_reorder_provenance_persisted_in_artifact(client):
+    """Task 32 review round-3 P2: layerReorder provenance exists in the SAVED
+    artwork.json artifact (and the export), not only the returned dict."""
+    pid, rev = _task32_overlap_project(client)
+    r = client.post(f'/api/projects/{pid}/objects', headers=H, json={
+        'base_revision': rev, 'object_id': 'obj-blue', 'order_action': 'send_to_back'})
+    p = wait(client, pid)
+    assert p['job']['status'] == 'done', p['job']
+    rev2 = p['currentRevision']
+    manifest = client.get(
+        f'/api/projects/{pid}/revisions/{rev2}/files/artwork.json').json()
+    assert manifest['provenance']['layerReorder']['reconstructedVisibleSurfaces'] is True
+    assert manifest['provenance']['layerReorder']['action'] == 'send_to_back'
+    assert manifest['provenance']['lastEdit'] == 'object_update'
+    # the authoring export carries the same field
+    import zipfile, io as _io
+    export = client.get(f'/api/projects/{pid}/revisions/{rev2}/export?authoring=true')
+    assert export.status_code == 200, export.text
+    with zipfile.ZipFile(_io.BytesIO(export.content)) as z:
+        names = z.namelist()
+        art = next(n for n in names if n.endswith('artwork.json'))
+        exported = json.loads(z.read(art).decode('utf-8'))
+    assert exported['provenance']['layerReorder']['reconstructedVisibleSurfaces'] is True
+
+
 def test_unparented_object_stays_root_across_rebuilds(client):
     """Task 32 review round-2 R3B: moving a genuinely nested imported object
     back to the root is an AUTHORITATIVE deletion — the derived parentId from

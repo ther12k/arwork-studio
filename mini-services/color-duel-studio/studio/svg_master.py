@@ -64,6 +64,9 @@ _DROPPED_ELEMENTS = ('script', 'foreignobject', 'image', 'iframe', 'animate', 'a
                      'mask', 'filter', 'pattern', 'symbol', 'title', 'desc', 'metadata')
 _MAX_ELEMENTS = 20000
 _MAX_COMMANDS = 400000
+# Ids this pipeline allocated itself (sanitizer sNNNN, artwork pen sp-*) —
+# the only source ids trusted for identity on INTERNAL round-trips.
+_INTERNAL_ID_RE = re.compile(r'^(s\d{4}|sp-[a-f0-9]{6,})$')
 
 
 def _local(tag: str) -> str:
@@ -307,6 +310,8 @@ class MasterDoc:
                              'notes': ['Imported SVG masters keep original curve commands; '
                                        'nothing is rasterized or retraced.']}
         self.source_text: str = ''
+        # Identity bookkeeping for internal round-trips (uniqueness guard).
+        self.seen_shape_ids: set = set()
 
     def summary(self) -> dict:
         curved = sum(1 for s in self.shapes + self.ink_shapes
@@ -474,8 +479,18 @@ def _solid_union(solids) -> Polygon:
         return cleaned[0]
 
 
-def import_master(text: str) -> MasterDoc:
-    """Parse + sanitize SVG text into a MasterDoc (never rasterizes)."""
+def import_master(text: str, preserve_shape_ids: bool = False) -> MasterDoc:
+    """Parse + sanitize SVG text into a MasterDoc (never rasterizes).
+
+    Identity contract (Task 32 review round 3):
+    - EXTERNAL upload (default): internal ids are ALLOCATED from traversal
+      order (s0000…) — source ids are never trusted for identity.
+    - INTERNAL authoring round-trip (preserve_shape_ids=True): ids already
+      allocated by this pipeline (sanitized sNNNN or pen sp-*) are KEPT so the
+      same shape keeps its identity across reorder/rebuild. Uniqueness and
+      format are validated; anything invalid falls back to allocation.
+      Document order still drives `order`/z — never identity.
+    """
     if not isinstance(text, str):
         raise ValueError('SVG master must be text.')
     if len(text.encode('utf-8')) > 12 * 1024 * 1024:
@@ -583,6 +598,11 @@ def import_master(text: str) -> MasterDoc:
             raise ValueError('SVG master is too complex (command budget exceeded).')
         shape_id = f's{ordn:04d}'          # generated: never emitted from source text
         source_id = sattrs.get('id')        # kept for reports only
+        if preserve_shape_ids and source_id and _INTERNAL_ID_RE.match(source_id) \
+                and source_id not in doc.seen_shape_ids:
+            # Internal authoring round-trip: keep the allocated identity.
+            shape_id = source_id
+        doc.seen_shape_ids.add(shape_id)
         role = sattrs.get('data-cd-role') or None
         if role not in (None, 'gameplay', 'shading', 'ink'):
             role = None
