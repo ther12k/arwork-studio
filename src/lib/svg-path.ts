@@ -268,3 +268,146 @@ export function serializePathCommands(cmds: PathCommand[]): string {
   }
   return parts.join(" ");
 }
+
+// ---------------------------------------------------------------------------
+// Task 37 — add/remove nodes: segment hit-testing, de Casteljau split, anchor
+// removal by neighbor merge. Pure functions over PathCommand[]; the caller
+// (CanvasWorkspace) owns history/dirty bookkeeping.
+// ---------------------------------------------------------------------------
+
+const lerpPt = (a: FlatPoint, b: FlatPoint, t: number): FlatPoint => ({
+  x: a.x + (b.x - a.x) * t,
+  y: a.y + (b.y - a.y) * t,
+});
+
+/** Drawable segment commands (M is a point, Z closes implicitly). */
+function isSegment(c: PathCommand): boolean {
+  return c.op === "L" || c.op === "C" || c.op === "Q";
+}
+
+/** Point ON a segment command at parameter t. The segment's start anchor is
+ *  not stored on the command — the caller supplies the previous command's
+ *  endpoint, exactly how the renderer chains commands. */
+function segmentPointAt(start: FlatPoint, c: PathCommand, t: number): FlatPoint {
+  if (c.op === "L") return lerpPt(start, c.pts[0], t);
+  if (c.op === "C") return cubicAt(start, c.pts[0], c.pts[1], c.pts[2], t);
+  return quadAt(start, c.pts[0], c.pts[1], t);
+}
+
+export interface PathHit {
+  cmd: number;
+  t: number;
+  x: number;
+  y: number;
+  dist: number;
+}
+
+/** Nearest point on the path's DRAWN segments (M and the closing Z chord are
+ *  never hit targets — a node cannot be added on the closure). Curves are
+ *  sampled and the query is projected onto the sampled chords, giving
+ *  sub-sample parameter accuracy — precise enough for click hit-testing. */
+export function nearestOnPathCommands(
+  cmds: PathCommand[],
+  p: FlatPoint,
+  curveSamples = 24
+): PathHit | null {
+  let best: PathHit | null = null;
+  for (let ci = 1; ci < cmds.length; ci++) {
+    const c = cmds[ci];
+    if (!isSegment(c)) continue;
+    const prevPts = cmds[ci - 1].pts;
+    const start = prevPts[prevPts.length - 1];
+    const samples = c.op === "L" ? 1 : Math.max(2, curveSamples);
+    let a = segmentPointAt(start, c, 0);
+    for (let k = 1; k <= samples; k++) {
+      const t1 = k / samples;
+      const b = segmentPointAt(start, c, t1);
+      const dx = b.x - a.x;
+      const dy = b.y - a.y;
+      const lenSq = dx * dx + dy * dy;
+      let s = 0;
+      if (lenSq > 0) s = Math.max(0, Math.min(1, ((p.x - a.x) * dx + (p.y - a.y) * dy) / lenSq));
+      const hx = a.x + s * dx;
+      const hy = a.y + s * dy;
+      const dist = Math.hypot(p.x - hx, p.y - hy);
+      if (!best || dist < best.dist) {
+        best = { cmd: ci, t: (k - 1 + s) / samples, x: hx, y: hy, dist };
+      }
+      a = b;
+    }
+  }
+  return best;
+}
+
+/** Split one drawn segment at parameter t. de Casteljau subdivision — the
+ *  two halves reproduce the original curve EXACTLY (no visual change); lines
+ *  split by linear interpolation. Returns the new commands with the segment
+ *  replaced by its two halves, or null when `cmdIndex` is not a drawn
+ *  segment. t is clamped away from the ends so the split never creates a
+ *  zero-length half. */
+export function splitPathCommand(
+  cmds: PathCommand[],
+  cmdIndex: number,
+  tRaw: number
+): PathCommand[] | null {
+  const c = cmds[cmdIndex];
+  if (cmdIndex < 1 || !c || !isSegment(c)) return null;
+  const t = Math.min(0.98, Math.max(0.02, tRaw));
+  const prevPts = cmds[cmdIndex - 1].pts;
+  const p0 = prevPts[prevPts.length - 1];
+  const next = cmds.slice();
+  if (c.op === "L") {
+    const s = lerpPt(p0, c.pts[0], t);
+    next.splice(cmdIndex, 1, { op: "L", pts: [s] }, { op: "L", pts: [{ ...c.pts[0] }] });
+    return next;
+  }
+  if (c.op === "C") {
+    const [p1, p2, p3] = c.pts;
+    const q0 = lerpPt(p0, p1, t);
+    const q1 = lerpPt(p1, p2, t);
+    const q2 = lerpPt(p2, p3, t);
+    const r0 = lerpPt(q0, q1, t);
+    const r1 = lerpPt(q1, q2, t);
+    const s = lerpPt(r0, r1, t);
+    next.splice(
+      cmdIndex,
+      1,
+      { op: "C", pts: [q0, r0, s] },
+      { op: "C", pts: [r1, q2, { ...p3 }] }
+    );
+    return next;
+  }
+  const [p1, p2] = c.pts;
+  const q0 = lerpPt(p0, p1, t);
+  const q1 = lerpPt(p1, p2, t);
+  const s = lerpPt(q0, q1, t);
+  next.splice(cmdIndex, 1, { op: "Q", pts: [q0, s] }, { op: "Q", pts: [q1, { ...p2 }] });
+  return next;
+}
+
+/** Remove the anchor that ENDS segment `cmdIndex` by merging that segment
+ *  with the FOLLOWING one. C+C and Q+Q merges keep the outer control points
+ *  so the endpoint tangents survive; any line involved degrades the merge to
+ *  a straight L (a single segment cannot represent two arbitrary curves).
+ *  Guards: the M anchor and the last segment's anchor are not removable, and
+ *  a closed ring keeps at least three edges. Returns the new commands or
+ *  null. */
+export function removePathAnchor(cmds: PathCommand[], cmdIndex: number): PathCommand[] | null {
+  const cur = cmds[cmdIndex];
+  if (cmdIndex < 1 || !cur || !isSegment(cur)) return null;
+  const nxt = cmds[cmdIndex + 1];
+  if (!nxt || !isSegment(nxt)) return null;
+  if (cmds.filter(isSegment).length < 3) return null;
+  const end = nxt.pts[nxt.pts.length - 1];
+  let merged: PathCommand;
+  if (cur.op === "C" && nxt.op === "C") {
+    merged = { op: "C", pts: [cur.pts[0], nxt.pts[1], end] };
+  } else if (cur.op === "Q" && nxt.op === "Q") {
+    merged = { op: "Q", pts: [cur.pts[0], end] };
+  } else {
+    merged = { op: "L", pts: [end] };
+  }
+  const next = cmds.slice();
+  next.splice(cmdIndex, 2, merged);
+  return next;
+}

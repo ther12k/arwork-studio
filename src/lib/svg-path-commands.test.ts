@@ -11,9 +11,12 @@
 import { describe, expect, test } from "vitest";
 import {
   flattenPath,
+  nearestOnPathCommands,
   parsePathCommands,
   polylineNearestDistance,
+  removePathAnchor,
   serializePathCommands,
+  splitPathCommand,
 } from "./svg-path";
 
 describe("parsePathCommands", () => {
@@ -184,5 +187,191 @@ describe("whole-path preview flatten — continuity and closure", () => {
     const expected = { x: 150, y: 175 };
     const best = Math.min(...a.map((p) => Math.hypot(p.x - expected.x, p.y - expected.y)));
     expect(best).toBeLessThan(1);
+  });
+});
+
+// ------------------------------------------- Task 37: add/remove nodes
+
+const LENS_D = "M 70,180 C 70,60 230,60 230,180 C 230,300 70,300 70,180 Z";
+
+describe("nearestOnPathCommands — click hit-testing on drawn segments", () => {
+  test("a tap on the cubic's analytic midpoint resolves to that segment near t=0.5", () => {
+    const hit = nearestOnPathCommands(parsePathCommands(LENS_D), { x: 150, y: 90 })!;
+    expect(hit).toBeTruthy();
+    expect(hit.cmd).toBe(1);
+    expect(Math.abs(hit.t - 0.5)).toBeLessThan(0.03);
+    expect(hit.dist).toBeLessThan(0.5);
+  });
+
+  test("a point on the second segment resolves there; a far point reports its distance", () => {
+    const cmds = parsePathCommands(LENS_D);
+    const hit = nearestOnPathCommands(cmds, { x: 150, y: 270 })!;
+    expect(hit.cmd).toBe(2);
+    const far = nearestOnPathCommands(cmds, { x: 400, y: 400 })!;
+    expect(far.dist).toBeGreaterThan(100);
+  });
+
+  test("M and Z are never hit targets (only the two cubics answer)", () => {
+    const cmds = parsePathCommands(LENS_D);
+    for (const p of [
+      { x: 70, y: 180 },
+      { x: 230, y: 180 },
+      { x: 150, y: 90 },
+    ]) {
+      const hit = nearestOnPathCommands(cmds, p)!;
+      expect(hit.cmd).toBeGreaterThanOrEqual(1);
+      expect(hit.cmd).toBeLessThanOrEqual(2);
+    }
+  });
+});
+
+describe("splitPathCommand — de Casteljau split preserves geometry exactly", () => {
+  const lerp = (a: number, b: number, t: number) => a + (b - a) * t;
+
+  test("cubic split controls follow the de Casteljau construction", () => {
+    // Curve M(0,0) C(30,0)(60,30)(60,60) split at t=0.35.
+    const cmds = parsePathCommands("M 0,0 C 30,0 60,30 60,60 L 0,60 Z");
+    const next = splitPathCommand(cmds, 1, 0.35)!;
+    expect(next).not.toBeNull();
+    expect(next.length).toBe(cmds.length + 1);
+    expect(next[next.length - 1].op).toBe("Z");
+    const t = 0.35;
+    const p0 = { x: 0, y: 0 };
+    const p1 = { x: 30, y: 0 };
+    const p2 = { x: 60, y: 30 };
+    const p3 = { x: 60, y: 60 };
+    const q0 = { x: lerp(p0.x, p1.x, t), y: lerp(p0.y, p1.y, t) };
+    const q1 = { x: lerp(p1.x, p2.x, t), y: lerp(p1.y, p2.y, t) };
+    const q2 = { x: lerp(p2.x, p3.x, t), y: lerp(p2.y, p3.y, t) };
+    const r0 = { x: lerp(q0.x, q1.x, t), y: lerp(q0.y, q1.y, t) };
+    const r1 = { x: lerp(q1.x, q2.x, t), y: lerp(q1.y, q2.y, t) };
+    const s = { x: lerp(r0.x, r1.x, t), y: lerp(r0.y, r1.y, t) };
+    const left = next[1];
+    const right = next[2];
+    expect(left.op).toBe("C");
+    expect(right.op).toBe("C");
+    for (const [got, want] of [
+      [left.pts[0], q0],
+      [left.pts[1], r0],
+      [left.pts[2], s],
+      [right.pts[0], r1],
+      [right.pts[1], q2],
+      [right.pts[2], p3],
+    ]) {
+      expect(Math.hypot(got.x - want.x, got.y - want.y)).toBeLessThan(1e-9);
+    }
+  });
+
+  test("the two halves reproduce the original curve point-for-point (C, Q, L)", () => {
+    // Independent Bernstein evaluation: for every u, the left half at u is
+    // the original at t*u, and the right half at u is the original at
+    // t+(1-t)*u — the defining property of an exact subdivision. (A finite-
+    // sampling distance check cannot prove this: its error floor is the
+    // sampling step, not the math.)
+    const at = (
+      start: { x: number; y: number },
+      c: { op: string; pts: Array<{ x: number; y: number }> },
+      t: number
+    ) => {
+      const u = 1 - t;
+      if (c.op === "L") {
+        return {
+          x: start.x + (c.pts[0].x - start.x) * t,
+          y: start.y + (c.pts[0].y - start.y) * t,
+        };
+      }
+      if (c.op === "C") {
+        const [p1, p2, p3] = c.pts;
+        return {
+          x: u * u * u * start.x + 3 * u * u * t * p1.x + 3 * u * t * t * p2.x + t * t * t * p3.x,
+          y: u * u * u * start.y + 3 * u * u * t * p1.y + 3 * u * t * t * p2.y + t * t * t * p3.y,
+        };
+      }
+      const [p1, p2] = c.pts;
+      return {
+        x: u * u * start.x + 2 * u * t * p1.x + t * t * p2.x,
+        y: u * u * start.y + 2 * u * t * p1.y + t * t * p2.y,
+      };
+    };
+    const cases: Array<[string, number]> = [
+      ["M 70,180 C 70,60 230,60 230,180 C 230,300 70,300 70,180 Z", 0.4],
+      ["M 10,90 Q 90,10 170,90 Q 90,170 10,90 Z", 0.65],
+      ["M 0,0 L 60,0 L 60,60 L 0,60 Z", 0.3],
+    ];
+    for (const [d, t] of cases) {
+      const cmds = parsePathCommands(d);
+      const split = splitPathCommand(cmds, 1, t)!;
+      const start = cmds[0].pts[0];
+      const orig = cmds[1];
+      const left = split[1];
+      const right = split[2];
+      for (const u of [0, 0.25, 0.5, 0.75, 1]) {
+        const a = at(start, orig, t * u);
+        const b = at(start, left, u);
+        expect(Math.hypot(a.x - b.x, a.y - b.y)).toBeLessThan(1e-9);
+        const c = at(start, orig, t + (1 - t) * u);
+        const e = at(left.pts[left.pts.length - 1], right, u);
+        expect(Math.hypot(c.x - e.x, c.y - e.y)).toBeLessThan(1e-9);
+      }
+      // The edited commands survive the serialize→parse format round trip.
+      const rt = parsePathCommands(serializePathCommands(split));
+      expect(rt.length).toBe(split.length);
+      expect(rt.map((x) => x.op)).toEqual(split.map((x) => x.op));
+    }
+  });
+
+  test("t is clamped away from the ends; M and Z cannot be split", () => {
+    const cmds = parsePathCommands(LENS_D);
+    const nearStart = splitPathCommand(cmds, 1, 0)!;
+    const nearEnd = splitPathCommand(cmds, 1, 1)!;
+    // Degenerate halves are prevented: both split points sit inside the curve.
+    const s1 = nearStart[1].pts[2];
+    const s2 = nearEnd[1].pts[2];
+    expect(Math.hypot(s1.x - 70, s1.y - 180)).toBeGreaterThan(0.5);
+    expect(Math.hypot(s2.x - 230, s2.y - 180)).toBeGreaterThan(0.5);
+    expect(splitPathCommand(cmds, 0, 0.5)).toBeNull();
+    expect(splitPathCommand(cmds, cmds.length - 1, 0.5)).toBeNull();
+  });
+});
+
+describe("removePathAnchor — neighbor merge with guards", () => {
+  test("C+C merge keeps the outer control points (endpoint tangents survive)", () => {
+    const cmds = parsePathCommands(
+      "M 0,0 C 10,0 20,10 20,20 C 20,30 10,40 0,40 C -10,30 -20,10 0,0 Z"
+    );
+    const next = removePathAnchor(cmds, 1)!;
+    expect(next).not.toBeNull();
+    expect(next.length).toBe(cmds.length - 1);
+    expect(next[1].op).toBe("C");
+    expect(next[1].pts[0]).toEqual({ x: 10, y: 0 }); // c1 of the first segment
+    expect(next[1].pts[1]).toEqual({ x: 10, y: 40 }); // c2 of the second
+    expect(next[1].pts[2]).toEqual({ x: 0, y: 40 }); // end anchor
+    expect(next[next.length - 1].op).toBe("Z");
+    // Round-trips through the parser.
+    expect(parsePathCommands(serializePathCommands(next)).length).toBe(next.length);
+  });
+
+  test("L+L merges to a line; any curve+line mix degrades to a line", () => {
+    const lls = parsePathCommands("M 0,0 L 10,0 L 20,10 L 0,30 Z");
+    const ll = removePathAnchor(lls, 1)!;
+    expect(ll[1].op).toBe("L");
+    expect(ll[1].pts[0]).toEqual({ x: 20, y: 10 });
+    const mixed = parsePathCommands("M 0,0 C 10,0 20,10 20,20 L 0,40 C -10,30 -20,10 0,0 Z");
+    const mx = removePathAnchor(mixed, 1)!;
+    expect(mx[1].op).toBe("L");
+    expect(mx[1].pts[0]).toEqual({ x: 0, y: 40 });
+  });
+
+  test("Q+Q merges keeping the first control; M, last segment, and thin rings are refused", () => {
+    const qs = parsePathCommands("M 10,90 Q 90,10 170,90 Q 90,170 10,90 Z");
+    expect(removePathAnchor(qs, 1)).toBeNull(); // only 2 edges — below the floor
+    const q3 = parsePathCommands("M 10,90 Q 50,10 90,90 Q 130,170 170,90 Q 90,250 10,90 Z");
+    const merged = removePathAnchor(q3, 1)!;
+    expect(merged[1].op).toBe("Q");
+    expect(merged[1].pts[0]).toEqual({ x: 50, y: 10 });
+    expect(merged[1].pts[1]).toEqual({ x: 170, y: 90 });
+    // Guards: M anchor (0), the last segment's anchor (no following segment).
+    expect(removePathAnchor(q3, 0)).toBeNull();
+    expect(removePathAnchor(q3, q3.length - 2)).toBeNull();
   });
 });

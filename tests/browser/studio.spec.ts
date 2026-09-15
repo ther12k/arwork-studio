@@ -153,6 +153,33 @@ const maxVertexDistance = (a: Pt[], b: Pt[]): number => {
 const minDistToPoint = (pts: Pt[], p: Pt): number =>
   Math.min(...pts.map((q) => Math.hypot(q.x - p.x, q.y - p.y)));
 
+/** One-directional point-cloud → polyline distance: every point of `a` vs
+ *  the SEGMENTS of `b`. Sampling-invariant geometry comparison — comparing
+ *  two flattenings of the SAME curve as point sets fails on sample-offset
+ *  (a split segment samples at shifted parameters), while this measures the
+ *  curves themselves. */
+const hausdorffToPolyline = (a: Pt[], b: Pt[]): number => {
+  let worst = 0;
+  for (const p of a) {
+    let best = Infinity;
+    for (let i = 1; i < b.length; i++) {
+      const dx = b[i].x - b[i - 1].x;
+      const dy = b[i].y - b[i - 1].y;
+      const lenSq = dx * dx + dy * dy;
+      let t = 0;
+      if (lenSq > 0) {
+        t = Math.max(0, Math.min(1, ((p.x - b[i - 1].x) * dx + (p.y - b[i - 1].y) * dy) / lenSq));
+      }
+      best = Math.min(
+        best,
+        Math.hypot(p.x - (b[i - 1].x + t * dx), p.y - (b[i - 1].y + t * dy))
+      );
+    }
+    worst = Math.max(worst, best);
+  }
+  return worst;
+};
+
 const overlayGroup = (page: Page) =>
   page.locator(`g[aria-label="Artwork path anchors for shape ${SHAPE}"]`);
 
@@ -505,5 +532,93 @@ test("Art node local draft undo/redo: debounced drag step, keyboard shortcuts, i
   // Reload: the redone state persists.
   await page.reload();
   await expect(page.locator(`${BOARD} path[data-region-id="r-blue"]`)).toBeAttached();
+  await expectPixel(page, 187, 95, isBlue);
+});
+
+// ------------------------------------------------- add/remove nodes (Task 38)
+
+test("Art node add/remove nodes: exact split, guarded removal, composes with undo/redo and Save", async ({ page }) => {
+  test.setTimeout(150_000);
+  const state: FixtureState = mkState();
+  await routeBackend(page, state);
+  await page.goto("/");
+
+  // Load shape s0002 (two cubic edges, three anchors).
+  await page.getByRole("button", { name: "Edit regions" }).click();
+  await page.getByRole("button", { name: "Art node" }).click();
+  const tap = await artToPage(page, 150, 90);
+  await page.mouse.click(tap.x, tap.y);
+  await expect(overlayGroup(page)).toBeVisible();
+
+  const anchors = page.locator('circle[aria-label^="Anchor "]');
+  const undoBtn = page.getByRole("button", { name: "Undo", exact: true });
+  await expect(anchors).toHaveCount(3);
+  const originalPreview = await previewArtPoints(page);
+
+  // Negative guard: with only two edges, removing the interior anchor is
+  // REFUSED — toast explains, geometry unchanged, no history step created.
+  await page.locator('circle[aria-label="Anchor 2"]').dblclick();
+  await expect(page.locator('[data-sonner-toast]', { hasText: "at least three" })).toBeVisible();
+  await expect(anchors).toHaveCount(3);
+  await expect(undoBtn).toBeDisabled();
+
+  // Add a node exactly on the top curve (de Casteljau split): one new
+  // anchor, the preview geometry is PRESERVED, exactly one history step.
+  await page.mouse.dblclick(tap.x, tap.y);
+  await expect(anchors).toHaveCount(4);
+  await expect(page.getByText("modified", { exact: false })).toBeVisible();
+  await expect(undoBtn).toBeEnabled();
+  const splitPreview = await previewArtPoints(page);
+  expect(hausdorffToPolyline(splitPreview, originalPreview)).toBeLessThan(2);
+  expect(hausdorffToPolyline(originalPreview, splitPreview)).toBeLessThan(2);
+
+  // Undo returns the untouched ring (status back to unchanged, undo
+  // exhausted); redo re-adds the node.
+  await page.keyboard.press("Control+z");
+  await expect(anchors).toHaveCount(3);
+  await expect(page.getByText("unchanged", { exact: false })).toBeVisible();
+  await expect(undoBtn).toBeDisabled();
+  const undonePreview = await previewArtPoints(page);
+  expect(hausdorffToPolyline(undonePreview, originalPreview)).toBeLessThan(0.5);
+  expect(hausdorffToPolyline(originalPreview, undonePreview)).toBeLessThan(0.5);
+  await page.keyboard.press("Control+Shift+z");
+  await expect(anchors).toHaveCount(4);
+
+  // Remove an interior anchor (neighbor merge): 4 → 3 anchors and the
+  // geometry genuinely changes (merge controls differ) — one more history
+  // step, and undo brings the split state back.
+  await page.locator('circle[aria-label="Anchor 3"]').dblclick();
+  await expect(anchors).toHaveCount(3);
+  const afterRemove = await previewArtPoints(page);
+  expect(hausdorffToPolyline(splitPreview, afterRemove)).toBeGreaterThan(5);
+  await page.keyboard.press("Control+z");
+  await expect(anchors).toHaveCount(4);
+
+  // Drag the NEW node up so the published geometry is visually distinct from
+  // the original lens (the split alone is invisible by design): the probe
+  // pixel at (187,95) sits below the raised top curve.
+  const newNode = page.locator('circle[aria-label="Anchor 2"]');
+  const nb = await newNode.boundingBox();
+  const raise = await artToPage(page, 150, 40);
+  await page.mouse.move(nb!.x + nb!.width / 2, nb!.y + nb!.height / 2);
+  await page.mouse.down();
+  await page.mouse.move(raise.x, raise.y, { steps: 8 });
+  await page.mouse.up();
+  await expect(anchors).toHaveCount(4);
+
+  // Save: the payload carries THREE cubic segments (2 + 1 from the split —
+  // the added node survived into the submitted path), the published
+  // revision renders the raised geometry (pixel flips red → blue), the
+  // draft + history clear, and the edit survives reload.
+  state.mode = "success";
+  await saveBar(page).click();
+  await page.getByRole("alertdialog").getByRole("button", { name: "Save path" }).click();
+  await expectPixel(page, 187, 95, isBlue, 20_000);
+  const payload = state.editCalls[state.editCalls.length - 1];
+  expect(payload).toMatchObject({ base_revision: REV1, action: "shape", shape_id: SHAPE });
+  expect((payload.d.match(/ C /g) ?? []).length).toBe(3);
+  expect(payload.d).not.toBe(ORIGINAL_D);
+  await expect(saveBar(page)).toHaveCount(0);
+  await page.reload();
   await expectPixel(page, 187, 95, isBlue);
 });

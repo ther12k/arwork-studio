@@ -47,9 +47,12 @@ import type { BoardMode, EdgeEntry, VectorBoard } from "@/lib/detailed-board";
 import { imageUrl, masterSvgUrl, type DifficultyProfile } from "@/lib/studio-api";
 import {
   flattenPath,
+  nearestOnPathCommands,
   parsePathCommands,
   polylineNearestDistance,
+  removePathAnchor,
   serializePathCommands,
+  splitPathCommand,
   type PathCommand,
 } from "@/lib/svg-path";
 import { VIEW_LABELS, type StudioTool, type StudioView, useStudioContext } from "./use-studio";
@@ -70,7 +73,8 @@ const TOOL_HINTS: Record<StudioTool, string> = {
   cut: "Drag a line across a region — outside one edge to outside the opposite edge",
   pen: "Draw a closed shape — the artwork pen paints it, the region pen is gameplay-only",
   node: "Tap a boundary between two regions, then drag its anchor points.",
-  artnode: "Tap a region to load its source shape, then drag its anchors or handles — Save recompiles.",
+  artnode:
+    "Tap a shape to load it, drag anchors or handles — double-click an edge to add a node, double-click an anchor to remove it.",
 };
 
 const MODE_HINTS: Record<BoardMode, string> = {
@@ -652,6 +656,50 @@ export function CanvasWorkspace() {
       };
     });
   }, [artPath, foreignDraft]);
+
+  /** Push the CURRENT draft state onto the undo stack — one meaningful step
+   *  for DISCRETE operations (node add/remove), mirroring how one drag =
+   *  one step. Truncates the redo branch. */
+  const pushArtHistoryBefore = () => {
+    if (!artPath) return;
+    const gen = draftGenerationRef.current;
+    const snap: ArtDraftSnapshot = { commands: cloneCommands(artPath.commands), dirty: artPath.dirty };
+    setArtHistory((h) =>
+      h && h.draftGeneration === gen ? { ...h, past: [...h.past, snap].slice(-50), future: [] } : h
+    );
+  };
+
+  /** Double-click on an edge: insert a node at the nearest point of the
+   *  drawn outline (de Casteljau split — the geometry is preserved exactly;
+   *  only the editable node count changes). */
+  const addArtNode = (clientX: number, clientY: number) => {
+    const board = boardRef.current;
+    if (!artPath || !board) return;
+    const pt = board.clientToArt(clientX, clientY);
+    if (!pt) return;
+    const hit = nearestOnPathCommands(artPath.commands, pt);
+    if (!hit || hit.dist > 12) {
+      toast("Double-click directly on a drawn edge to add a node.");
+      return;
+    }
+    const next = splitPathCommand(artPath.commands, hit.cmd, hit.t);
+    if (!next) return;
+    pushArtHistoryBefore();
+    setArtPath((prev) => (prev ? { ...prev, commands: next, dirty: true } : prev));
+  };
+
+  /** Double-click on an anchor: remove that node by merging its two segments
+   *  (refused with an explanation when it would break the ring). */
+  const removeArtNode = (cmd: number) => {
+    if (!artPath) return;
+    const next = removePathAnchor(artPath.commands, cmd);
+    if (!next) {
+      toast("Only interior anchors can be removed — keep at least three edges.");
+      return;
+    }
+    pushArtHistoryBefore();
+    setArtPath((prev) => (prev ? { ...prev, commands: next, dirty: true } : prev));
+  };
 
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
@@ -1546,6 +1594,17 @@ export function CanvasWorkspace() {
                       strokeWidth={2}
                       strokeLinecap="round"
                       strokeLinejoin="round"
+                      style={{ pointerEvents: "stroke", cursor: "copy" }}
+                      onPointerDown={(e) => e.stopPropagation()}
+                      onPointerUp={(e) => e.stopPropagation()}
+                      onDoubleClick={(e) => {
+                        // Add-node target: the parent group opted out of
+                        // pointer events for drawing; the stroke re-enables
+                        // them so double-click lands HERE (not on the canvas
+                        // tap-to-pick below).
+                        e.stopPropagation();
+                        addArtNode(e.clientX, e.clientY);
+                      }}
                     />
                     {artGeometry.controls.map((_, i) => (
                       <line
@@ -1591,6 +1650,10 @@ export function CanvasWorkspace() {
                       onPointerMove={extendArtDrag}
                       onPointerUp={endArtDrag}
                       onPointerCancel={endArtDrag}
+                      onDoubleClick={(e) => {
+                        e.stopPropagation();
+                        removeArtNode(p.cmd);
+                      }}
                     />
                   ))}
                 </g>
