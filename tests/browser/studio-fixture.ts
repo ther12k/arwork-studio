@@ -6,9 +6,12 @@
  * hook/page logic (runEdit guard, saveArtPath settle-watch, job polling,
  * VectorBoard mounting) decides every outcome — only the HTTP boundary is
  * staged. The staged backend models the bits the journey depends on: async
- * jobs (queued → done), semantic job failure with the revision untouched, a
- * 409 stale-base rejection, and revision-addressed bundle files (rev-2 serves
- * the edited paint).
+ * jobs (running → done), semantic job failure with the revision untouched, a
+ * 409 stale-base rejection, BASE-REVISION verification (a payload whose
+ * base_revision is not the current revision is rejected, like the real
+ * service), an UNRELATED operation route (/objects rename) that advances the
+ * revision WITHOUT touching the artwork (drives the draft-conflict row), and
+ * revision-addressed bundle files (each revision serves its own paint).
  */
 
 import type { Page } from "@playwright/test";
@@ -16,6 +19,7 @@ import type { Page } from "@playwright/test";
 export const PID = "proj-journey";
 export const REV1 = "rev-1";
 export const REV2 = "rev-2";
+export const REV3 = "rev-3";
 export const SHAPE = "s0002";
 /** Closed two-cubic blob; handle 1 = c1 (70,60) of the first cubic. */
 export const ORIGINAL_D = "M 70,180 C 70,60 230,60 230,180 C 230,300 70,300 70,180 Z";
@@ -27,24 +31,35 @@ export type EditMode = "reject409" | "jobfail" | "success";
 export type FixtureState = {
   mode: EditMode;
   revision: string;
-  paintD: string;
+  /** Paint `d` served per revision (revisions carry their own artwork). */
+  revPaint: Record<string, string>;
   job: Record<string, unknown>;
   editCalls: Array<Record<string, unknown>>;
+  objectCalls: Array<Record<string, unknown>>;
   runningGets: number;
   pendingD: string;
+  pendingKind: "edit" | "objects" | null;
+  /** jobId returned by the POST — the settled project.job must keep THIS id
+   *  (the app's settle-watch attributes outcomes by job identity). */
+  activeJobId: string;
 };
 
 export const mkState = (): FixtureState => ({
   mode: "reject409",
   revision: REV1,
-  paintD: ORIGINAL_D,
+  revPaint: { [REV1]: ORIGINAL_D },
   job: { status: "idle" },
   editCalls: [],
+  objectCalls: [],
   runningGets: 0,
   pendingD: "",
+  pendingKind: null,
+  activeJobId: "",
 });
 
 const ART = "journey-artwork";
+/** Immutable revision chain: each operation publishes the next one. */
+const NEXT_REV: Record<string, string> = { [REV1]: REV2, [REV2]: REV3 };
 
 const revision = (id: string) => ({
   id,
@@ -66,11 +81,13 @@ const revision = (id: string) => ({
   manifestUrl: `/api/projects/${PID}/revisions/${id}/files/artwork.json`,
 });
 
-const manifest = {
+/** Per-revision manifest — artworkVersion advances with the revision (the
+ *  real compiler bumps it; the node-session key in the app depends on it). */
+const manifestFor = (rev: string) => ({
   schemaVersion: 1,
   format: "color-duel-detailed-vector-1",
   id: ART,
-  version: "0.1.0",
+  version: { [REV1]: "0.1.0", [REV2]: "0.1.1", [REV3]: "0.1.2" }[rev] ?? "0.1.0",
   title: "Journey fixture",
   regionCount: 2,
   paletteCount: 2,
@@ -78,12 +95,14 @@ const manifest = {
   assets: { regions: "regions.json", palette: "palette.json", paint: "paint.json" },
   contentHash: "journey-fixture",
   difficulty: { rating: "easy", score: 10, metrics: {} },
-};
+});
 
-const geometry = {
+/** Per-revision geometry — artworkVersion advances WITH the manifest version
+ *  (validateBundle asserts they match, exactly like the real compiler). */
+const geometryFor = (rev: string) => ({
   schemaVersion: 1,
   artworkId: ART,
-  artworkVersion: "0.1.0",
+  artworkVersion: { [REV1]: "0.1.0", [REV2]: "0.1.1", [REV3]: "0.1.2" }[rev] ?? "0.1.0",
   viewBox: [0, 0, 300, 300],
   fillRule: "evenodd",
   stroke: "#22333B",
@@ -117,7 +136,7 @@ const geometry = {
   ],
   decorations: [],
   detailPaths: [],
-};
+});
 
 const palette = [
   { id: 1, number: 1, name: "Red", hex: "#CC3333", paint: { type: "solid", stops: [] } },
@@ -137,13 +156,17 @@ const paintFor = (d: string) => ({
   sourceColorShapeCount: 2,
 });
 
-const objects = {
+const objectsFor = (rev: string) => ({
   schemaVersion: 1,
   objects: [
     { id: "obj-red", name: "Red", shapeIds: ["s0001"] },
-    { id: "obj-blue", name: "Blue", shapeIds: [SHAPE] },
+    {
+      id: "obj-blue",
+      name: rev === REV1 ? "Blue" : "Blue Renamed",
+      shapeIds: [SHAPE],
+    },
   ],
-};
+});
 
 const project = (state: FixtureState) => ({
   id: PID,
@@ -155,37 +178,50 @@ const project = (state: FixtureState) => ({
   aiUsage: [],
   master: null,
   reference: null,
-  revisions: [revision(REV1), ...(state.revision === REV2 ? [revision(REV2)] : [])],
+  revisions: (
+    state.revision === REV3 ? [REV1, REV2, REV3] : state.revision === REV2 ? [REV1, REV2] : [REV1]
+  ).map(revision),
   currentRevision: state.revision,
   job: state.job,
 });
 
-/** Success jobs flip to done + publish rev-2 on the SECOND project GET (the
- *  first is the POST handler's own refresh, the second the poll loop). */
+/** Publish the next revision. An edit job carries its submitted paint; an
+ *  objects job carries the previous artwork unchanged. */
+const publish = (state: FixtureState) => {
+  const next = NEXT_REV[state.revision];
+  if (!next) throw new Error("fixture revision chain exhausted");
+  state.revPaint[next] =
+    state.pendingKind === "edit" && state.pendingD ? state.pendingD : state.revPaint[state.revision];
+  state.revision = next;
+  state.job = {
+    id: state.activeJobId,
+    kind: state.pendingKind === "edit" ? "shape edit" : "object update",
+    status: "done",
+    progress: 100,
+  };
+};
+
+/** Running jobs flip to done + publish on the SECOND project GET (the first
+ *  is the POST handler's own refresh, the second the poll loop). */
 const advanceJob = (state: FixtureState) => {
-  if (state.job.status === "running") {
-    state.runningGets += 1;
-    if (state.runningGets >= 2) {
-      state.job = { id: "job-ok", kind: "shape edit", status: "done", progress: 100 };
-      state.revision = REV2;
-      state.paintD = state.pendingD;
-    }
-  }
+  if (state.job.status !== "running") return;
+  state.runningGets += 1;
+  if (state.runningGets >= 2) publish(state);
 };
 
 const fileFor = (state: FixtureState, rev: string, name: string): unknown => {
-  const d = rev === REV2 ? state.paintD : ORIGINAL_D;
+  const d = state.revPaint[rev] ?? ORIGINAL_D;
   switch (name) {
     case "artwork.json":
-      return manifest;
+      return manifestFor(rev);
     case "regions.json":
-      return geometry;
+      return geometryFor(rev);
     case "palette.json":
       return palette;
     case "paint.json":
       return paintFor(d);
     case "objects.json":
-      return objects;
+      return objectsFor(rev);
     default:
       return { detail: "no such file" };
   }
@@ -215,13 +251,29 @@ export async function routeBackend(page: Page, state: FixtureState) {
     if (path === `/api/projects/${PID}/generation/sessions`) return json({ sessions: [] });
     const file = path.match(new RegExp(`^/api/projects/${PID}/revisions/([^/]+)/files/(.+)$`));
     if (file && req.method() === "GET") return json(fileFor(state, file[1], file[2]));
+    if (path === `/api/projects/${PID}/objects` && req.method() === "POST") {
+      const body = req.postDataJSON() as Record<string, unknown>;
+      if (body.base_revision !== state.revision) {
+        return json({ detail: "Stale base revision: the project has moved on." }, 409);
+      }
+      state.objectCalls.push(body);
+      state.activeJobId = "job-objects";
+      state.job = { id: "job-objects", kind: "object update", status: "running", progress: 10 };
+      state.runningGets = 0;
+      state.pendingKind = "objects";
+      return json({ jobId: "job-objects" });
+    }
     if (path === `/api/projects/${PID}/edit` && req.method() === "POST") {
       const body = req.postDataJSON() as Record<string, unknown>;
+      if (state.mode !== "reject409" && body.base_revision !== state.revision) {
+        return json({ detail: "Stale base revision: the project has moved on." }, 409);
+      }
       state.editCalls.push(body);
       if (state.mode === "reject409") {
         return json({ detail: "Stale base revision: the project has moved on." }, 409);
       }
       if (state.mode === "jobfail") {
+        state.activeJobId = "job-fail";
         state.job = {
           id: "job-fail",
           kind: "shape edit",
@@ -231,9 +283,11 @@ export async function routeBackend(page: Page, state: FixtureState) {
         };
         return json({ jobId: "job-fail", projectId: PID });
       }
+      state.activeJobId = "job-ok";
       state.job = { id: "job-ok", kind: "shape edit", status: "running", progress: 10 };
       state.runningGets = 0;
       state.pendingD = String(body.d);
+      state.pendingKind = "edit";
       return json({ jobId: "job-ok", projectId: PID });
     }
     return json({ detail: "fixture route not implemented" }, 404);

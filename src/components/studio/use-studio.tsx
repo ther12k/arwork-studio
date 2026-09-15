@@ -110,7 +110,7 @@ export interface StudioApi {
   tool: StudioTool;
   setTool: (t: StudioTool) => void;
   /** Cut a region along a drawn line: edit action "cut" with the path d. */
-  cutRegion: (regionId: string, d: string) => Promise<void>;
+  cutRegion: (regionId: string, d: string) => Promise<{ jobId: string }>;
   /** Create a region from a drawn closed shape: edit action "draw". With
    *  paint=true (artwork pen) the shape also becomes finished artwork — a
    *  paint.json path with a stable shapeId, fill, optional ink outline and
@@ -127,11 +127,16 @@ export interface StudioApi {
     color?: string,
     strokeWidth?: number,
     zBehind?: boolean
-  ) => Promise<void>;
+  ) => Promise<{ jobId: string }>;
   /** Rebuild the shared boundary between two regions (dragged anchors):
    *  edit action "node" with the new open boundary path d. */
-  nodeEdit: (regionIds: [string, string], d: string) => Promise<void>;
-  editShape: (shapeId: string, d: string) => Promise<void>;
+  nodeEdit: (regionIds: [string, string], d: string) => Promise<{ jobId: string }>;
+  /** Resolves with the ACCEPTED job's id (not its outcome — the caller owns
+   *  settle handling). */
+  editShape: (shapeId: string, d: string) => Promise<{ jobId: string }>;
+  /** One poll pass on demand (edit-route 409 recovery): refreshes the
+   *  project snapshot so an externally advanced revision becomes visible. */
+  syncProject: () => Promise<void>;
   // free color (true custom colors, contract §4)
   freeColor: string;
   setBoardFreeColor: (hex: string) => void;
@@ -199,7 +204,12 @@ export interface StudioApi {
   generate: () => Promise<void>;
   generateSvg: () => Promise<void>;
   build: () => Promise<void>;
-  runEdit: (action: EditAction, extra?: Partial<EditPayload>, regionIds?: string[]) => Promise<void>;
+  /** Resolves with the accepted job's id. */
+  runEdit: (
+    action: EditAction,
+    extra?: Partial<EditPayload>,
+    regionIds?: string[]
+  ) => Promise<{ jobId: string }>;
   /** Task 27 — Optimize Difficulty: gameplay-only move toward a tier on the
    *  current revision (new immutable revision; artwork stays untouched). */
   optimizeDifficulty: (tier: "easy" | "medium" | "hard" | "master") => Promise<void>;
@@ -548,8 +558,11 @@ export function StudioProvider({ children }: { children: React.ReactNode }) {
 
   // runEdit is called from inside the board paint wrapper; declare it via ref
   // first so the wrapper (created once per board) always calls the latest one.
-  const runEditRef = useRef<(action: EditAction, extra?: Partial<EditPayload>) => Promise<void>>(async () => {
+  const runEditRef = useRef<
+    (action: EditAction, extra?: Partial<EditPayload>) => Promise<{ jobId: string }>
+  >(async () => {
     /* replaced below */
+    return { jobId: "" };
   });
 
   /** Wrap board interactions for authoring mode (selection instead of paint). */
@@ -735,6 +748,14 @@ export function StudioProvider({ children }: { children: React.ReactNode }) {
   useEffect(() => {
     pollRef.current = poll;
   }, [poll]);
+  /** One poll pass on demand — e.g. after an edit route answers 409: the
+   *  client's project snapshot may be stale (another window/operator advanced
+   *  the revision), and the UI cannot offer an honest conflict choice until
+   *  it knows the server's actual state. */
+  const syncProject = useCallback(async () => {
+    const p = projectRef.current;
+    if (p) await poll(p.id);
+  }, [poll]);
   // Task 31: an unmounted studio must not leave poll timers firing — stale
   // pollers would keep hitting getProject and corrupt the next test/run.
   useEffect(() => () => {
@@ -745,9 +766,10 @@ export function StudioProvider({ children }: { children: React.ReactNode }) {
     async (post: () => Promise<{ jobId: string }>) => {
       const pid = projectRef.current?.id;
       if (!pid) throw new Error("Create a project first.");
-      await post();
+      const res = await post();
       setProjectSync(await getProject(pid));
       void poll(pid);
+      return res;
     },
     [poll, setProjectSync]
   );
@@ -988,10 +1010,11 @@ export function StudioProvider({ children }: { children: React.ReactNode }) {
         region_ids: ids,
         ...extra,
       };
-      await job(() => apiRunEdit(p.id, body));
+      const res = await job(() => apiRunEdit(p.id, body));
       selectedRef.current = new Set();
       setSelected(new Set());
       highlightSelection();
+      return res;
     },
     [highlightSelection, job]
   );
@@ -1344,7 +1367,6 @@ export function StudioProvider({ children }: { children: React.ReactNode }) {
     (shapeId: string, d: string) => runEdit("shape", { shape_id: shapeId, d }, []),
     [runEdit]
   );
-
   /** Apply a custom free-mode color (contract §4) and remember it in the
    *  recent list (capped at 10, persisted in localStorage OUTSIDE the board). */
   const setBoardFreeColor = useCallback((hex: string) => {
@@ -1598,6 +1620,7 @@ export function StudioProvider({ children }: { children: React.ReactNode }) {
     drawRegion,
     nodeEdit,
     editShape,
+    syncProject,
     freeColor,
     setBoardFreeColor,
     recentColors,

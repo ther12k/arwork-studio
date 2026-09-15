@@ -3,23 +3,31 @@
  * app (production `dist/` build: StudioPage → use-studio hook → CanvasWorkspace
  * → VectorBoard), driven through the route-intercepted FIXTURE BACKEND in
  * studio-fixture.ts ("controlled transport"). Nothing about editShape /
- * runEdit / saveArtPath is mocked: the hook's real guard logic, the real
- * overlay geometry and the real job polling decide the outcomes — only the
- * HTTP boundary is staged.
+ * runEdit / submitArtSave is mocked: the hook's real guard logic, the real
+ * overlay geometry, the real job polling and the real settle-watch decide the
+ * outcomes — only the HTTP boundary is staged.
  *
- * Proven rows (reviewer's matrix):
+ * Proven rows (reviewer's matrix + round-2 follow-ups):
  *   1. tapping the MIDDLE of a long outline selects the correct source shape,
  *   2. Art node saves with NO gameplay region selection (region_ids: []),
- *   3. the dragged-handle preview matches the geometry actually submitted,
+ *   3. the dragged-handle preview matches the geometry actually submitted
+ *      (and the UNCORRECTED overlay readback is bounded — calibration can only
+ *      absorb a small drift, never a real misalignment),
  *   4. a rejected edit (409) and a FAILED JOB keep the draft editable and the
  *      healthy revision untouched,
- *   5. save success → reload → next revision serves the edited geometry under
- *      the SAME stable shape id,
+ *   4b. revision-conflict recovery is separate from request rejection: an
+ *      UNRELATED operation (object rename) advances the project while the
+ *      draft is dirty — the draft is retained, the stale base is reported,
+ *      and Save demands an EXPLICIT choice; saving applies on top of the
+ *      CURRENT revision (base rev-2), never a silent rebase or dismissal,
+ *   5. save success → reload → the later revision serves the edited geometry
+ *      under the SAME stable shape id,
  *   6. explicit Cancel sends no request and discards the draft.
  *
  * Not proven here (documented limits): real compiler recompilation (the
- * fixture backend stages revision rev-2 instead of running pipeline.py), and
- * multi-shape / open-path editing (deferred slices).
+ * fixture backend stages revisions instead of running pipeline.py — the
+ * composition chain with the real compiler lives in the backend test suite),
+ * and multi-shape / open-path editing (deferred slices).
  */
 
 import { expect, test, type Page } from "@playwright/test";
@@ -29,6 +37,7 @@ import {
   EDITED_D,
   ORIGINAL_D,
   REV1,
+  REV2,
   SHAPE,
   mkState,
   routeBackend,
@@ -144,19 +153,21 @@ const minDistToPoint = (pts: Pt[], p: Pt): number =>
 const overlayGroup = (page: Page) =>
   page.locator(`g[aria-label="Artwork path anchors for shape ${SHAPE}"]`);
 
+const saveBar = (page: Page) => page.getByRole("button", { name: "Save path" });
+
 // ---------------------------------------------------------------- the journey
 
-test("Art node journey: mid-edge pick, no-selection save, preview==payload, reject keeps draft, save survives reload, cancel sends nothing", async ({ page }) => {
-  test.setTimeout(120_000);
+test("Art node journey: mid-edge pick, no-selection save, preview==payload, reject + conflict keep the draft, save survives reload, cancel sends nothing", async ({ page }) => {
+  test.setTimeout(150_000);
   const state: FixtureState = mkState();
   await routeBackend(page, state);
   await page.goto("/");
 
   // Board mounted on the fixture: the live region layer carries our region,
   // and the cached underpainting renders the ORIGINAL geometry. (187,95)
-  // sits BELOW the edited top curve (inside rev-2's blob) but ABOVE the
-  // original one (outside rev-1's blob) — so red proves rev-1 geometry and
-  // blue proves the edited geometry reached the canvas.
+  // sits BELOW the edited top curve (inside rev-3's blob) but ABOVE the
+  // original one (outside rev-1's blob) — so red proves original geometry
+  // and blue proves the edited geometry reached the canvas.
   const region = page.locator(`${BOARD} path[data-region-id="r-blue"]`);
   await expect(region).toBeAttached();
   await expectPixel(page, 187, 95, isRed);
@@ -186,26 +197,29 @@ test("Art node journey: mid-edge pick, no-selection save, preview==payload, reje
   await page.mouse.down();
   await page.mouse.move(drop.x, drop.y, { steps: 8 });
   await page.mouse.up();
-  // The preview follows the EDITED geometry: it passes through the new curve
-  // midpoint (187.5,90) and no longer through the old one (150,90). The
-  // readback is calibrated on the UNTOUCHED M anchor first: capture-time vs
-  // read-time CTMs can differ by a couple of subpixel units, which shows up
-  // as a constant offset on every vertex (the drag itself is exact — the
-  // submitted payload below matches to 2 decimals).
+  // Follow-up 2 — TWO separate properties. (a) The UNCORRECTED readback is
+  // bounded: the untouched M anchor must sit within ~3 art units (~6 screen
+  // px at this canvas size) of its true position, so the calibration below
+  // can only ever absorb small capture-time drift, never a real overlay
+  // misalignment. (b) Calibrated on that anchor, the preview follows the
+  // EDITED geometry: it passes through the new curve midpoint (187.5,90) and
+  // no longer through the old one (150,90).
+  const rawPreview = await previewArtPoints(page);
+  expect(Math.hypot(rawPreview[0].x - 70, rawPreview[0].y - 180)).toBeLessThan(3);
   const calibrate = (pts: Pt[], start: Pt): Pt[] => {
     const dx = start.x - pts[0].x;
     const dy = start.y - pts[0].y;
     return pts.map((p) => ({ x: p.x + dx, y: p.y + dy }));
   };
-  const editedPreview = calibrate(await previewArtPoints(page), { x: 70, y: 180 });
+  const editedPreview = calibrate(rawPreview, { x: 70, y: 180 });
   expect(minDistToPoint(editedPreview, { x: 187.5, y: 90 })).toBeLessThan(2);
   expect(minDistToPoint(editedPreview, { x: 150, y: 90 })).toBeGreaterThan(8);
 
   // Row 4a — Save is REJECTED at the HTTP boundary (409 stale base): the
   // toast fires, the draft stays editable, no job exists, revision untouched.
-  await page.getByRole("button", { name: "Save path" }).click();
+  await saveBar(page).click();
   await page.getByRole("alertdialog").getByRole("button", { name: "Save path" }).click();
-  await expect(page.getByText("Stale base revision")).toBeVisible();
+  await expect(page.locator('[data-sonner-toast]', { hasText: "Stale base revision" })).toBeVisible();
   await expect(overlayGroup(page)).toBeVisible();
   expect(state.editCalls).toHaveLength(1);
   expect(state.revision).toBe(REV1);
@@ -213,37 +227,55 @@ test("Art node journey: mid-edge pick, no-selection save, preview==payload, reje
   // Row 4b — Save is ACCEPTED but the JOB FAILS validation: the poller toasts,
   // busy clears, and the draft STILL waits for correction on the same revision.
   state.mode = "jobfail";
-  await page.getByRole("button", { name: "Save path" }).click();
+  await saveBar(page).click();
   await page.getByRole("alertdialog").getByRole("button", { name: "Save path" }).click();
-  // The toast is the poller's failure signal; the same message also lands in
-  // the workspace job-status line, so assert on the toast element itself.
   await expect(page.locator('[data-sonner-toast]', { hasText: "not a simple ring" })).toBeVisible();
   await expect(overlayGroup(page)).toBeVisible();
-  await expect(page.getByRole("button", { name: "Save path" })).toBeEnabled();
+  await expect(saveBar(page)).toBeEnabled();
   expect(state.editCalls).toHaveLength(2);
   expect(state.revision).toBe(REV1);
 
-  // Rows 2 + 3 (submit half) — the corrected save SUCCEEDS. The journey never
-  // selected a gameplay region, so the payload must carry region_ids: [] and
-  // the exact dragged geometry. The published revision re-renders the board:
-  // the probe pixel flips red → blue (the edited outline now covers it).
+  // Row 4c — REVISION CONFLICT, distinct from request rejection: an unrelated
+  // operation (renaming the owning object in the inspector) advances the
+  // project to rev-2 while the draft is dirty. The draft must SURVIVE, the
+  // stale base must be REPORTED, and the artwork itself is untouched (the
+  // probe pixel stays red).
+  await page.getByTitle("Blue", { exact: true }).click();
+  await page.getByTitle("Rename object").click();
+  await page.locator('input[value="Blue"]').fill("Blue Renamed");
+  await page.locator('input[value="Blue Renamed"]').press("Enter");
+  await expect(page.getByText(/loaded from rev-1, project now at rev-2/)).toBeVisible({ timeout: 20_000 });
+  await expect(saveBar(page)).toBeVisible();
+  await expect(saveBar(page)).toBeEnabled();
+  expect(state.revision).toBe(REV2);
+  expect(state.editCalls).toHaveLength(2); // no accidental save
+  await expectPixel(page, 187, 95, isRed); // rename never touched the artwork
+
+  // Saving the conflicted draft demands the EXPLICIT choice (the conflict
+  // dialog, not the normal confirmation) — and states honestly that the
+  // shape's outline is unchanged in between.
   state.mode = "success";
-  await page.getByRole("button", { name: "Save path" }).click();
-  await page.getByRole("alertdialog").getByRole("button", { name: "Save path" }).click();
-  await expectPixel(page, 187, 95, isBlue);
+  await saveBar(page).click();
+  await expect(page.getByText("The artwork changed since this shape was loaded")).toBeVisible();
+  await expect(page.getByText("outline is unchanged in between", { exact: false })).toBeVisible();
+  await page.getByRole("button", { name: `Save against ${REV2}` }).click();
+  // The save applies on TOP of the current revision: payload base is rev-2
+  // (never a silent rebase of the stale rev-1 draft), region_ids stay [],
+  // and the published rev-3 renders the edited geometry.
+  await expectPixel(page, 187, 95, isBlue, 20_000);
   const payload = state.editCalls[state.editCalls.length - 1];
   expect(payload).toMatchObject({
-    base_revision: REV1,
+    base_revision: REV2,
     action: "shape",
     shape_id: SHAPE,
     region_ids: [],
     d: EDITED_D,
   });
-  // Success clears the draft (the settle-watch saw the NEW revision land).
-  await expect(overlayGroup(page)).toHaveCount(0);
+  // Success clears the draft (the settle-watch attributed the published job).
+  await expect(saveBar(page)).toHaveCount(0);
 
-  // Row 5 — reload → the fixture "Build" serves rev-2: the SAME stable shape
-  // id carries the edited geometry (pixel still blue after a fresh mount).
+  // Row 5 — reload → the fixture serves rev-3: the SAME stable shape id
+  // carries the edited geometry (pixel still blue after a fresh mount).
   await page.reload();
   await expect(page.locator(`${BOARD} path[data-region-id="r-blue"]`)).toBeAttached();
   await expectPixel(page, 187, 95, isBlue);

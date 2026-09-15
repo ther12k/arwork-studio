@@ -308,6 +308,7 @@ export function CanvasWorkspace() {
     drawRegion,
     nodeEdit,
     editShape,
+    syncProject,
     recordPlaytest,
     freeColor,
     setBoardFreeColor,
@@ -399,28 +400,64 @@ export function CanvasWorkspace() {
 
   // --------------------------------------------- artwork node tool (Task 33)
 
-  /** The artwork path being node-edited: the SOURCE shape id (stable), the
-   *  parsed commands (M/L/C/Q/Z, absolute), and which control point (command
-   *  index + point index) is being dragged. Anchor = command endpoint,
-   *  handle = a Bézier control point. */
-  const [artPath, setArtPath] = useState<{
+  /** Draft identity (review follow-up: "request rejection recovery" is
+   *  separate from "revision conflict recovery"). The base revision and the
+   *  ORIGINAL path data anchor the draft: a draft whose base no longer
+   *  matches the project is never silently rebased or dismissed — the save
+   *  bar surfaces it and Save demands an explicit choice. */
+  type ArtworkDraftContext = {
+    projectId: string;
+    baseRevision: string;
     shapeId: string;
-    /** Region whose masterShapeId selected the shape (for the caption). */
-    regionId: string | null;
+    originalD: string;
+  };
+
+  /** An in-flight shape save. The job id lets the settle-watch attribute the
+   *  published revision to THIS save; `submittedD` is what it must show. */
+  type PendingArtworkSave = {
+    jobId: string;
+    submittedD: string;
+    /** Base the job was submitted against (for conflict reporting). */
+    baseRevision: string;
+  };
+
+  /** The artwork path being node-edited: its identity context, the parsed
+   *  commands (M/L/C/Q/Z, absolute), and which control point (command index +
+   *  point index) is being dragged. Anchor = command endpoint, handle = a
+   *  Bézier control point. */
+  const [artPath, setArtPath] = useState<{
+    context: ArtworkDraftContext;
     commands: PathCommand[];
     dragging: { cmd: number; pt: number } | null;
     dirty: boolean;
   } | null>(null);
   const [artSaveOpen, setArtSaveOpen] = useState(false);
-  /** Base revision of an in-flight shape save. The settle-watch below uses it
-   *  to tell "job accepted" from "edited revision published". */
-  const artSaveBaseRef = useRef<string | null>(null);
+  const [artConflictOpen, setArtConflictOpen] = useState(false);
+  const artPendingSaveRef = useRef<PendingArtworkSave | null>(null);
+
+  /** True when the project moved past the revision the draft was loaded
+   *  from — another operation published while the artist was editing. */
+  const staleDraftBase =
+    !!artPath &&
+    !!project?.currentRevision &&
+    artPath.context.baseRevision !== project.currentRevision &&
+    artPath.context.projectId === project.id;
+  /** True when the edited SHAPE ITSELF changed in between (its current paint
+   *  path no longer matches the draft's origin) — saving then overwrites
+   *  geometry changes the artist has not seen. */
+  const draftShapeChangedInBetween =
+    !!artPath &&
+    (() => {
+      const cur = bundle?.paint?.paths.find((q) => q.shapeId === artPath.context.shapeId)?.d;
+      return cur !== undefined && cur !== artPath.context.originalD;
+    })();
 
   const pickArtPath = (clientX: number, clientY: number) => {
     const board = boardRef.current;
-    if (!board || !bundle?.paint) return;
-    const p = board.clientToArt(clientX, clientY);
-    if (!p) return;
+    const p = project;
+    if (!board || !bundle?.paint || !p?.currentRevision) return;
+    const pt = board.clientToArt(clientX, clientY);
+    if (!pt) return;
     // nearest paint path within ~20 art units of the tap (reverse z = topmost)
     const entries = [...bundle.paint.paths]
       .filter((q) => q.shapeId)
@@ -429,7 +466,7 @@ export function CanvasWorkspace() {
     for (const q of entries) {
       const pts = flattenPath(q.d);
       if (pts.length < 2) continue;
-      const dist = polylineNearestDistance(pts, { x: p.x, y: p.y });
+      const dist = polylineNearestDistance(pts, { x: pt.x, y: pt.y });
       if (!best || dist < best.dist) best = { shapeId: q.shapeId!, d: q.d, dist };
     }
     if (!best || best.dist > 20) {
@@ -443,7 +480,17 @@ export function CanvasWorkspace() {
       return;
     }
     captureNodeTransform();
-    setArtPath({ shapeId: best.shapeId, regionId: null, commands, dragging: null, dirty: false });
+    setArtPath({
+      context: {
+        projectId: p.id,
+        baseRevision: p.currentRevision,
+        shapeId: best.shapeId,
+        originalD: best.d,
+      },
+      commands,
+      dragging: null,
+      dirty: false,
+    });
   };
 
   const beginArtDrag = (e: React.PointerEvent<SVGCircleElement>, cmd: number, pt: number) => {
@@ -485,32 +532,63 @@ export function CanvasWorkspace() {
     setArtPath((prev) => (prev && prev.dragging ? { ...prev, dragging: null } : prev));
   };
 
+  /** Save intent: route to the explicit-conflict dialog when the draft's base
+   *  revision is stale (another operation published in between), otherwise to
+   *  the normal consequence confirmation. */
+  const requestArtSave = () => {
+    if (!artPath || !artPath.dirty) return;
+    if (staleDraftBase) setArtConflictOpen(true);
+    else setArtSaveOpen(true);
+  };
+
   /** Save: submit the edited path (edit action "shape", keyed by the stable
    *  shapeId — the 409 stale-base guard is the shared edit-route check).
    *  The draft is NOT dropped here: it stays mounted and editable until the
-   *  edit's job settles. A rejected request (validation / stale base) or a
-   *  failed job keeps the artist's changes on screen for correction. */
-  const saveArtPath = () => {
+   *  job settles. Attribution is by job id (the settle-watch below) so only
+   *  THIS save's success can clear it; rejections, failures, and unrelated
+   *  revision changes keep the artist's changes available. */
+  const submitArtSave = () => {
     const path = artPath;
     if (!path || !path.dirty) return;
+    const d = serializePathCommands(path.commands);
     setArtSaveOpen(false);
-    artSaveBaseRef.current = project?.currentRevision ?? null;
-    void editShape(path.shapeId, serializePathCommands(path.commands)).catch((e: Error) => {
-      artSaveBaseRef.current = null;
-      toast(e.message);
-    });
+    setArtConflictOpen(false);
+    // jobId arrives with the POST response; "" marks "accepted, id pending".
+    artPendingSaveRef.current = {
+      jobId: "",
+      submittedD: d,
+      baseRevision: project?.currentRevision ?? path.context.baseRevision,
+    };
+    void editShape(path.context.shapeId, d)
+      .then((res) => {
+        const pending = artPendingSaveRef.current;
+        if (pending) artPendingSaveRef.current = { ...pending, jobId: res.jobId };
+      })
+      .catch((e: Error) => {
+        artPendingSaveRef.current = null;
+        toast(e.message);
+        // A 409 means the client's snapshot is behind the server — resync so
+        // the stale-base conflict becomes visible for an explicit choice.
+        void syncProject();
+      });
   };
 
   // Shape-save settle-watch: runEdit resolves when the job is ACCEPTED, not
-  // when it finishes. Discard the draft only when the project settles idle on
-  // a NEW revision (the edited geometry is live); an unchanged revision means
-  // the job failed (its error is toasted by the poller) — keep the draft.
+  // when it finishes. Only a settled job whose ID IS OURS proves "my save
+  // published its result" (draft discarded). A settled job that is NOT ours
+  // means the project changed for another reason — the draft survives and the
+  // save bar reports the stale base for an explicit save/discard choice.
   useEffect(() => {
-    const base = artSaveBaseRef.current;
-    if (!base || busy) return;
-    artSaveBaseRef.current = null;
-    if (project?.currentRevision && project.currentRevision !== base) setArtPath(null);
-  }, [busy, project?.currentRevision]);
+    const pending = artPendingSaveRef.current;
+    if (!pending || !pending.jobId || busy) return;
+    const job = project?.job;
+    if (!job?.id) return;
+    artPendingSaveRef.current = null;
+    if (job.id === pending.jobId && job.status === "done") setArtPath(null);
+    // Every other terminal outcome (our job failed/canceled/interrupted, or
+    // an unrelated job settled) keeps the draft; the poller already toasted
+    // failures.
+  }, [busy, project?.job?.id, project?.job?.status]);
 
   const toolActive = view === "inspect" && hasBundle && tool !== "select" && !busy;
 
@@ -795,7 +873,14 @@ export function CanvasWorkspace() {
     setSyncedNodeSession(nodeSessionKey);
     setNodeEdge(null);
     setNodeConfirmOpen(false);
-    setArtPath(null);
+    // A bundle/view change does NOT discard an Art node DRAFT (review
+    // follow-up): another operation may have published a revision while the
+    // artist was editing — the draft is keyed by the stable shape id and its
+    // base revision now differs from the project's, which the save bar
+    // reports as an explicit conflict. The draft only goes away by the
+    // artist's own action (Cancel, switching tools) or by its save
+    // publishing. The gameplay BOUNDARY selection above is still discarded —
+    // it references two region ids that the new revision may have re-derived.
     if (nodeSessionKey != null) setStrokeViewBox(null);
   }
 
@@ -1283,7 +1368,7 @@ export function CanvasWorkspace() {
                   draggable anchors (solid) and handles (hollow, tethered).
                   Same constant-screen-size handles as the boundary tool. */}
               {tool === "artnode" && artPath && artGeometry && (
-                <g role="group" aria-label={`Artwork path anchors for shape ${artPath.shapeId}`}>
+                <g role="group" aria-label={`Artwork path anchors for shape ${artPath.context.shapeId}`}>
                   <g style={{ pointerEvents: "none" }}>
                     <polyline
                       points={artGeometry.previewLine.map((p) => `${p.x},${p.y}`).join(" ")}
@@ -1599,14 +1684,24 @@ export function CanvasWorkspace() {
       {tool === "artnode" && artPath && (
         <div className="mt-2.5 flex flex-wrap items-center gap-2">
           <span className="text-[10px] text-[#657671]">
-            Shape <code className="font-mono text-[10px] text-[#183837]">{artPath.shapeId}</code>
+            Shape <code className="font-mono text-[10px] text-[#183837]">{artPath.context.shapeId}</code>
             {artPath.dirty ? " · modified" : " · unchanged"}
           </span>
+          {staleDraftBase && (
+            <span
+              className="rounded-md border border-[#f0c8c3] bg-[#fbeeeb] px-2 py-1 text-[10px] font-medium text-[#ba463f]"
+              role="status"
+            >
+              Base changed: loaded from {artPath.context.baseRevision}, project now at{" "}
+              {project?.currentRevision}
+              {draftShapeChangedInBetween ? " — this shape was edited in between" : ""}
+            </span>
+          )}
           <Button
             size="sm"
             className="h-7 rounded-md bg-[#087f74] px-3 text-[10px] font-semibold text-white hover:bg-[#056a60]"
             disabled={busy || !artPath.dirty}
-            onClick={() => setArtSaveOpen(true)}
+            onClick={requestArtSave}
           >
             Save path
           </Button>
@@ -1786,7 +1881,7 @@ export function CanvasWorkspace() {
               Save the edited artwork path?
             </AlertDialogTitle>
             <AlertDialogDescription className="text-left text-[11px] leading-relaxed text-[#657671]">
-              Shape {artPath?.shapeId} is recompiled from the edited outline: the finished illustration
+              Shape {artPath?.context.shapeId} is recompiled from the edited outline: the finished illustration
               updates and its playable surfaces are re-derived — manual subdivisions inside the changed
               outline are superseded. The shape id and object ownership are preserved, and undo is
               revision history.
@@ -1799,10 +1894,57 @@ export function CanvasWorkspace() {
             <AlertDialogAction
               className="h-9 rounded-md bg-[#087f74] text-[10px] font-semibold text-white hover:bg-[#056c62]"
               disabled={busy}
-              onClick={saveArtPath}
+              onClick={submitArtSave}
             >
               <PenTool className="size-3.5" aria-hidden />
               {busy ? "Saving…" : "Save path"}
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+
+      {/* Stale-base conflict (review follow-up): the project advanced past the
+          revision this draft was loaded from. The artist gets an explicit
+          choice — save against the CURRENT revision (the edit is keyed by the
+          stable shape id), keep editing, or discard — never an implicit
+          rebase or a silent dismissal. */}
+      <AlertDialog
+        open={artConflictOpen}
+        onOpenChange={(open) => {
+          if (!open) setArtConflictOpen(false);
+        }}
+      >
+        <AlertDialogContent className="rounded-xl border-[#f0c8c3] sm:max-w-md">
+          <AlertDialogHeader>
+            <AlertDialogTitle className="text-left text-sm text-[#183837]">
+              The artwork changed since this shape was loaded
+            </AlertDialogTitle>
+            <AlertDialogDescription className="text-left text-[11px] leading-relaxed text-[#657671]">
+              Shape {artPath?.context.shapeId} was loaded from revision {artPath?.context.baseRevision}, but
+              the project is now at {project?.currentRevision}.{" "}
+              {draftShapeChangedInBetween
+                ? "This shape's outline was also edited in between — saving replaces those changes with your draft."
+                : "This shape's outline is unchanged in between, so saving applies your edit on top of the latest revision."}{" "}
+              Your draft stays available if you keep editing.
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter className="gap-2 sm:justify-end">
+            <AlertDialogCancel
+              className="h-9 rounded-md border-[#e1e5df] bg-white text-[10px]"
+              onClick={() => setArtPath(null)}
+            >
+              Discard draft
+            </AlertDialogCancel>
+            <AlertDialogCancel className="h-9 rounded-md border-[#e1e5df] bg-white text-[10px]">
+              Keep editing
+            </AlertDialogCancel>
+            <AlertDialogAction
+              className="h-9 rounded-md bg-[#087f74] text-[10px] font-semibold text-white hover:bg-[#056c62]"
+              disabled={busy}
+              onClick={submitArtSave}
+            >
+              <PenTool className="size-3.5" aria-hidden />
+              Save against {project?.currentRevision}
             </AlertDialogAction>
           </AlertDialogFooter>
         </AlertDialogContent>
