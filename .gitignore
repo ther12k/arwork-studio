@@ -79,3 +79,6 @@ tests/game-integration/.serve/
 
 # sandbox-local toolchain (rebuilt by .toolchain/setup.sh)
 .toolchain/
+
+# stray debug specs
+tests/game-integration/.*.spec.ts
