@@ -16,7 +16,7 @@ export default defineConfig({
     headless: true,
   },
   webServer: {
-    command: "python3 tests/game-integration/prepare_game.py && python3 -m http.server 4176 --bind 127.0.0.1 -d tests/game-integration/.serve",
+    command: ".toolchain/venv/bin/python tests/game-integration/prepare_game.py && node .toolchain/static-server.mjs 4176 tests/game-integration/.serve",
     url: "http://127.0.0.1:4176/index.html",
     reuseExistingServer: true,
     timeout: 600_000,

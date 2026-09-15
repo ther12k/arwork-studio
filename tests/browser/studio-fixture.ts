@@ -185,7 +185,7 @@ const objectsFor = (rev: string) => ({
     { id: "obj-red", name: "Red", shapeIds: ["s0001"] },
     {
       id: "obj-blue",
-      name: rev === REV1 ? "Blue" : "Blue Renamed",
+      name: rev === REV1 ? "Blue" : rev === REV2 ? "Blue Renamed" : "Blue Twice",
       shapeIds: [SHAPE],
     },
   ],

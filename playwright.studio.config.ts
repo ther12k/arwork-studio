@@ -17,7 +17,7 @@ export default defineConfig({
     headless: true,
   },
   webServer: {
-    command: "python3 -m http.server 4174 --bind 127.0.0.1 -d dist",
+    command: "node .toolchain/static-server.mjs 4174 dist",
     url: "http://127.0.0.1:4174/index.html",
     reuseExistingServer: true,
     timeout: 15_000,

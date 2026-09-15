@@ -466,46 +466,138 @@ export function CanvasWorkspace() {
   const artPendingSaveRef = useRef<PendingArtworkSave | null>(null);
 
   // ----- Task 40A: ink appearance (shape-addressed, topology-neutral) -----
-  /** The picked shape's CURRENT ink appearance (from the live bundle) —
-   *  the baseline the style draft diffs against when saving. */
-  const styleTarget = (() => {
-    if (!artPath || !bundle?.paint) return null;
+  /** Identity of an appearance draft: which project/revision the style was
+   *  loaded from (the P1 contract — the payload's base must be the revision
+   *  the artist SAW, never whatever happens to be current at save time),
+   *  which shape it styles, and the appearance baseline it was seeded with
+   *  (a concurrent publish that changed the appearance demands a warning,
+   *  an unchanged one makes "save against current" safe). Reused by 40B. */
+  type AppearanceDraftContext = {
+    projectId: string;
+    baseRevision: string;
+    shapeId: string;
+    original: { color: string; width: number; opacity: number };
+  };
+  /** The CURRENT revision's appearance for the picked shape (from the live
+   *  bundle) — what a fresh seed would capture. */
+  const liveInkAppearance: AppearanceDraftContext | null = (() => {
+    if (!artPath || !bundle?.paint || !project?.currentRevision) return null;
     const ink = bundle.paint.inkPaths.find((p) => p.shapeId === artPath.context.shapeId);
     if (!ink) return null;
-    return { shapeId: ink.shapeId!, color: ink.fill, width: ink.strokeWidth ?? 1.5, opacity: ink.opacity ?? 1 };
+    return {
+      projectId: project.id,
+      baseRevision: project.currentRevision,
+      shapeId: ink.shapeId!,
+      original: { color: ink.fill, width: ink.strokeWidth ?? 1.5, opacity: ink.opacity ?? 1 },
+    };
   })();
-  const styleTargetId = styleTarget?.shapeId ?? "";
+  /** The SEEDED draft context — frozen at pick time (per shape), so a
+   *  concurrent publish does NOT move the draft's base out from under the
+   *  artist. Null until the effect below seeds it. */
+  const [styleContext, setStyleContext] = useState<AppearanceDraftContext | null>(null);
   const [inkStyle, setInkStyle] = useState<{ color: string; width: number; opacity: number } | null>(null);
-  // (Re)seed the style draft when the edited shape changes. A published
-  // style edit keeps the artist's values (they now match the new paint).
+  const savedStyleJobRef = useRef<string | null>(null);
   useEffect(() => {
-    setInkStyle(
-      styleTarget ? { color: styleTarget.color, width: styleTarget.width, opacity: styleTarget.opacity } : null
-    );
-  }, [styleTargetId]);
+    // Seed ONCE per edited shape (keyed on the DRAFT's shape id — a stable
+    // artPath property, NOT a bundle-derived value that blips null during a
+    // revision remount): the context freezes the revision the artist saw.
+    // Concurrent publishes must surface as a conflict, not as a silent
+    // re-seed.
+    if (!artPath || !liveInkAppearance) {
+      setStyleContext(null);
+      setInkStyle(null);
+      return;
+    }
+    setStyleContext(liveInkAppearance);
+    setInkStyle({ ...liveInkAppearance.original });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [artPath?.context.shapeId]);
+  // The artist's OWN style save rebases the draft: once ITS job publishes,
+  // the artist's draft values ARE the published appearance — adopt them as
+  // the new seed (base = the revision the artist created). Other jobs'
+  // terminal outcomes never touch the draft (attribution by job id).
+  useEffect(() => {
+    const job = project?.job;
+    if (
+      !savedStyleJobRef.current ||
+      !job ||
+      job.id !== savedStyleJobRef.current ||
+      job.status !== "done" ||
+      busy ||
+      !styleContext ||
+      !inkStyle
+    ) {
+      return;
+    }
+    savedStyleJobRef.current = null;
+    setStyleContext({
+      projectId: styleContext.projectId,
+      baseRevision: project.currentRevision ?? styleContext.baseRevision,
+      shapeId: styleContext.shapeId,
+      original: { ...inkStyle },
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [project?.job?.id, project?.job?.status, busy]);
 
-  const inkStyleDirty =
-    !!styleTarget &&
+  /** True when the revision the style draft was seeded from is no longer
+   *  current (another operation published in between) — saving then needs
+   *  the artist's explicit acknowledgment, exactly like the geometry draft. */
+  const staleStyleBase =
     !!inkStyle &&
-    (inkStyle.color.toUpperCase() !== styleTarget.color.toUpperCase() ||
-      Math.abs(inkStyle.width - styleTarget.width) > 1e-6 ||
-      Math.abs(inkStyle.opacity - styleTarget.opacity) > 1e-6);
+    !!styleContext &&
+    styleContext.baseRevision !== project?.currentRevision &&
+    styleContext.projectId === project?.id;
+  /** True when the shape's appearance CHANGED in between (its current paint
+   *  no longer matches the draft's seed) — saving would silently overwrite
+   *  those unseen changes. */
+  const styleChangedInBetween = (() => {
+    if (!styleContext) return false;
+    const ink = bundle?.paint?.inkPaths.find((p) => p.shapeId === styleContext.shapeId);
+    if (!ink) return false;
+    const cur = { color: ink.fill, width: ink.strokeWidth ?? 1.5, opacity: ink.opacity ?? 1 };
+    const o = styleContext.original;
+    return (
+      cur.color.toUpperCase() !== o.color.toUpperCase() ||
+      Math.abs(cur.width - o.width) > 1e-6 ||
+      Math.abs(cur.opacity - o.opacity) > 1e-6
+    );
+  })();
+
+  const inkStyleDirty = !!inkStyle && !!styleContext &&
+    (inkStyle.color.toUpperCase() !== styleContext.original.color.toUpperCase() ||
+      Math.abs(inkStyle.width - styleContext.original.width) > 1e-6 ||
+      Math.abs(inkStyle.opacity - styleContext.original.opacity) > 1e-6);
 
   const resetInkStyle = () => {
-    if (!styleTarget) return;
-    setInkStyle({ color: styleTarget.color, width: styleTarget.width, opacity: styleTarget.opacity });
+    if (!styleContext) return;
+    setInkStyle({ ...styleContext.original });
   };
 
   const saveInkStyle = () => {
-    const t = styleTarget;
-    if (!t || !inkStyle || !inkStyleDirty) return;
+    const ctx = styleContext;
+    if (!ctx || !inkStyle || !inkStyleDirty) return;
+    // Identity guard, same class as the geometry draft's: the draft must go
+    // to ITS project. The payload's base is what the artist SAW — unless a
+    // concurrent publish moved the project, in which case the visible chip
+    // plus the explicit "Save against <current>" label IS the artist's
+    // consented rebase (never an implicit one).
+    if (ctx.projectId !== project?.id) {
+      toast("This style draft belongs to another project — switch back to it to save.");
+      return;
+    }
+    const baseRevision = staleStyleBase ? project?.currentRevision : ctx.baseRevision;
+    if (!baseRevision) return;
     const payload: { stroke_color?: string; stroke_width?: number; opacity?: number } = {};
-    if (inkStyle.color.toUpperCase() !== t.color.toUpperCase()) {
+    if (inkStyle.color.toUpperCase() !== ctx.original.color.toUpperCase()) {
       payload.stroke_color = inkStyle.color.toUpperCase();
     }
-    if (Math.abs(inkStyle.width - t.width) > 1e-6) payload.stroke_width = inkStyle.width;
-    if (Math.abs(inkStyle.opacity - t.opacity) > 1e-6) payload.opacity = inkStyle.opacity;
-    void editInkStyle(t.shapeId, payload).catch((e: Error) => toast(e.message));
+    if (Math.abs(inkStyle.width - ctx.original.width) > 1e-6) payload.stroke_width = inkStyle.width;
+    if (Math.abs(inkStyle.opacity - ctx.original.opacity) > 1e-6) payload.opacity = inkStyle.opacity;
+    void editInkStyle(ctx.shapeId, { ...payload, base_revision: baseRevision })
+      .then((res) => {
+        savedStyleJobRef.current = res.jobId;
+      })
+      .catch((e: Error) => toast(e.message));
   };
 
   const [artHistory, setArtHistory] = useState<ArtDraftHistory | null>(null);
@@ -2049,7 +2141,7 @@ export function CanvasWorkspace() {
           picked ink stroke. Appearance-only: gameplay geometry is untouched
           (regions re-derive identically); the outline of a FILLED shape is
           visual, never part of the tap target. */}
-      {tool === "artnode" && artPath && styleTarget && inkStyle && !busy && (
+      {tool === "artnode" && artPath && styleContext && inkStyle && !busy && (
         <div className="mt-2 flex flex-wrap items-center gap-x-3 gap-y-1.5 rounded-md border border-[#e1e5df] bg-white px-3 py-2">
           <span className="text-[10px] font-semibold text-[#183837]">Stroke</span>
           <label className="flex items-center gap-1.5 text-[10px] text-[#657671]">
@@ -2068,13 +2160,13 @@ export function CanvasWorkspace() {
             <input
               type="number"
               aria-label="Stroke width"
-              min={0}
+              min={0.4}
               max={8}
-              step={0.5}
+              step={0.1}
               value={inkStyle.width}
               onChange={(e) => {
                 const v = Number(e.target.value);
-                if (Number.isFinite(v)) setInkStyle({ ...inkStyle, width: Math.min(8, Math.max(0, v)) });
+                if (Number.isFinite(v)) setInkStyle({ ...inkStyle, width: Math.min(8, Math.max(0.4, v)) });
               }}
               className="h-6 w-14 rounded border border-[#e1e5df] px-1.5 text-[10px]"
             />
@@ -2097,6 +2189,16 @@ export function CanvasWorkspace() {
             />
             %
           </label>
+          {staleStyleBase && (
+            <span
+              className="rounded-md border border-[#e5d8a8] bg-[#faf5e3] px-2 py-1 text-[10px] font-medium text-[#8a6d1a]"
+              role="status"
+            >
+              Base changed: style loaded from {styleContext?.baseRevision}, project now at{" "}
+              {project?.currentRevision}
+              {styleChangedInBetween ? " — this stroke's appearance was edited in between" : ""}
+            </span>
+          )}
           <span className="text-[9px] text-[#778481]">appearance only — tap targets stay the same</span>
           <div className="ml-auto flex gap-2">
             <Button
@@ -2113,8 +2215,9 @@ export function CanvasWorkspace() {
               className="h-7 rounded-md bg-[#087f74] px-3 text-[10px] font-semibold text-white hover:bg-[#056a60]"
               disabled={busy || foreignDraft || !inkStyleDirty}
               onClick={saveInkStyle}
+              title={staleStyleBase ? "Explicitly apply this style on top of the current revision" : undefined}
             >
-              Save appearance
+              {staleStyleBase ? `Save against ${project?.currentRevision}` : "Save appearance"}
             </Button>
           </div>
         </div>

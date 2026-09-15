@@ -493,3 +493,54 @@ def test_ink_style_edit(client):
     p = wait(client, pid)
     assert p['job']['status'] == 'failed', p['job']
     assert 'Nothing to restyle' in p['job'].get('message', '')
+
+
+def test_ink_width_floor(client):
+    """P2 contract: ink stroke width floor is 0.4 (the compiler normalizes
+    smaller widths up, so sub-0.4 requests would be a silent lie); 0 is NOT
+    'remove stroke' for ink (opacity 0 is the non-destructive hide); 0.4
+    survives an ordinary Build."""
+    pid = new(client)
+    r = client.post(f'/api/projects/{pid}/upload-svg', headers=H,
+                    files={'file': ('ink.svg', INK_SVG, 'image/svg+xml')},
+                    data={'rights_confirmed': 'true'})
+    assert r.status_code == 200, r.text
+    r = client.post(f'/api/projects/{pid}/build', headers=H, json=BUILD_BODY)
+    assert r.status_code == 200, r.text
+    rev = wait(client, pid)['currentRevision']
+    d0 = files(client, pid, rev)
+    ink_id = next(p_['shapeId'] for p_ in d0['paint']['inkPaths']
+                  if p_['d'].startswith('M 40,40'))
+
+    # 0.1: below the compiler floor — rejected with guidance.
+    r = client.post(f'/api/projects/{pid}/edit', headers=H, json={
+        'base_revision': rev, 'action': 'shape_style', 'shape_id': ink_id,
+        'region_ids': [], 'stroke_width': 0.1})
+    assert r.status_code == 200, r.text
+    p = wait(client, pid)
+    assert p['job']['status'] == 'failed', p['job']
+    assert '0.4' in p['job'].get('message', '')
+
+    # 0.4: the floor — accepted and stable across an ordinary Build.
+    rev2 = step(client, pid, rev, {
+        'base_revision': rev, 'action': 'shape_style', 'shape_id': ink_id,
+        'region_ids': [], 'stroke_width': 0.4})
+    d2 = files(client, pid, rev2)
+    ink2 = next(p_ for p_ in d2['paint']['inkPaths'] if p_['shapeId'] == ink_id)
+    assert ink2['strokeWidth'] == 0.4
+    r = client.post(f'/api/projects/{pid}/build', headers=H, json=BUILD_BODY)
+    assert r.status_code == 200, r.text
+    p = wait(client, pid)
+    assert p['job']['status'] == 'done', p['job']
+    d3 = files(client, pid, p['currentRevision'])
+    ink3 = next(p_ for p_ in d3['paint']['inkPaths'] if p_['shapeId'] == ink_id)
+    assert ink3['strokeWidth'] == 0.4, 'floor width not preserved by Build'
+
+    # Opacity 0: the sanctioned hide — still a stroke, still pickable.
+    rev4 = step(client, pid, p['currentRevision'], {
+        'base_revision': p['currentRevision'], 'action': 'shape_style',
+        'shape_id': ink_id, 'region_ids': [], 'opacity': 0.0})
+    d4 = files(client, pid, rev4)
+    ink4 = next(p_ for p_ in d4['paint']['inkPaths'] if p_['shapeId'] == ink_id)
+    assert ink4.get('opacity') == 0.0 and ink4['strokeWidth'] == 0.4
+    assert d4['master'].count(f'id="{ink_id}"') == 1  # still present in source

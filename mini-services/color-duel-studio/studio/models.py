@@ -68,12 +68,12 @@ class EditRequest(StrictModel):
     x: float | None = Field(None, allow_inf_nan=False)
     y: float | None = Field(None, allow_inf_nan=False)
     # 'shape_style' (Task 40A: shape-addressed ink appearance; region_ids must
-    # be []): stroke_color/stroke_width restyle the ink stroke (width 0 removes
-    # it from the master), opacity < 1 sets it / >= 1 clears it. Gameplay
-    # geometry is untouched — regions re-derive identically.
+    # be []): stroke_color/stroke_width restyle the ink stroke, opacity < 1
+    # sets it / >= 1 clears it. Gameplay geometry is untouched — regions are
+    # re-derived identically.
     stroke_color: str | None = Field(None, pattern=r'^#[0-9A-Fa-f]{6}$')
     opacity: float | None = Field(None, ge=0, le=1, allow_inf_nan=False,
-        description="'shape_style' ink stroke opacity; >= 1 clears the attribute from the master.")
+        description="'shape_style' ink stroke opacity; >= 1 clears the attribute from the master. 0 hides the line non-destructively (ink strokes cannot be unstroked — width 0 is reserved for filled-shape outlines).")
     # 'recolor' (visible appearance, distinct from 'palette' = number group):
     color: str | None = Field(None, pattern=r'^#[0-9A-Fa-f]{6}$')
     preserve_shading: bool = Field(False, description='Keep gradient shading (tinted toward the target color) instead of replacing the fill.')
@@ -84,7 +84,7 @@ class EditRequest(StrictModel):
     paint: bool = Field(False,
         description="'draw': also emit a paint.json artwork path (stable shapeId + masterShapeId, fill, z-order). False = gameplay-only white tap target (region pen).")
     stroke_width: float | None = Field(None, ge=0, le=8,
-        description="'draw' with paint=true: ink outline width on the new paint path. 'shape_style': the ink stroke's width in px (0 removes the stroke). Authoring cap 8.")
+        description="'draw' with paint=true: ink outline width on the new paint path. 'shape_style': the ink stroke's width in px, floor 0.4 (the compiler minimum — smaller values are rejected; use opacity 0 to hide the line). Authoring cap 8.")
     z_behind: bool = Field(False,
         description="'draw' with paint=true: place the new paint path BEHIND the existing art (min z - 1) instead of on top (max z + 1).")
     # Task 33 — Artwork Path node mode: edit ONE source shape's geometry by

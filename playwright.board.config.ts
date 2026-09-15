@@ -13,7 +13,7 @@ export default defineConfig({
     headless: true,
   },
   webServer: {
-    command: "python3 -m http.server 4173 --bind 127.0.0.1 -d tests/browser/dist",
+    command: "node .toolchain/static-server.mjs 4173 tests/browser/dist",
     url: "http://127.0.0.1:4173/harness.html",
     reuseExistingServer: true,
     timeout: 15_000,

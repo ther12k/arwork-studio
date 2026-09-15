@@ -39,6 +39,7 @@ import {
   ORIGINAL_D,
   REV1,
   REV2,
+  REV3,
   SHAPE,
   mkState,
   routeBackend,
@@ -807,5 +808,22 @@ test("Ink appearance: color/width/opacity end-to-end, topology untouched, style 
   await expect(page.locator("[data-sonner-toast]", { hasText: "not a simple ring" })).toBeVisible();
   await expect(page.locator('input[aria-label="Stroke opacity"]')).toHaveValue("100");
   expect(state.editCalls.filter((c) => c.action === "shape_style")).toHaveLength(2);
+
+  // P1 — stale style base: a concurrent operation (the objects rename route)
+  // publishes rev-3 while the style draft still sits on rev-2. The draft is
+  // retained, the conflict is REPORTED, and saving sends the DRAFT's base
+  // (rev-2, what the artist saw) — never silently rebased onto rev-3.
+  state.mode = "success";
+  await page.getByTitle("Blue Renamed", { exact: true }).click();
+  await page.getByTitle("Rename object").click();
+  await page.locator('input[value="Blue Renamed"]').fill("Blue Twice");
+  await page.locator('input[value="Blue Twice"]').press("Enter");
+  await expect(page.getByText(/style loaded from rev-2, project now at rev-3/)).toBeVisible({ timeout: 20_000 });
+  // The save button itself states the explicit rebase target.
+  await page.locator('input[aria-label="Stroke opacity"]').fill("100");
+  await page.getByRole("button", { name: "Save against rev-3" }).click();
+  await expect(page.locator('input[aria-label="Stroke opacity"]')).toHaveValue("100", { timeout: 20_000 });
+  const stylePayload = state.editCalls.filter((c) => c.action === "shape_style")[2];
+  expect(stylePayload).toMatchObject({ shape_id: INK, base_revision: REV3 });
 });
 

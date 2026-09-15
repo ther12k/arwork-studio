@@ -3856,8 +3856,10 @@ def _style_master_shape_d(master_text: str, shape_id: str, stroke_color: str | N
     master path by stable id, with AUTHORITATIVE deletion semantics: a None
     / cleared value REMOVES the attribute rather than leaving a stale one
     behind, so Save → Build → Build can never resurrect the old style.
-    stroke_width 0 removes the whole stroke; opacity >= 1 removes the
-    opacity attribute (1 is the visual default — writing it would be noise).
+    opacity >= 1 removes the opacity attribute (1 is the visual default —
+    writing it would be noise). Ink widths are validated >= 0.4 upstream
+    (the compiler minimum); "remove the whole stroke" is NOT an ink
+    operation — an unstroked fill=none path stops being drawable ink.
     Only appearance attributes change; the path data is preserved verbatim.
     Raises ValueError when the shape is absent."""
     ET.register_namespace('', 'http://www.w3.org/2000/svg')
@@ -3874,13 +3876,9 @@ def _style_master_shape_d(master_text: str, shape_id: str, stroke_color: str | N
         raise ValueError(
             f'Shape "{shape_id}" was not found in the source master. Shapes from converted '
             'raster artwork (rc-*) are not restylable; redraw them with the pen instead.')
-    remove_width = stroke_width is not None and stroke_width <= 0
     if stroke_color is not None:
         target.set('stroke', stroke_color)
-    if remove_width:
-        target.attrib.pop('stroke-width', None)
-        target.attrib.pop('stroke', None)
-    elif stroke_width is not None:
+    if stroke_width is not None:
         target.set('stroke-width', str(round(stroke_width, 3)))
     if opacity is not None:
         if opacity < 0.999:
@@ -3915,8 +3913,15 @@ def _edit_master_style(source: Path, output: Path, request, version: str) -> dic
             'ink appearance targets open/closed strokes in paint.inkPaths.')
     if request.stroke_color is None and request.stroke_width is None and request.opacity is None:
         raise ValueError('Nothing to restyle — set stroke_color, stroke_width, or opacity.')
-    if request.stroke_width is not None and request.stroke_width <= 0:
-        raise ValueError('Ink strokes cannot be unstroked — remove the stroke from the source SVG instead.')
+    # Ink width floor: the compiler normalizes ink strokeWidth to >= 0.4, so
+    # anything below would silently snap back to 0.4 — reject the lie. 0 is
+    # NOT "remove stroke" for ink (an unstroked fill=none path would stop
+    # being drawable ink); the non-destructive hide is opacity 0. (Filled
+    # shape outlines — a later slice — MAY use 0 = remove outline, because
+    # the fill keeps the shape alive and selectable.)
+    if request.stroke_width is not None and request.stroke_width < 0.4:
+        raise ValueError('Ink stroke width starts at 0.4 px (the compiler minimum). '
+                         'To hide the line, set its opacity to 0 instead.')
 
     master_file = source / 'source-master.svg'
     if not master_file.is_file():

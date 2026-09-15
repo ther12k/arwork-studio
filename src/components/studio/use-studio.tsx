@@ -134,10 +134,12 @@ export interface StudioApi {
   /** Resolves with the ACCEPTED job's id (not its outcome — the caller owns
    *  settle handling). */
   editShape: (shapeId: string, d: string) => Promise<{ jobId: string }>;
-  /** Task 40A: restyle one ink stroke (color/width/opacity). */
+  /** Task 40A: restyle one ink stroke (color/width/opacity). The payload's
+   *  base_revision is the DRAFT's revision (what the artist saw) — never
+   *  silently rebased onto whatever is current at save time. */
   editInkStyle: (
     shapeId: string,
-    style: { stroke_color?: string; stroke_width?: number; opacity?: number }
+    style: { stroke_color?: string; stroke_width?: number; opacity?: number; base_revision?: string }
   ) => Promise<{ jobId: string }>;
   /** One poll pass on demand (edit-route 409 recovery): refreshes the
    *  project snapshot so an externally advanced revision becomes visible. */
@@ -1375,8 +1377,15 @@ export function StudioProvider({ children }: { children: React.ReactNode }) {
   /** Task 40A — restyle one ink stroke (shape-addressed; never touches the
    *  gameplay region selection). */
   const editInkStyle = useCallback(
-    (shapeId: string, style: { stroke_color?: string; stroke_width?: number; opacity?: number }) =>
-      runEdit("shape_style", { shape_id: shapeId, region_ids: [], ...style }, []),
+    (
+      shapeId: string,
+      style: { stroke_color?: string; stroke_width?: number; opacity?: number; base_revision?: string }
+    ) => {
+      const { base_revision, ...rest } = style;
+      return base_revision
+        ? runEdit("shape_style", { shape_id: shapeId, region_ids: [], base_revision, ...rest }, [])
+        : runEdit("shape_style", { shape_id: shapeId, region_ids: [], ...rest }, []);
+    },
     [runEdit]
   );
   /** Apply a custom free-mode color (contract §4) and remember it in the
