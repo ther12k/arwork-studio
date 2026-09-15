@@ -510,7 +510,6 @@ export function CanvasWorkspace() {
     }
     setStyleContext(liveInkAppearance);
     setInkStyle({ ...liveInkAppearance.original });
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [artPath?.context.shapeId]);
   // The artist's OWN style save rebases the draft: once ITS job publishes,
   // the artist's draft values ARE the published appearance — adopt them as
@@ -536,7 +535,6 @@ export function CanvasWorkspace() {
       shapeId: styleContext.shapeId,
       original: { ...inkStyle },
     });
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [project?.job?.id, project?.job?.status, busy]);
 
   /** True when the revision the style draft was seeded from is no longer

@@ -1,6 +1,6 @@
 // Minimal static file server (node, zero deps) — replaces `python3 -m
 // http.server` in Playwright webServer configs (python left the sandbox PATH).
-/* eslint-env node */
+/* global process, console, URL */
 import { createServer } from "node:http";
 import { readFile } from "node:fs/promises";
 import { extname, join, normalize } from "node:path";
