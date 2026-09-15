@@ -17,7 +17,7 @@ export default defineConfig({
     headless: true,
   },
   webServer: {
-    command: "node .toolchain/static-server.mjs 4174 dist",
+    command: "node tests/static-server.mjs 4174 dist",
     url: "http://127.0.0.1:4174/index.html",
     reuseExistingServer: true,
     timeout: 15_000,

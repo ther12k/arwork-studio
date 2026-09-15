@@ -13,7 +13,7 @@ export default defineConfig({
     headless: true,
   },
   webServer: {
-    command: "node .toolchain/static-server.mjs 4173 tests/browser/dist",
+    command: "node tests/static-server.mjs 4173 tests/browser/dist",
     url: "http://127.0.0.1:4173/harness.html",
     reuseExistingServer: true,
     timeout: 15_000,
