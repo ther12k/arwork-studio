@@ -26,6 +26,10 @@ STUDIO_ROOT = Path(__file__).resolve().parents[2]
 GOLDEN = STUDIO_ROOT / 'mini-services' / 'color-duel-studio' / 'tests' / 'golden-packs'
 SERVE = Path(__file__).resolve().parent / '.serve'
 
+# EXPLICIT test-harness mapping, not a silent product demotion: the game's
+# picker contract currently has three tiers (Easy/Medium/Hard) while Studio
+# measures four — Master displays as Hard here until Color Duel either adopts
+# the fourth tier or records the collapse as product policy.
 DIFFICULTY_MAP = {'easy': 'Easy', 'medium': 'Medium', 'hard': 'Hard', 'master': 'Hard'}
 
 

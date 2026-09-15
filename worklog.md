@@ -1930,3 +1930,16 @@ Work Log:
 
 Stage Summary:
 - Task 36's core is closed: the exported pack is now proven IN the real game, not just against the adapter — five byte-pinned golden packs traverse the game's own catalog, loader, renderer, pointer handlers and save path, with the composition pack's overlap resolving to the authoring-intended visible owner under a real click. Determinism is real (two runs, identical hashes), the provenance is pinned on both sides, and the two things CI cannot yet see (in-game journey, version-aware progress) are traced to the game repo's uncommitted catalog work rather than silently skipped. Next: the undo/redo editor slice, and re-enabling the CI game job when color-duel lands the catalog loader.
+
+---
+Task ID: 36-review1
+Agent: main (ZCode)
+Task: Review round on 0725aab — close the CI adapter-coverage gap (plural-named test checked only qa-composition) and record the accepted game-side roadmap.
+
+Work Log:
+- test_golden_packs_pass_the_shipped_game_adapter now extracts ALL five golden packs and runs the shipped adapter against every folder in one invocation (manual run: 10 PASS lines incl. the 250-region converted geometry and the 600-region master, exit 0; a converted/master-only adapter regression can no longer ride on the composition pack's green). Dropped the leftover `[sys.executable and 'bun', ...]` oddity for plain 'bun'; timeout raised to 300s for the master pack.
+- prepare_game.py: the master→Hard difficulty mapping is now annotated as an EXPLICIT harness decision (game picker contract has three tiers vs Studio's four) — not a silent product demotion; revisit when Color Duel adopts the fourth tier or records the collapse as policy.
+- Accepted roadmap from the review (game-repo side, in order): commit the catalog loader + golden-pack support upstream so prepare_game.py can pin a CLEAN sha (dirty:false) and the real-game gate becomes reproducible in CI → version-aware progress identity (effective key artworkId + content version; mismatch policy = restore same identity, never silently reuse region completion across versions; old→new stale-completion test) → Free Color real-game row (custom HEX not in palette, fill, reload, restored) → Duel row on identical content identity → move the in-game Playwright gate into CI. Studio-side undo/redo stays local-only history keyed on {projectId, baseRevision, shapeId} (consistent with the cross-project draft guard) and can proceed in parallel.
+
+Stage Summary:
+- CI now guards the adapter contract across the full golden set (not 1 of 5). The remaining Task-36 gap is explicitly game-repo-owned: reproducibility from a clean color-duel commit and version-safe progress identity, both sequenced above before the in-game gate joins CI.

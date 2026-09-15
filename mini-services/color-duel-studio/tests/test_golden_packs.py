@@ -13,7 +13,6 @@ import hashlib
 import json
 import shutil
 import subprocess
-import sys
 import zipfile
 from pathlib import Path
 
@@ -52,15 +51,22 @@ def test_golden_packs_are_pinned_and_complete():
 
 
 def test_golden_packs_pass_the_shipped_game_adapter(tmp_path):
+    """ALL five packs — an adapter regression that only breaks e.g. the
+    converted raster geometry or the 600-region master must not slip through
+    on the composition pack's green result."""
     if shutil.which('bun') is None:
         pytest.skip('bun runtime unavailable')
+    manifest = json.loads((GOLDEN / 'manifest.json').read_text())
     folders = []
-    with zipfile.ZipFile(GOLDEN / 'qa-composition.zip') as zf:
-        zf.extractall(tmp_path)
-    folders.append(tmp_path / 'artworks' / 'qa-composition')
-    assert folders[0].is_dir()
-    proc = subprocess.run([sys.executable and 'bun', str(ADAPTER_CHECK),
-                           *(str(f) for f in folders)],
-                          capture_output=True, text=True, cwd=str(ROOT), timeout=120)
+    for pack in manifest['packs']:
+        with zipfile.ZipFile(GOLDEN / pack['zip']) as zf:
+            # zip entries already carry the artworks/<id>/ prefix
+            zf.extractall(tmp_path)
+        folder = tmp_path / 'artworks' / pack['artworkId']
+        assert folder.is_dir(), f'{pack["id"]}: unexpected pack layout'
+        folders.append(folder)
+    assert len(folders) == len(EXPECTED_IDS)
+    proc = subprocess.run(['bun', str(ADAPTER_CHECK), *(str(f) for f in folders)],
+                          capture_output=True, text=True, cwd=str(ROOT), timeout=300)
     assert proc.returncode == 0, f'adapter rejected a golden pack:\n{proc.stdout}\n{proc.stderr}'
     assert 'FAIL' not in proc.stdout
