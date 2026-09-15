@@ -12,6 +12,7 @@ export default tseslint.config(
       "node_modules/**",
       "dist/**",
       "tests/browser/dist/**",
+      "tests/game-integration/.serve/**",
       "dev.log",
       "mini-services/**",
       "examples/**",

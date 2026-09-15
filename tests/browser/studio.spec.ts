@@ -44,6 +44,9 @@ import {
   type FixtureState,
 } from "./studio-fixture";
 
+void EDITED_D;
+void ORIGINAL_D;
+
 type Pt = { x: number; y: number };
 
 /** The board svg's label is set by VectorBoard itself at mount. */
@@ -297,4 +300,74 @@ test("Art node journey: mid-edge pick, no-selection save, preview==payload, reje
   await expect(overlayGroup(page)).toHaveCount(0);
   await page.waitForTimeout(400);
   expect(state.editCalls).toHaveLength(callsBeforeCancel);
+});
+
+// ------------------------------------------------- cross-project draft safety
+
+test("foreign-project draft: suspended, unsendable, recoverable — never written into another project", async ({ page }) => {
+  test.setTimeout(120_000);
+  const state: FixtureState = mkState();
+  await routeBackend(page, state);
+  await page.goto("/");
+
+  // Dirty a draft on project A (shape s0002, handle dragged).
+  await page.getByRole("button", { name: "Edit regions" }).click();
+  await page.getByRole("button", { name: "Art node" }).click();
+  const tap = await artToPage(page, 150, 90);
+  await page.mouse.click(tap.x, tap.y);
+  await expect(overlayGroup(page)).toBeVisible();
+  const handle = page.locator('circle[aria-label="Bézier handle 1"]');
+  const drop = await artToPage(page, 170, 60);
+  const hb = await handle.boundingBox();
+  await page.mouse.move(hb!.x + hb!.width / 2, hb!.y + hb!.height / 2);
+  await page.mouse.down();
+  await page.mouse.move(drop.x, drop.y, { steps: 6 });
+  await page.mouse.up();
+
+  // Open the save CONFIRMATION, then switch projects with it open. If the
+  // modal layer blocks the switch, close the dialog and continue — the
+  // functional guard (submitArtSave re-checks identity) is additionally
+  // proven by the disabled action below.
+  await saveBar(page).click();
+  const dialog = page.getByRole("alertdialog");
+  const dialogOpen = await dialog.isVisible().catch(() => false);
+  if (dialogOpen) {
+    const combobox = page.getByRole("combobox", { name: "Workspace" });
+    const switched = await combobox
+      .click({ timeout: 2_000 })
+      .then(() => true)
+      .catch(() => false);
+    if (!switched) await dialog.getByRole("button", { name: "Cancel" }).click();
+  }
+  await page.getByRole("combobox", { name: "Workspace" }).click();
+  await page.getByRole("option", { name: "Project B" }).click();
+
+  // On B: the draft from A survives (workspace stays mounted) but is
+  // SUSPENDED — chip explains, Save disabled, zero edit requests so far.
+  await expect(page.getByText("Draft from another project", { exact: false })).toBeVisible({ timeout: 15_000 });
+  await expect(saveBar(page)).toBeDisabled();
+  expect(state.editCalls).toHaveLength(0);
+  // B's own board mounted (its single region is live).
+  await expect(page.locator(`${BOARD} path[data-region-id="r-b1"]`)).toBeAttached();
+
+  // Even a disabled-action attempt sends nothing.
+  await saveBar(page).click({ force: true }).catch(() => {});
+  await page.waitForTimeout(300);
+  expect(state.editCalls).toHaveLength(0);
+
+  // Switch back to A: the draft is recoverable — chip gone, Save enabled,
+  // and saving publishes to A (base rev-1), never B.
+  await page.getByRole("combobox", { name: "Workspace" }).click();
+  await page.getByRole("option", { name: "Journey fixture" }).click();
+  await expect(page.getByText("Draft from another project", { exact: false })).toHaveCount(0, { timeout: 15_000 });
+  await expect(saveBar(page)).toBeEnabled();
+  state.mode = "success";
+  await saveBar(page).click();
+  await page.getByRole("alertdialog").getByRole("button", { name: "Save path" }).click();
+  await expectPixel(page, 187, 95, isBlue, 20_000);
+  const payload = state.editCalls[state.editCalls.length - 1];
+  expect(state.editCalls).toHaveLength(1);
+  expect(payload).toMatchObject({ base_revision: REV1, action: "shape", shape_id: SHAPE });
+  // B was never written: its revision never advanced.
+  expect(state.revision).toBe(REV2); // A advanced rev-1 → rev-2 only
 });

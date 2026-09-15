@@ -1,0 +1,153 @@
+{
+  "schema": "golden-packs/1",
+  "studioVersion": "0.3.1",
+  "generatedBy": "scripts/generate_golden_packs.py",
+  "note": "Fixed regression assets \u2014 regenerate ONLY deliberately (this changes every content hash and requires a fresh pin).",
+  "packs": [
+    {
+      "id": "qa-composition",
+      "requested": {
+        "source": "authoring-composition chain (pen \u2192 recolor \u2192 reorder \u2192 B\u00e9zier edit \u2192 build)"
+      },
+      "zip": "qa-composition.zip",
+      "sha256": "c9217d92211515d024bb7c14ed5a0d55607d91984a06d86edbe8f0bbe10b9db7",
+      "artworkId": "qa-composition",
+      "format": "color-duel-detailed-vector-1",
+      "regionCount": 3,
+      "difficulty": {
+        "rating": "easy",
+        "score": 17.7,
+        "metrics": {
+          "regionCount": 3,
+          "medianRegionArea": 11044.13,
+          "tinyRegionPct": 0.3333,
+          "requiredZoom": 0.85,
+          "labelClearance": "tight",
+          "paletteAmbiguity": "low",
+          "paletteGroups": 3,
+          "avgNeighbors": 0.0,
+          "subdivisionEdges": 1,
+          "objectDensity": 0.333
+        }
+      },
+      "artworkVersion": "0.1.5"
+    },
+    {
+      "id": "qa-easy",
+      "requested": {
+        "source": "native-vector master",
+        "targetRegions": 60
+      },
+      "zip": "qa-easy.zip",
+      "sha256": "20431d73c06ac3944d6b4ae0431206f1d1a5bd4835cc5d082aba4f37cd9b4627",
+      "artworkId": "qa-easy",
+      "format": "color-duel-detailed-vector-1",
+      "regionCount": 60,
+      "difficulty": {
+        "rating": "easy",
+        "score": 12.2,
+        "metrics": {
+          "regionCount": 60,
+          "medianRegionArea": 4831.96,
+          "tinyRegionPct": 0.0,
+          "requiredZoom": 1.15,
+          "labelClearance": "ok",
+          "paletteAmbiguity": "low",
+          "paletteGroups": 5,
+          "avgNeighbors": 2.733,
+          "subdivisionEdges": 107,
+          "objectDensity": 1.808
+        }
+      },
+      "artworkVersion": "0.1.0"
+    },
+    {
+      "id": "qa-hard",
+      "requested": {
+        "source": "native-vector master",
+        "targetRegions": 300
+      },
+      "zip": "qa-hard.zip",
+      "sha256": "f40e443b5f9fec87cfe23e7af8f2e2094273ed491597547ec82449e0a9c7cc8b",
+      "artworkId": "qa-hard",
+      "format": "color-duel-detailed-vector-1",
+      "regionCount": 300,
+      "difficulty": {
+        "rating": "medium",
+        "score": 40.0,
+        "metrics": {
+          "regionCount": 300,
+          "medianRegionArea": 997.69,
+          "tinyRegionPct": 0.0,
+          "requiredZoom": 2.32,
+          "labelClearance": "tight",
+          "paletteAmbiguity": "low",
+          "paletteGroups": 5,
+          "avgNeighbors": 2.227,
+          "subdivisionEdges": 486,
+          "objectDensity": 9.042
+        }
+      },
+      "artworkVersion": "0.1.0"
+    },
+    {
+      "id": "qa-master",
+      "requested": {
+        "source": "native-vector master",
+        "targetRegions": 600
+      },
+      "zip": "qa-master.zip",
+      "sha256": "b4d99081a3d68c81e3bdfde30aef472f1e708dc6ac25cececa84bf14feaa172a",
+      "artworkId": "qa-master",
+      "format": "color-duel-detailed-vector-1",
+      "regionCount": 600,
+      "difficulty": {
+        "rating": "hard",
+        "score": 52.4,
+        "metrics": {
+          "regionCount": 600,
+          "medianRegionArea": 499.45,
+          "tinyRegionPct": 0.1367,
+          "requiredZoom": 3.29,
+          "labelClearance": "tight",
+          "paletteAmbiguity": "low",
+          "paletteGroups": 5,
+          "avgNeighbors": 1.793,
+          "subdivisionEdges": 953,
+          "objectDensity": 18.084
+        }
+      },
+      "artworkVersion": "0.1.0"
+    },
+    {
+      "id": "qa-converted-balanced",
+      "requested": {
+        "source": "Convert pipeline (offline provider mock)",
+        "fidelity": "balanced",
+        "difficulty": "medium"
+      },
+      "zip": "qa-converted-balanced.zip",
+      "sha256": "9d8698e5f9472ade3718c2b6c1710446e461d74e806280af7485c6ee9000a3d4",
+      "artworkId": "art-0000000000000000",
+      "format": "color-duel-detailed-vector-1",
+      "regionCount": 250,
+      "difficulty": {
+        "rating": "hard",
+        "score": 53.6,
+        "metrics": {
+          "regionCount": 250,
+          "medianRegionArea": 324.33,
+          "tinyRegionPct": 0.912,
+          "requiredZoom": 2.32,
+          "labelClearance": "tight",
+          "paletteAmbiguity": "low",
+          "paletteGroups": 3,
+          "avgNeighbors": 2.52,
+          "subdivisionEdges": 0,
+          "objectDensity": 30.141
+        }
+      },
+      "artworkVersion": "0.1.0"
+    }
+  ]
+}

@@ -17,6 +17,8 @@
 import type { Page } from "@playwright/test";
 
 export const PID = "proj-journey";
+export const PID_B = "proj-b";
+export const REV_B1 = "b-rev-1";
 export const REV1 = "rev-1";
 export const REV2 = "rev-2";
 export const REV3 = "rev-3";
@@ -168,6 +170,78 @@ const objectsFor = (rev: string) => ({
   ],
 });
 
+// Project B — a SECOND project whose artwork also has a shape "s0002"
+// (different geometry/fill). The cross-project draft guard depends on this
+// collision being possible: A's draft must never be submittable against B's
+// s0002.
+const ART_B = "journey-artwork-b";
+const B_D = "M 60,60 C 60,20 180,20 180,60 C 180,100 60,100 60,60 Z";
+const manifestB = {
+  schemaVersion: 1,
+  format: "color-duel-detailed-vector-1",
+  id: ART_B,
+  version: "0.2.0",
+  title: "Journey fixture B",
+  regionCount: 1,
+  paletteCount: 2,
+  objectGroups: [],
+  assets: { regions: "regions.json", palette: "palette.json", paint: "paint.json" },
+  contentHash: "journey-fixture-b",
+  difficulty: { rating: "easy", score: 10, metrics: {} },
+};
+const geometryB = {
+  schemaVersion: 1,
+  artworkId: ART_B,
+  artworkVersion: "0.2.0",
+  viewBox: [0, 0, 300, 300],
+  fillRule: "evenodd",
+  stroke: "#22333B",
+  strokeWidth: 0.8,
+  edges: [],
+  regions: [
+    {
+      id: "r-b1", paletteId: 1, objectId: "obj-b1",
+      d: B_D, fillRule: "evenodd", masterShapeId: SHAPE,
+      rings: [[[60, 60], [180, 60], [180, 100], [60, 100]]],
+      bbox: [60, 20, 180, 100], area: 4800,
+      label: { x: 120, y: 60, fontSize: 14, minScreenPx: 9, clearance: 20 },
+    },
+  ],
+  decorations: [],
+  detailPaths: [],
+};
+const paintB = {
+  schemaVersion: 2,
+  artworkId: ART_B,
+  viewBox: [0, 0, 300, 300],
+  paths: [{ z: 0, shapeId: SHAPE, d: B_D, fill: "#CC33AA", fillRule: "evenodd" }],
+  inkPaths: [],
+  gradients: [],
+  sourceColorShapeCount: 1,
+};
+const projectB = () => ({
+  id: PID_B,
+  title: "Project B",
+  brief: "fixture brief b",
+  createdAt: "2026-01-01T00:00:00Z",
+  updatedAt: "2026-01-01T00:00:00Z",
+  messages: [],
+  aiUsage: [],
+  master: null,
+  reference: null,
+  revisions: [
+    {
+      id: REV_B1, version: "0.3.1", createdAt: "2026-01-01T00:00:00Z", kind: "build",
+      sourceHash: "sha-b1", regionCount: 1,
+      qa: { passed: true, errors: [], warnings: [], playableRegions: 1, fixedRegions: 0,
+            paletteGroups: 2, paintPaths: 1, humanReviewed: false },
+      manifestUrl: `/api/projects/${PID_B}/revisions/${REV_B1}/files/artwork.json`,
+    },
+  ],
+  currentRevision: REV_B1,
+  job: { status: "idle" },
+});
+
 const project = (state: FixtureState) => ({
   id: PID,
   title: "Journey fixture",
@@ -210,6 +284,22 @@ const advanceJob = (state: FixtureState) => {
 };
 
 const fileFor = (state: FixtureState, rev: string, name: string): unknown => {
+  if (rev === REV_B1) {
+    switch (name) {
+      case "artwork.json":
+        return manifestB;
+      case "regions.json":
+        return geometryB;
+      case "palette.json":
+        return palette;
+      case "paint.json":
+        return paintB;
+      case "objects.json":
+        return { schemaVersion: 1, objects: [{ id: "obj-b1", name: "B1", shapeIds: [SHAPE] }] };
+      default:
+        return { detail: "no such file" };
+    }
+  }
   const d = state.revPaint[rev] ?? ORIGINAL_D;
   switch (name) {
     case "artwork.json":
@@ -242,14 +332,19 @@ export async function routeBackend(page: Page, state: FixtureState) {
         maxUploadMB: 10,
       });
     }
-    if (path === "/api/projects" && req.method() === "GET") return json([project(state)]);
+    if (path === "/api/projects" && req.method() === "GET") return json([project(state), projectB()]);
+    if (path === `/api/projects/${PID_B}` && req.method() === "GET") return json(projectB());
+    if (path === `/api/projects/${PID_B}` && req.method() === "PATCH") return json(projectB());
+    if (path === `/api/projects/${PID_B}/generation/sessions`) return json({ sessions: [] });
     if (path === `/api/projects/${PID}` && req.method() === "GET") {
       advanceJob(state);
       return json(project(state));
     }
     if (path === `/api/projects/${PID}` && req.method() === "PATCH") return json(project(state));
     if (path === `/api/projects/${PID}/generation/sessions`) return json({ sessions: [] });
-    const file = path.match(new RegExp(`^/api/projects/${PID}/revisions/([^/]+)/files/(.+)$`));
+    const file = path.match(
+      new RegExp(`^/api/projects/(?:${PID}|${PID_B})/revisions/([^/]+)/files/(.+)$`)
+    );
     if (file && req.method() === "GET") return json(fileFor(state, file[1], file[2]));
     if (path === `/api/projects/${PID}/objects` && req.method() === "POST") {
       const body = req.postDataJSON() as Record<string, unknown>;

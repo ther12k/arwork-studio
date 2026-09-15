@@ -442,6 +442,11 @@ export function CanvasWorkspace() {
     !!project?.currentRevision &&
     artPath.context.baseRevision !== project.currentRevision &&
     artPath.context.projectId === project.id;
+  /** True when the MOUNTED project is not the project the draft belongs to
+   *  (the workspace stays mounted across openProject). A foreign draft is
+   *  never writable: saving would submit it to the other project's shape of
+   *  the same id. It stays suspended — recoverable by switching back. */
+  const foreignDraft = !!artPath && !!project && artPath.context.projectId !== project.id;
   /** True when the edited SHAPE ITSELF changed in between (its current paint
    *  path no longer matches the draft's origin) — saving then overwrites
    *  geometry changes the artist has not seen. */
@@ -532,24 +537,38 @@ export function CanvasWorkspace() {
     setArtPath((prev) => (prev && prev.dragging ? { ...prev, dragging: null } : prev));
   };
 
-  /** Save intent: route to the explicit-conflict dialog when the draft's base
-   *  revision is stale (another operation published in between), otherwise to
-   *  the normal consequence confirmation. */
+  /** Save intent: foreign drafts are suspended (no request can target the
+   *  wrong project); a stale base routes to the explicit-conflict dialog;
+   *  otherwise the normal consequence confirmation. */
   const requestArtSave = () => {
     if (!artPath || !artPath.dirty) return;
+    if (foreignDraft) {
+      toast("This draft belongs to another project — switch back to it to save, or Cancel to discard.");
+      return;
+    }
     if (staleDraftBase) setArtConflictOpen(true);
     else setArtSaveOpen(true);
   };
 
   /** Save: submit the edited path (edit action "shape", keyed by the stable
    *  shapeId — the 409 stale-base guard is the shared edit-route check).
-   *  The draft is NOT dropped here: it stays mounted and editable until the
-   *  job settles. Attribution is by job id (the settle-watch below) so only
-   *  THIS save's success can clear it; rejections, failures, and unrelated
-   *  revision changes keep the artist's changes available. */
+   *  PROJECT IDENTITY is re-verified here, not just at button level: a save
+   *  dialog can stay open across an openProject switch, and runEdit would
+   *  otherwise target whatever project is current. The draft is NOT dropped
+   *  here: it stays mounted and editable until the job settles. Attribution
+   *  is by job id (the settle-watch below) so only THIS save's success can
+   *  clear it; rejections, failures, and unrelated revision changes keep the
+   *  artist's changes available. */
   const submitArtSave = () => {
     const path = artPath;
+    const p = project;
     if (!path || !path.dirty) return;
+    if (!p || path.context.projectId !== p.id) {
+      // Foreign project (dialog left open across a project switch): never
+      // send — the request would edit the OTHER project's shape.
+      toast("This draft belongs to another project — switch back to it to save.");
+      return;
+    }
     const d = serializePathCommands(path.commands);
     setArtSaveOpen(false);
     setArtConflictOpen(false);
@@ -557,7 +576,7 @@ export function CanvasWorkspace() {
     artPendingSaveRef.current = {
       jobId: "",
       submittedD: d,
-      baseRevision: project?.currentRevision ?? path.context.baseRevision,
+      baseRevision: p.currentRevision ?? path.context.baseRevision,
     };
     void editShape(path.context.shapeId, d)
       .then((res) => {
@@ -1687,6 +1706,15 @@ export function CanvasWorkspace() {
             Shape <code className="font-mono text-[10px] text-[#183837]">{artPath.context.shapeId}</code>
             {artPath.dirty ? " · modified" : " · unchanged"}
           </span>
+          {foreignDraft && (
+            <span
+              className="rounded-md border border-[#e5d8a8] bg-[#faf5e3] px-2 py-1 text-[10px] font-medium text-[#8a6d1a]"
+              role="status"
+            >
+              Draft from another project — switch back to {artPath.context.projectId} to save it, or
+              Cancel to discard
+            </span>
+          )}
           {staleDraftBase && (
             <span
               className="rounded-md border border-[#f0c8c3] bg-[#fbeeeb] px-2 py-1 text-[10px] font-medium text-[#ba463f]"
@@ -1700,7 +1728,7 @@ export function CanvasWorkspace() {
           <Button
             size="sm"
             className="h-7 rounded-md bg-[#087f74] px-3 text-[10px] font-semibold text-white hover:bg-[#056a60]"
-            disabled={busy || !artPath.dirty}
+            disabled={busy || !artPath.dirty || foreignDraft}
             onClick={requestArtSave}
           >
             Save path
@@ -1893,7 +1921,7 @@ export function CanvasWorkspace() {
             </AlertDialogCancel>
             <AlertDialogAction
               className="h-9 rounded-md bg-[#087f74] text-[10px] font-semibold text-white hover:bg-[#056c62]"
-              disabled={busy}
+              disabled={busy || foreignDraft}
               onClick={submitArtSave}
             >
               <PenTool className="size-3.5" aria-hidden />
@@ -1940,7 +1968,7 @@ export function CanvasWorkspace() {
             </AlertDialogCancel>
             <AlertDialogAction
               className="h-9 rounded-md bg-[#087f74] text-[10px] font-semibold text-white hover:bg-[#056c62]"
-              disabled={busy}
+              disabled={busy || foreignDraft}
               onClick={submitArtSave}
             >
               <PenTool className="size-3.5" aria-hidden />
