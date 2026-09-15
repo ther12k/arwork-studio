@@ -76,3 +76,6 @@ playwright-report/
 
 # Task 36 game gate runtime staging (rebuilt by prepare_game.py)
 tests/game-integration/.serve/
+
+# sandbox-local toolchain (rebuilt by .toolchain/setup.sh)
+.toolchain/

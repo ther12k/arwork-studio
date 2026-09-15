@@ -134,6 +134,11 @@ export interface StudioApi {
   /** Resolves with the ACCEPTED job's id (not its outcome — the caller owns
    *  settle handling). */
   editShape: (shapeId: string, d: string) => Promise<{ jobId: string }>;
+  /** Task 40A: restyle one ink stroke (color/width/opacity). */
+  editInkStyle: (
+    shapeId: string,
+    style: { stroke_color?: string; stroke_width?: number; opacity?: number }
+  ) => Promise<{ jobId: string }>;
   /** One poll pass on demand (edit-route 409 recovery): refreshes the
    *  project snapshot so an externally advanced revision becomes visible. */
   syncProject: () => Promise<void>;
@@ -999,10 +1004,10 @@ export function StudioProvider({ children }: { children: React.ReactNode }) {
       if (isBusyProject(p)) throw new Error("Wait for the current job.");
       if (!p.currentRevision) throw new Error("Build the vector regions first.");
       // Cut/draw supply their own region ids (the target region / none);
-      // 'shape' is keyed by shape_id and never touches region selection;
-      // everything else uses the current selection.
+      // 'shape'/'shape_style' are keyed by shape_id and never touch region
+      // selection; everything else uses the current selection.
       const ids = regionIds ?? [...selectedRef.current];
-      if (!ids.length && action !== "draw" && action !== "shape")
+      if (!ids.length && action !== "draw" && action !== "shape" && action !== "shape_style")
         throw new Error("Select at least one region in Edit regions.");
       const body: EditPayload = {
         base_revision: p.currentRevision,
@@ -1367,6 +1372,13 @@ export function StudioProvider({ children }: { children: React.ReactNode }) {
     (shapeId: string, d: string) => runEdit("shape", { shape_id: shapeId, d }, []),
     [runEdit]
   );
+  /** Task 40A — restyle one ink stroke (shape-addressed; never touches the
+   *  gameplay region selection). */
+  const editInkStyle = useCallback(
+    (shapeId: string, style: { stroke_color?: string; stroke_width?: number; opacity?: number }) =>
+      runEdit("shape_style", { shape_id: shapeId, region_ids: [], ...style }, []),
+    [runEdit]
+  );
   /** Apply a custom free-mode color (contract §4) and remember it in the
    *  recent list (capped at 10, persisted in localStorage OUTSIDE the board). */
   const setBoardFreeColor = useCallback((hex: string) => {
@@ -1620,6 +1632,7 @@ export function StudioProvider({ children }: { children: React.ReactNode }) {
     drawRegion,
     nodeEdit,
     editShape,
+    editInkStyle,
     syncProject,
     freeColor,
     setBoardFreeColor,

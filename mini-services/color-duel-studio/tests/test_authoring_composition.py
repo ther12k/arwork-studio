@@ -397,3 +397,99 @@ def test_ink_stroke_edit(client):
     step(client, pid, rev5, {
         'action': 'shape', 'shape_id': ink_id, 'region_ids': [],
         'd': 'M 0,0 L 0,0 M 100,100 L 120,100', 'base_revision': rev5})
+
+
+# ---------------------------------------------------------- Task 40A: ink style
+
+STYLE_TEAL = '#29383E'
+
+
+def test_ink_style_edit(client):
+    """Task 40A — ink appearance is shape-addressed and topology-neutral:
+    color/width/opacity land in paint.inkPaths AND the authoritative master
+    in the SAME revision; regions.json and paint.paths are byte-identical
+    across the edit; an ordinary Build preserves the style; opacity renders
+    end-to-end (master → paint → exported colored.svg)."""
+    pid = new(client)
+    r = client.post(f'/api/projects/{pid}/upload-svg', headers=H,
+                    files={'file': ('ink.svg', INK_SVG, 'image/svg+xml')},
+                    data={'rights_confirmed': 'true'})
+    assert r.status_code == 200, r.text
+    r = client.post(f'/api/projects/{pid}/build', headers=H, json=BUILD_BODY)
+    assert r.status_code == 200, r.text
+    rev = wait(client, pid)['currentRevision']
+    before = files(client, pid, rev)
+    ink_id = next(p_['shapeId'] for p_ in before['paint']['inkPaths']
+                  if p_['d'].startswith('M 40,40'))
+    regions_sig = json.dumps(sorted(before['regions'], key=lambda r_: r_['id']), sort_keys=True)
+    paths_sig = json.dumps(before['paint']['paths'], sort_keys=True)
+
+    # Restyle the open squiggle: teal, width 3, 50% opacity.
+    rev2 = step(client, pid, rev, {
+        'base_revision': rev, 'action': 'shape_style', 'shape_id': ink_id,
+        'region_ids': [], 'stroke_color': STYLE_TEAL, 'stroke_width': 3.0,
+        'opacity': 0.5})
+    d2 = files(client, pid, rev2)
+    # Topology-neutral invariants (the hard gate).
+    assert json.dumps(sorted(d2['regions'], key=lambda r_: r_['id']), sort_keys=True) == regions_sig
+    assert json.dumps(d2['paint']['paths'], sort_keys=True) == paths_sig
+    assert d2['objects'] == before['objects']
+    # paint.inkPaths carries the new appearance.
+    ink2 = next(p_ for p_ in d2['paint']['inkPaths'] if p_['shapeId'] == ink_id)
+    assert ink2['fill'] == STYLE_TEAL and ink2['strokeWidth'] == 3.0
+    assert ink2.get('opacity') == 0.5
+    # The authoritative master carries the same style in the same revision
+    # (deletion semantics check comes later via opacity=1 / width changes).
+    assert f'stroke="{STYLE_TEAL}"' in d2['master'] or f'stroke="{STYLE_TEAL.lower()}"' in d2['master']
+    assert not d2['qa'].get('errors')
+    # Opacity renders into the exported colored.svg (serializer chain).
+    colored = client.get(f'/api/projects/{pid}/revisions/{rev2}/files/colored.svg', headers=H).text
+    assert 'opacity="0.5"' in colored, 'ink opacity missing from the exported colored.svg'
+
+    # Ordinary Build preserves the restyled ink (source is authoritative).
+    r = client.post(f'/api/projects/{pid}/build', headers=H, json=BUILD_BODY)
+    assert r.status_code == 200, r.text
+    p = wait(client, pid)
+    assert p['job']['status'] == 'done', p['job']
+    d3 = files(client, pid, p['currentRevision'])
+    ink3 = next(p_ for p_ in d3['paint']['inkPaths'] if p_['shapeId'] == ink_id)
+    assert ink3['fill'] == STYLE_TEAL and ink3['strokeWidth'] == 3.0
+    assert ink3.get('opacity') == 0.5, 'opacity resurrected/cleared by an ordinary Build'
+
+    # Deletion semantics: opacity >= 1 REMOVES the attribute everywhere.
+    rev4 = step(client, pid, p['currentRevision'], {
+        'base_revision': p['currentRevision'], 'action': 'shape_style',
+        'shape_id': ink_id, 'region_ids': [], 'opacity': 1.0})
+    d4 = files(client, pid, rev4)
+    ink4 = next(p_ for p_ in d4['paint']['inkPaths'] if p_['shapeId'] == ink_id)
+    assert 'opacity' not in ink4
+    assert f'stroke-width="3"' in d4['master'] or 'stroke-width="3.0"' in d4['master']
+    colored4 = client.get(f'/api/projects/{pid}/revisions/{rev4}/files/colored.svg', headers=H).text
+    ink_frag4 = [seg for seg in colored4.split('<path ') if f'stroke="{STYLE_TEAL}"' in seg]
+    assert ink_frag4 and all('opacity=' not in seg.split('>')[0] for seg in ink_frag4), \
+        'opacity attribute survived the opacity=1 edit'
+
+    # Width change on a stroke master persists too (renderer-visible).
+    rev5 = step(client, pid, rev4, {
+        'base_revision': rev4, 'action': 'shape_style', 'shape_id': ink_id,
+        'region_ids': [], 'stroke_width': 2.0})
+    d5 = files(client, pid, rev5)
+    ink5 = next(p_ for p_ in d5['paint']['inkPaths'] if p_['shapeId'] == ink_id)
+    assert ink5['strokeWidth'] == 2.0
+
+    # Guardrails: not-an-ink target and empty style both fail cleanly.
+    blob_shape = next(o for o in d5['objects'] if o['id'] == 'obj-blob')['shapeIds'][0]
+    r = client.post(f'/api/projects/{pid}/edit', headers=H, json={
+        'base_revision': rev5, 'action': 'shape_style', 'shape_id': blob_shape,
+        'region_ids': [], 'stroke_color': STYLE_TEAL})
+    assert r.status_code == 200, r.text
+    p = wait(client, pid)
+    assert p['job']['status'] == 'failed', p['job']
+    assert 'not an ink stroke' in p['job'].get('message', '')
+    r = client.post(f'/api/projects/{pid}/edit', headers=H, json={
+        'base_revision': p['currentRevision'], 'action': 'shape_style',
+        'shape_id': ink_id, 'region_ids': []})
+    assert r.status_code == 200, r.text
+    p = wait(client, pid)
+    assert p['job']['status'] == 'failed', p['job']
+    assert 'Nothing to restyle' in p['job'].get('message', '')

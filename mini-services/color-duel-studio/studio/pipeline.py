@@ -1663,8 +1663,11 @@ def _ordered_paint_entries(paint, include_ink=True):
 def _paint_element(p) -> str:
     """One paint layer element honouring fill rule, opacity, stroke, z-role."""
     if p.get('filled') is False or (p.get('strokeWidth') and not p.get('fill')):
-        return (f'<path fill="none" stroke="{_xa(p["fill"])}" stroke-width="{number(p.get("strokeWidth", 1.5))}" '
-                f'stroke-linecap="round" stroke-linejoin="round" d="{p["d"]}"/>')
+        op = ''
+        if p.get('opacity') is not None and p['opacity'] < 0.999:
+            op = f' opacity="{fmt_num(p["opacity"], 3)}"'
+        return (f'<path fill="none" stroke="{_xa(p["fill"])}" stroke-width="{number(p.get("strokeWidth", 1.5))}"'
+                f'{op} stroke-linecap="round" stroke-linejoin="round" d="{p["d"]}"/>')
     attrs = [f'fill="{_xa(p["fill"])}"']
     if p.get('fillRule') and p['fillRule'] != 'evenodd':
         attrs.append(f'fill-rule="{p["fillRule"]}"')
@@ -2572,8 +2575,11 @@ def compile_svg_master(source: Path, output: Path, *, artwork_id: str, version: 
     progress(.18, 'Separating shading shapes from gameplay tap surfaces')
     ink_parts = []
     for s in doc.ink_shapes:
-        ink_parts.append({'shapeId': s['id'], 'z': s['order'], 'fill': s.get('stroke') or INK, 'd': s['d'],
-                          'strokeWidth': round(max(0.4, s.get('strokeWidth', 1.5)), 3), 'filled': False})
+        part = {'shapeId': s['id'], 'z': s['order'], 'fill': s.get('stroke') or INK, 'd': s['d'],
+                'strokeWidth': round(max(0.4, s.get('strokeWidth', 1.5)), 3), 'filled': False}
+        if s.get('opacity', 1.0) < 0.999:
+            part['opacity'] = round(s['opacity'], 4)
+        ink_parts.append(part)
     # NOTE: filled shapes with strokes are no longer converted to ink
     # overlays (that reordered ink above fills); the stroke stays on the
     # filled paint path itself, exactly like the source SVG.
@@ -2739,6 +2745,8 @@ def compile_svg_master(source: Path, output: Path, *, artwork_id: str, version: 
             entry['shapeId'] = part['shapeId']
         if part.get('strokeWidth'):
             entry['strokeWidth'] = part['strokeWidth']
+        if part.get('opacity') is not None:
+            entry['opacity'] = part['opacity']
         if part.get('filled') is False:
             entry['filled'] = False
         ink_paths.append(entry)
@@ -3074,6 +3082,14 @@ def edit_bundle(source: Path, output: Path, request, version: str):
     # before anything is published — the last healthy revision is untouched.
     if request.action == 'shape':
         return _edit_master_shape(source, output, request, version)
+
+    # Task 40A — Ink appearance (shape-addressed, topology-neutral): restyle
+    # ONE ink stroke's color/width/opacity by stable shapeId. Ink is
+    # appearance-only, so the gameplay surface is guaranteed unchanged: the
+    # recompile re-derives regions from an UNCHANGED geometry source, and the
+    # test suite pins regions.json/paint.paths byte-identity across the edit.
+    if request.action == 'shape_style':
+        return _edit_master_style(source, output, request, version)
 
     regs = {r['id']: r for r in g['regions']}
     chosen_ids = list(dict.fromkeys(request.region_ids))
@@ -3613,6 +3629,37 @@ def _sync_source_master(bundle: dict, source: Path) -> str | None:
             el.set('stroke-width', str(p['strokeWidth']))
             changed = True
 
+    # 1b) ink appearance sync (Task 40A): keep stroke color/width/opacity of
+    # ink master paths in step with paint.inkPaths, same deletion semantics
+    # as the style editor — a cleared value removes the attribute so
+    # Save → Build → Build never resurrects the old style.
+    for p in (paint.get('inkPaths') or []):
+        el = path_by_id.get(p.get('shapeId') or '')
+        if el is None:
+            continue
+        stroke = p.get('fill')
+        if isinstance(stroke, str) and stroke.startswith('#') and (el.get('stroke') or '') != stroke:
+            el.set('stroke', stroke)
+            changed = True
+        if (el.get('fill') or '').lower() != 'none':
+            el.set('fill', 'none')
+            changed = True
+        w = p.get('strokeWidth')
+        if w:
+            if (el.get('stroke-width') or '') != str(w):
+                el.set('stroke-width', str(w))
+                changed = True
+        else:
+            el.attrib.pop('stroke-width', None)
+        op = p.get('opacity')
+        if op is not None and op < 0.999:
+            if (el.get('opacity') or '') != str(op):
+                el.set('opacity', str(op))
+                changed = True
+        elif el.get('opacity') is not None:
+            el.attrib.pop('opacity', None)
+            changed = True
+
     # gradient stop sync (preserve_shading recolors tint stops in paint.json).
     # Round-4 P1-2: paint gradient INSTANCE ids are regenerated per import
     # (g-0000-g-0000-sunset ≠ the source def g-0000-sunset), so the lookup
@@ -3801,6 +3848,100 @@ def _edit_master_shape_d(master_text: str, shape_id: str, new_d: str) -> str:
             'raster artwork (rc-*) are not path-editable; redraw them with the pen instead.')
     target.set('d', new_d)
     return ET.tostring(root, encoding='unicode')
+
+
+def _style_master_shape_d(master_text: str, shape_id: str, stroke_color: str | None,
+                          stroke_width: float | None, opacity: float | None) -> str:
+    """Task 40A — apply ink appearance (stroke color/width/opacity) to ONE
+    master path by stable id, with AUTHORITATIVE deletion semantics: a None
+    / cleared value REMOVES the attribute rather than leaving a stale one
+    behind, so Save → Build → Build can never resurrect the old style.
+    stroke_width 0 removes the whole stroke; opacity >= 1 removes the
+    opacity attribute (1 is the visual default — writing it would be noise).
+    Only appearance attributes change; the path data is preserved verbatim.
+    Raises ValueError when the shape is absent."""
+    ET.register_namespace('', 'http://www.w3.org/2000/svg')
+    try:
+        root = ET.fromstring(master_text)
+    except Exception as exc:
+        raise ValueError(f'The source master is not well-formed XML: {exc}')
+    target = None
+    for el in root.iter():
+        if _local_svg_tag(el.tag) == 'path' and el.get('id') == shape_id:
+            target = el
+            break
+    if target is None:
+        raise ValueError(
+            f'Shape "{shape_id}" was not found in the source master. Shapes from converted '
+            'raster artwork (rc-*) are not restylable; redraw them with the pen instead.')
+    remove_width = stroke_width is not None and stroke_width <= 0
+    if stroke_color is not None:
+        target.set('stroke', stroke_color)
+    if remove_width:
+        target.attrib.pop('stroke-width', None)
+        target.attrib.pop('stroke', None)
+    elif stroke_width is not None:
+        target.set('stroke-width', str(round(stroke_width, 3)))
+    if opacity is not None:
+        if opacity < 0.999:
+            target.set('opacity', str(round(opacity, 3)))
+        else:
+            target.attrib.pop('opacity', None)
+    # Ink master paths carry the stroke on fill="none"; keep that contract
+    # explicit so a restyled ink stroke can never regrow a fill.
+    if (target.get('fill') or '').lower() != 'none' and not target.get('fill'):
+        target.set('fill', 'none')
+    return ET.tostring(root, encoding='unicode')
+
+
+def _edit_master_style(source: Path, output: Path, request, version: str) -> dict:
+    """Task 40A — apply ink appearance to ONE ink stroke and FULLY RECOMPILE.
+
+    Contract: the target must be an ink stroke (paint.inkPaths). The style
+    lands in paint.json (fill=stroke color, strokeWidth, opacity) AND the
+    authoritative source master in the SAME revision (deletion semantics —
+    see _style_master_shape_d), so Save → Build → Build can never resurrect
+    the old style. Gameplay is untouched by construction: the recompile
+    re-derives regions.json byte-identically (the test suite pins this).
+    Any failure raises before the output revision exists."""
+    bundle = load_bundle(source)
+    shape_id = (request.shape_id or '').strip()
+    if not shape_id:
+        raise ValueError('Select an artwork shape to restyle (shape_id is required).')
+    ink = next((p for p in (bundle['paint'].get('inkPaths') or []) if p.get('shapeId') == shape_id), None)
+    if ink is None:
+        raise ValueError(
+            f'"{shape_id}" is not an ink stroke. Fill styling is the recolor action; '
+            'ink appearance targets open/closed strokes in paint.inkPaths.')
+    if request.stroke_color is None and request.stroke_width is None and request.opacity is None:
+        raise ValueError('Nothing to restyle — set stroke_color, stroke_width, or opacity.')
+    if request.stroke_width is not None and request.stroke_width <= 0:
+        raise ValueError('Ink strokes cannot be unstroked — remove the stroke from the source SVG instead.')
+
+    master_file = source / 'source-master.svg'
+    if not master_file.is_file():
+        raise ValueError('Ink restyling needs a vector master; converted raster '
+                         'artwork (rc-* shapes) is not restylable.')
+    synced = _sync_source_master(bundle, source)
+    base_text = synced if synced is not None else master_file.read_text(encoding='utf-8')
+    edited_master = _style_master_shape_d(
+        base_text, shape_id, request.stroke_color, request.stroke_width, request.opacity)
+
+    objects = bundle.get('objects') or []
+    result = _recompile_from_master(
+        edited_master, source, output, bundle, objects, version,
+        provenance_extra={
+            'lastEdit': 'shape_style',
+            'shapeStyle': {
+                'shapeId': shape_id,
+                'note': ('Ink appearance was restyled in Artwork Node mode; the stroke color, '
+                         'width or opacity changed. Gameplay regions re-derived identically — '
+                         'this edit is topology-neutral by construction.')}})
+    qa = result['validation']
+    qa.setdefault('warnings', []).append(
+        f'Ink stroke "{shape_id}" was restyled; appearance-only — the gameplay surface is unchanged.')
+    write_json(output / 'validation.json', qa)
+    return result
 
 
 def edit_objects_bundle(source: Path, output: Path, request, version: str) -> dict:
@@ -4031,6 +4172,9 @@ def validate_runtime_contract(bundle: dict) -> list:
             errors.append('Invalid ink fill.')
         if not (SAFE_D.match(path['d']) or open_ok):
             errors.append('Invalid ink path.')
+        op = path.get('opacity')
+        if op is not None and (not isinstance(op, (int, float)) or not (0 <= op <= 1)):
+            errors.append('Invalid ink opacity.')
     for gr in (paint.get('gradients') or []):
         if not _re.match(r'^g-[a-zA-Z0-9_-]+$', gr.get('id', '')):
             errors.append('Unsafe gradient id.')

@@ -313,6 +313,7 @@ export function CanvasWorkspace() {
     drawRegion,
     nodeEdit,
     editShape,
+    editInkStyle,
     syncProject,
     recordPlaytest,
     freeColor,
@@ -463,6 +464,49 @@ export function CanvasWorkspace() {
   const [artSaveOpen, setArtSaveOpen] = useState(false);
   const [artConflictOpen, setArtConflictOpen] = useState(false);
   const artPendingSaveRef = useRef<PendingArtworkSave | null>(null);
+
+  // ----- Task 40A: ink appearance (shape-addressed, topology-neutral) -----
+  /** The picked shape's CURRENT ink appearance (from the live bundle) —
+   *  the baseline the style draft diffs against when saving. */
+  const styleTarget = (() => {
+    if (!artPath || !bundle?.paint) return null;
+    const ink = bundle.paint.inkPaths.find((p) => p.shapeId === artPath.context.shapeId);
+    if (!ink) return null;
+    return { shapeId: ink.shapeId!, color: ink.fill, width: ink.strokeWidth ?? 1.5, opacity: ink.opacity ?? 1 };
+  })();
+  const styleTargetId = styleTarget?.shapeId ?? "";
+  const [inkStyle, setInkStyle] = useState<{ color: string; width: number; opacity: number } | null>(null);
+  // (Re)seed the style draft when the edited shape changes. A published
+  // style edit keeps the artist's values (they now match the new paint).
+  useEffect(() => {
+    setInkStyle(
+      styleTarget ? { color: styleTarget.color, width: styleTarget.width, opacity: styleTarget.opacity } : null
+    );
+  }, [styleTargetId]);
+
+  const inkStyleDirty =
+    !!styleTarget &&
+    !!inkStyle &&
+    (inkStyle.color.toUpperCase() !== styleTarget.color.toUpperCase() ||
+      Math.abs(inkStyle.width - styleTarget.width) > 1e-6 ||
+      Math.abs(inkStyle.opacity - styleTarget.opacity) > 1e-6);
+
+  const resetInkStyle = () => {
+    if (!styleTarget) return;
+    setInkStyle({ color: styleTarget.color, width: styleTarget.width, opacity: styleTarget.opacity });
+  };
+
+  const saveInkStyle = () => {
+    const t = styleTarget;
+    if (!t || !inkStyle || !inkStyleDirty) return;
+    const payload: { stroke_color?: string; stroke_width?: number; opacity?: number } = {};
+    if (inkStyle.color.toUpperCase() !== t.color.toUpperCase()) {
+      payload.stroke_color = inkStyle.color.toUpperCase();
+    }
+    if (Math.abs(inkStyle.width - t.width) > 1e-6) payload.stroke_width = inkStyle.width;
+    if (Math.abs(inkStyle.opacity - t.opacity) > 1e-6) payload.opacity = inkStyle.opacity;
+    void editInkStyle(t.shapeId, payload).catch((e: Error) => toast(e.message));
+  };
 
   const [artHistory, setArtHistory] = useState<ArtDraftHistory | null>(null);
   const artDragBeforeSnapshotRef = useRef<ArtDraftSnapshot | null>(null);
@@ -1998,6 +2042,81 @@ export function CanvasWorkspace() {
           >
             Cancel
           </Button>
+        </div>
+      )}
+
+      {/* Task 40A — ink appearance: shape-addressed style editor for the
+          picked ink stroke. Appearance-only: gameplay geometry is untouched
+          (regions re-derive identically); the outline of a FILLED shape is
+          visual, never part of the tap target. */}
+      {tool === "artnode" && artPath && styleTarget && inkStyle && !busy && (
+        <div className="mt-2 flex flex-wrap items-center gap-x-3 gap-y-1.5 rounded-md border border-[#e1e5df] bg-white px-3 py-2">
+          <span className="text-[10px] font-semibold text-[#183837]">Stroke</span>
+          <label className="flex items-center gap-1.5 text-[10px] text-[#657671]">
+            Color
+            <input
+              type="color"
+              aria-label="Stroke color"
+              value={inkStyle.color}
+              onChange={(e) => setInkStyle({ ...inkStyle, color: e.target.value.toUpperCase() })}
+              className="h-6 w-8 cursor-pointer rounded border border-[#e1e5df] bg-white"
+            />
+            <code className="font-mono text-[10px] text-[#183837]">{inkStyle.color}</code>
+          </label>
+          <label className="flex items-center gap-1.5 text-[10px] text-[#657671]">
+            Width
+            <input
+              type="number"
+              aria-label="Stroke width"
+              min={0}
+              max={8}
+              step={0.5}
+              value={inkStyle.width}
+              onChange={(e) => {
+                const v = Number(e.target.value);
+                if (Number.isFinite(v)) setInkStyle({ ...inkStyle, width: Math.min(8, Math.max(0, v)) });
+              }}
+              className="h-6 w-14 rounded border border-[#e1e5df] px-1.5 text-[10px]"
+            />
+            px
+          </label>
+          <label className="flex items-center gap-1.5 text-[10px] text-[#657671]">
+            Opacity
+            <input
+              type="number"
+              aria-label="Stroke opacity"
+              min={0}
+              max={100}
+              step={5}
+              value={Math.round(inkStyle.opacity * 100)}
+              onChange={(e) => {
+                const v = Number(e.target.value);
+                if (Number.isFinite(v)) setInkStyle({ ...inkStyle, opacity: Math.min(100, Math.max(0, v)) / 100 });
+              }}
+              className="h-6 w-14 rounded border border-[#e1e5df] px-1.5 text-[10px]"
+            />
+            %
+          </label>
+          <span className="text-[9px] text-[#778481]">appearance only — tap targets stay the same</span>
+          <div className="ml-auto flex gap-2">
+            <Button
+              size="sm"
+              variant="outline"
+              className="h-7 rounded-md bg-white px-2.5 text-[10px]"
+              disabled={!inkStyleDirty}
+              onClick={resetInkStyle}
+            >
+              Reset
+            </Button>
+            <Button
+              size="sm"
+              className="h-7 rounded-md bg-[#087f74] px-3 text-[10px] font-semibold text-white hover:bg-[#056a60]"
+              disabled={busy || foreignDraft || !inkStyleDirty}
+              onClick={saveInkStyle}
+            >
+              Save appearance
+            </Button>
+          </div>
         </div>
       )}
 

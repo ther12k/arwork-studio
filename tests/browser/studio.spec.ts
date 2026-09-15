@@ -711,3 +711,101 @@ test("Art node open ink stroke: pickable, editable, undoable — open payload sa
   expect(minDistToPoint(reloaded, { x: 285, y: 70 })).toBeLessThan(2);
   expect(Math.hypot(reloaded[0].x - 40, reloaded[0].y - 40)).toBeLessThan(2);
 });
+
+// ------------------------------------------------- ink appearance (Task 40A)
+
+test("Ink appearance: color/width/opacity end-to-end, topology untouched, style draft survives a failed job", async ({ page }) => {
+  test.setTimeout(150_000);
+  const state: FixtureState = mkState();
+  await routeBackend(page, state);
+  await page.goto("/");
+
+  // Pick the ink squiggle (the Art node draft loads its open geometry).
+  await page.getByRole("button", { name: "Edit regions" }).click();
+  await page.getByRole("button", { name: "Art node" }).click();
+  const inkOverlay = page.locator(`g[aria-label="Artwork path anchors for shape ${INK}"]`);
+  const tap = await artToPage(page, 120, 49);
+  await page.mouse.click(tap.x, tap.y);
+  await expect(inkOverlay).toBeVisible();
+
+  // The stroke's appearance is only visible through the cached underpaint
+  // image (preview mode replaces live paths). Probe the pixel at the
+  // stroke's center (120,49): authored = navy #1B4F8A opaque (alpha 255).
+  const isNavy = (px: readonly number[] | null) =>
+    !!px && Math.abs(px[0] - 27) < 30 && Math.abs(px[1] - 79) < 30 && Math.abs(px[2] - 138) < 30 && px[3] > 240;
+  const isTeal = (px: readonly number[] | null) =>
+    !!px && Math.abs(px[0] - 41) < 26 && Math.abs(px[1] - 56) < 26 && Math.abs(px[2] - 62) < 26;
+  const inkPixelRGBA = async (x: number, y: number) =>
+    page.evaluate(
+      ([px, py]) =>
+        new Promise<readonly (readonly number[])[] | null>((resolve) => {
+          const board = document.querySelector('svg[aria-label*="interactive coloring artwork"]');
+          const img = board?.querySelector('image[id$="underpaint-ink"]') as SVGImageElement | null;
+          const href = img?.getAttribute("href");
+          if (!href) return resolve(null);
+          const image = new Image();
+          image.onload = () => {
+            const canvas = document.createElement("canvas");
+            canvas.width = 300;
+            canvas.height = 300;
+            const ctx = canvas.getContext("2d")!;
+            ctx.drawImage(image, 0, 0, 300, 300);
+            // Grid around the aimed point: the tap can land within a few
+            // units of the thin (3px) stroke, so sample a 5x5 neighborhood.
+            const out: Array<readonly number[]> = [];
+            for (let dx = -4; dx <= 4; dx += 2) {
+              for (let dy = -4; dy <= 4; dy += 2) {
+                out.push([...ctx.getImageData(px + dx, py + dy, 1, 1).data]);
+              }
+            }
+            resolve(out);
+          };
+          image.onerror = () => resolve(null);
+          image.src = href;
+        }),
+      [x, y] as const
+    );
+  const anyPixel = async (pred: (px: readonly number[]) => boolean) =>
+    ((await inkPixelRGBA(120, 49)) ?? []).some(pred);
+  await expect.poll(() => anyPixel(isNavy), { timeout: 15_000 }).toBe(true);
+
+  // Restyle: teal, width 3, 50% opacity → Save appearance.
+  await page.getByRole("button", { name: "Reset" }).locator("visible=true").first(); // noop guard
+  await page.locator('input[aria-label="Stroke color"]').fill("#29383E");
+  await page.locator('input[aria-label="Stroke width"]').fill("3");
+  await page.locator('input[aria-label="Stroke opacity"]').fill("50");
+  state.mode = "success";
+  await page.getByRole("button", { name: "Save appearance" }).click();
+
+  // Published revision re-renders the ink with the new appearance — teal,
+  // with the OPACITY present as reduced alpha (was dropped end-to-end
+  // before Task 40A). Topology untouched: regions stay attached.
+  await expect.poll(() => anyPixel(isTeal), { timeout: 20_000 }).toBe(true);
+  const tealHit = ((await inkPixelRGBA(120, 49)) ?? []).find((px) => isTeal(px));
+  expect(tealHit, "50% opacity must show as reduced alpha").toBeTruthy();
+  expect(tealHit![3], "50% opacity must show as reduced alpha").toBeLessThan(200);
+  await expect(page.locator(`${BOARD} path[data-region-id="r-blue"]`)).toBeAttached();
+
+  // The style draft survives as editable; geometry draft untouched
+  // (shape unchanged → not dirty, no save bar for geometry).
+  await expect(page.locator('input[aria-label="Stroke color"]')).toHaveValue(/^#29383e$/i);
+
+  // Reload: the appearance persists (served from the published revision).
+  await page.reload();
+  await expect.poll(() => anyPixel(isTeal), { timeout: 20_000 }).toBe(true);
+
+  // Failed style edit: the job failure keeps the local controls and their
+  // values (revision-safe — nothing was published).
+  await page.getByRole("button", { name: "Edit regions" }).click();
+  await page.getByRole("button", { name: "Art node" }).click();
+  const tap3 = await artToPage(page, 120, 49);
+  await page.mouse.click(tap3.x, tap3.y);
+  await expect(inkOverlay).toBeVisible();
+  state.mode = "jobfail";
+  await page.locator('input[aria-label="Stroke opacity"]').fill("100");
+  await page.getByRole("button", { name: "Save appearance" }).click();
+  await expect(page.locator("[data-sonner-toast]", { hasText: "not a simple ring" })).toBeVisible();
+  await expect(page.locator('input[aria-label="Stroke opacity"]')).toHaveValue("100");
+  expect(state.editCalls.filter((c) => c.action === "shape_style")).toHaveLength(2);
+});
+

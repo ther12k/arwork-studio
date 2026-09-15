@@ -219,7 +219,8 @@ export type EditAction =
   | "cut"
   | "draw"
   | "node"
-  | "shape";
+  | "shape"
+  | "shape_style";
 
 export type GeometryMode = "curved" | "legacy";
 
@@ -282,9 +283,14 @@ export interface EditPayload {
   /** 'draw' with paint: place the new paint path behind the existing art
    *  (min z − 1) instead of on top (max z + 1). */
   z_behind?: boolean;
-  /** Task 33 'shape' (Artwork Path node mode): the stable id of the master
-   *  shape being edited; `d` carries its new closed path data. */
+  /** Task 33 'shape' / Task 40A 'shape_style' (both shape-addressed): the
+   *  stable id of the master shape being edited or restyled. */
   shape_id?: string;
+  /** 'shape_style' ink appearance: stroke color (#RRGGBB; the ink's `fill`
+   *  carries the stroke color). */
+  stroke_color?: string;
+  /** 'shape_style' ink appearance: stroke opacity 0..1 (>= 1 clears it). */
+  opacity?: number;
 }
 
 export interface SemanticObjectSubdivision {

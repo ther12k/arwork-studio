@@ -93,7 +93,8 @@ function serializeArtPath(p: PaintPath): string | null {
  *  shapes — the exact attribute logic the live `ink` group uses in mount(). */
 function serializeInkPath(p: PaintPath): string {
   if (p.strokeWidth != null || p.filled === false) {
-    return `<path d="${escapeXml(p.d)}" fill="none" stroke="${escapeXml(p.fill)}" stroke-width="${p.strokeWidth ?? 1.5}" stroke-linecap="round" stroke-linejoin="round"/>`;
+    const opacity = p.opacity != null && p.opacity < 0.999 ? ` opacity="${p.opacity}"` : "";
+    return `<path d="${escapeXml(p.d)}" fill="none" stroke="${escapeXml(p.fill)}" stroke-width="${p.strokeWidth ?? 1.5}"${opacity} stroke-linecap="round" stroke-linejoin="round"/>`;
   }
   const attrs = [`d="${escapeXml(p.d)}"`, `fill="${escapeXml(p.fill)}"`, `fill-rule="${p.fillRule ?? "evenodd"}"`];
   if (p.opacity != null && p.opacity < 0.999) attrs.push(`opacity="${p.opacity}"`);
@@ -835,6 +836,7 @@ export class VectorBoard {
             "stroke-linecap": "round", "stroke-linejoin": "round",
           };
           if (p.shapeId) inkAttrs["data-shape-id"] = p.shapeId;
+          if (p.opacity != null && p.opacity < 0.999) inkAttrs.opacity = p.opacity;
           ink.append(svgNode("path", inkAttrs));
         } else {
           const attrs: Attrs = { d: p.d, fill: p.fill, "fill-rule": p.fillRule ?? "evenodd" };

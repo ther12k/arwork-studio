@@ -28,6 +28,8 @@ export const SHAPE = "s0002";
 export const INK = "s0003";
 export const INK_D = "M 40,40 C 90,10 150,90 200,50 C 230,30 260,60 280,40";
 export const INK_EDITED_D = "M 40,40 C 90,10 150,90 200,50 C 230,30 260,60 285,70";
+/** The squiggle's authored appearance (rev-1 baseline). */
+export const INK_STYLE0 = { color: "#1B4F8A", width: 3 };
 /** Closed two-cubic blob; handle 1 = c1 (70,60) of the first cubic. */
 export const ORIGINAL_D = "M 70,180 C 70,60 230,60 230,180 C 230,300 70,300 70,180 Z";
 /** Serialized result of dragging handle 1 to art (170,60). */
@@ -41,14 +43,18 @@ export type FixtureState = {
   /** Paint `d` served per revision (revisions carry their own artwork). */
   revPaint: Record<string, string>;
   revInk: Record<string, string>;
+  /** Task 40A: per-revision ink stroke style (color/width/opacity). */
+  revInkStyle: Record<string, { color: string; width: number; opacity?: number }>;
   /** Which shape the accepted edit job targeted (paint vs ink routing). */
   pendingShape: string;
+  /** Accepted shape_style job's next appearance. */
+  pendingStyle: { color: string; width: number; opacity?: number } | null;
   job: Record<string, unknown>;
   editCalls: Array<Record<string, unknown>>;
   objectCalls: Array<Record<string, unknown>>;
   runningGets: number;
   pendingD: string;
-  pendingKind: "edit" | "objects" | null;
+  pendingKind: "edit" | "objects" | "style" | null;
   /** jobId returned by the POST — the settled project.job must keep THIS id
    *  (the app's settle-watch attributes outcomes by job identity). */
   activeJobId: string;
@@ -59,7 +65,9 @@ export const mkState = (): FixtureState => ({
   revision: REV1,
   revPaint: { [REV1]: ORIGINAL_D },
   revInk: { [REV1]: INK_D },
+  revInkStyle: {},
   pendingShape: SHAPE,
+  pendingStyle: null,
   job: { status: "idle" },
   editCalls: [],
   objectCalls: [],
@@ -155,7 +163,7 @@ const palette = [
   { id: 2, number: 2, name: "Blue", hex: "#3366CC", paint: { type: "solid", stops: [] } },
 ];
 
-const paintFor = (d: string, inkD: string) => ({
+const paintFor = (d: string, inkD: string, style: { color: string; width: number; opacity?: number }) => ({
   schemaVersion: 2,
   artworkId: ART,
   viewBox: [0, 0, 300, 300],
@@ -163,7 +171,10 @@ const paintFor = (d: string, inkD: string) => ({
     { z: 0, shapeId: "s0001", d: "M 20,20 L 280,20 L 280,280 L 20,280 Z", fill: "#CC3333", fillRule: "evenodd" },
     { z: 1, shapeId: SHAPE, d, fill: "#3366CC", fillRule: "evenodd" },
   ],
-  inkPaths: [{ z: 2, shapeId: INK, d: inkD, fill: "#1B4F8A", strokeWidth: 3, filled: false }],
+  inkPaths: [{
+    z: 2, shapeId: INK, d: inkD, fill: style.color, strokeWidth: style.width, filled: false,
+    ...(style.opacity != null && style.opacity < 0.999 ? { opacity: style.opacity } : {}),
+  }],
   gradients: [],
   sourceColorShapeCount: 2,
 });
@@ -281,10 +292,13 @@ const publish = (state: FixtureState) => {
   state.revInk[next] = carriesEdit && state.pendingShape === INK
     ? state.pendingD!
     : state.revInk[state.revision];
+  state.revInkStyle[next] = state.pendingKind === "style" && state.pendingStyle
+    ? state.pendingStyle
+    : state.revInkStyle[state.revision] ?? INK_STYLE0;
   state.revision = next;
   state.job = {
     id: state.activeJobId,
-    kind: state.pendingKind === "edit" ? "shape edit" : "object update",
+    kind: state.pendingKind === "edit" ? "shape edit" : state.pendingKind === "style" ? "ink style" : "object update",
     status: "done",
     progress: 100,
   };
@@ -317,6 +331,7 @@ const fileFor = (state: FixtureState, rev: string, name: string): unknown => {
   }
   const d = state.revPaint[rev] ?? ORIGINAL_D;
   const inkD = state.revInk[rev] ?? INK_D;
+  const inkStyle = state.revInkStyle[rev] ?? INK_STYLE0;
   switch (name) {
     case "artwork.json":
       return manifestFor(rev);
@@ -325,7 +340,7 @@ const fileFor = (state: FixtureState, rev: string, name: string): unknown => {
     case "palette.json":
       return palette;
     case "paint.json":
-      return paintFor(d, inkD);
+      return paintFor(d, inkD, inkStyle);
     case "objects.json":
       return objectsFor(rev);
     default:
@@ -387,7 +402,7 @@ export async function routeBackend(page: Page, state: FixtureState) {
         state.activeJobId = "job-fail";
         state.job = {
           id: "job-fail",
-          kind: "shape edit",
+          kind: body.action === "shape_style" ? "ink style" : "shape edit",
           status: "failed",
           progress: 100,
           message: "Edited path is not a simple ring.",
@@ -395,8 +410,28 @@ export async function routeBackend(page: Page, state: FixtureState) {
         return json({ jobId: "job-fail", projectId: PID });
       }
       state.activeJobId = "job-ok";
-      state.job = { id: "job-ok", kind: "shape edit", status: "running", progress: 10 };
       state.runningGets = 0;
+      if (body.action === "shape_style") {
+        // Task 40A: appearance-only — merge the new style over the current
+        // revision's ink style (echoes the real backend's paint behavior).
+        const cur = state.revInkStyle[state.revision] ?? INK_STYLE0;
+        state.pendingStyle = {
+          color: typeof body.stroke_color === "string" ? body.stroke_color : cur.color,
+          width: typeof body.stroke_width === "number" ? body.stroke_width : cur.width,
+          ...(typeof body.opacity === "number"
+            ? body.opacity < 0.999
+              ? { opacity: body.opacity }
+              : {}
+            : cur.opacity != null
+              ? { opacity: cur.opacity }
+              : {}),
+        };
+        state.pendingKind = "style";
+        state.pendingD = null;
+        state.job = { id: "job-ok", kind: "ink style", status: "running", progress: 10 };
+        return json({ jobId: "job-ok", projectId: PID });
+      }
+      state.job = { id: "job-ok", kind: "shape edit", status: "running", progress: 10 };
       state.pendingD = String(body.d);
       state.pendingKind = "edit";
       state.pendingShape = String(body.shape_id ?? SHAPE);

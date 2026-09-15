@@ -58,7 +58,7 @@ class PromoteRequest(StrictModel):
 
 class EditRequest(StrictModel):
     base_revision: str
-    action: Literal['merge', 'group', 'palette', 'recolor', 'label', 'decorate', 'split', 'cut', 'draw', 'node', 'shape']
+    action: Literal['merge', 'group', 'palette', 'recolor', 'label', 'decorate', 'split', 'cut', 'draw', 'node', 'shape', 'shape_style']
     region_ids: list[str] = Field(max_length=1600,
         description='Validated per action: merge>=2, split/cut/label=1, node=2 (the two regions sharing the dragged boundary), draw=0, others>=1.')
     d: str | None = Field(None, pattern=r'^M[\s\d.,eE+\-MLQCZ]+$',
@@ -67,6 +67,13 @@ class EditRequest(StrictModel):
     palette_id: int | None = None
     x: float | None = Field(None, allow_inf_nan=False)
     y: float | None = Field(None, allow_inf_nan=False)
+    # 'shape_style' (Task 40A: shape-addressed ink appearance; region_ids must
+    # be []): stroke_color/stroke_width restyle the ink stroke (width 0 removes
+    # it from the master), opacity < 1 sets it / >= 1 clears it. Gameplay
+    # geometry is untouched — regions re-derive identically.
+    stroke_color: str | None = Field(None, pattern=r'^#[0-9A-Fa-f]{6}$')
+    opacity: float | None = Field(None, ge=0, le=1, allow_inf_nan=False,
+        description="'shape_style' ink stroke opacity; >= 1 clears the attribute from the master.")
     # 'recolor' (visible appearance, distinct from 'palette' = number group):
     color: str | None = Field(None, pattern=r'^#[0-9A-Fa-f]{6}$')
     preserve_shading: bool = Field(False, description='Keep gradient shading (tinted toward the target color) instead of replacing the fill.')
@@ -77,7 +84,7 @@ class EditRequest(StrictModel):
     paint: bool = Field(False,
         description="'draw': also emit a paint.json artwork path (stable shapeId + masterShapeId, fill, z-order). False = gameplay-only white tap target (region pen).")
     stroke_width: float | None = Field(None, ge=0, le=8,
-        description="'draw' with paint=true: draw an ink outline of this width on the paint path (0 or null = no outline).")
+        description="'draw' with paint=true: ink outline width on the new paint path. 'shape_style': the ink stroke's width in px (0 removes the stroke). Authoring cap 8.")
     z_behind: bool = Field(False,
         description="'draw' with paint=true: place the new paint path BEHIND the existing art (min z - 1) instead of on top (max z + 1).")
     # Task 33 — Artwork Path node mode: edit ONE source shape's geometry by
