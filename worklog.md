@@ -1943,3 +1943,20 @@ Work Log:
 
 Stage Summary:
 - CI now guards the adapter contract across the full golden set (not 1 of 5). The remaining Task-36 gap is explicitly game-repo-owned: reproducibility from a clean color-duel commit and version-safe progress identity, both sequenced above before the in-game gate joins CI.
+
+---
+Task ID: 37
+Agent: main (ZCode)
+Task: Implement Studio-side Art-node local draft undo/redo with single-step drag debouncing, keyboard shortcuts, input isolation, and visual save persistence.
+
+Work Log:
+- History contract & scoping (CanvasWorkspace): ArtDraftHistory tracks `{ projectId, baseRevision, shapeId, draftGeneration, past: ArtDraftSnapshot[], future: ArtDraftSnapshot[] }` purely in React state. Each snapshot holds `{ commands: PathCommand[], dirty: boolean }`. History operations mutate local draft geometry only (anchors, handles, serialized d, dirty state); zoom, pan, selection, hide/isolate, object hierarchy, and backend revisions remain untouched.
+- Drag debouncing (pointerdown snapshot -> pointerup commit): `beginArtDrag` captures the pre-drag snapshot in `artDragBeforeSnapshotRef`; `extendArtDrag` updates `artPath.commands` for real-time 60fps canvas preview with zero history pushes; `endArtDrag` compares before and after path serialization. If geometry changed, exactly one snapshot is appended to `past` (capped at 50 steps) and `future` is cleared.
+- Keyboard shortcuts & text input precedence: global `keydown` listener intercepts `Cmd/Ctrl+Z` (undo) and `Cmd/Ctrl+Shift+Z` / `Cmd/Ctrl+Y` (redo) when the Art node tool is active and no dialog is open. An explicit target check (`INPUT`, `TEXTAREA`, `contenteditable`) ensures native text editing in input fields (such as the artwork title input) is never intercepted by draft undo.
+- Toolbar integration: added `Undo` and `Redo` buttons with `Undo2` and `Redo2` icons in the Save/Cancel toolbar row. Buttons reflect `canUndo` / `canRedo` disabled state, and are disabled when `foreignDraft` is true.
+- History lifecycle & cross-project safety: picking an art path increments `draftGenerationRef` and initializes a fresh history; `Cancel`, tool switching, successful save publish (settle watch), and conflict dialog discard all clear history; foreign drafts suspend undo/redo (disabled buttons and shortcut no-op), preserving history if the artist switches back.
+- Playwright regression test suite (`tests/browser/studio.spec.ts`): added automated browser test verifying: (1) 30 pointermove events during a handle drag produce exactly 1 undo step; (2) Ctrl+Z reverts geometry to pre-drag position and resets dirty status to unchanged, and redo restores dragged position; (3) 3 distinct drags create 3 ordered history entries that undo and redo in exact sequence; (4) typing in `#studio-title` and pressing Ctrl+Z does not affect the artwork draft; (5) Save path after an undo/redo cycle submits the visible serialized state, and published revision clears draft and history controls, persisting after reload.
+- Gates: tsc clean, eslint clean (0 errors, 0 warnings), vitest 46 passed, studio browser journey 3 passed (Art node journey, cross-project draft safety, draft undo/redo), VectorBoard gate 4 passed, golden packs pytest passed.
+
+Stage Summary:
+- Track B first slice is complete and verified: artists now have full local undo/redo control while tweaking Bézier shapes (single-step drags, shortcuts, text input safety, clear toolbar controls), while the single-immutable-revision Save and cross-project isolation guarantees remain intact.

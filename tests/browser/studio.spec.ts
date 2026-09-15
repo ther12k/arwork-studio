@@ -371,3 +371,139 @@ test("foreign-project draft: suspended, unsendable, recoverable — never writte
   // B was never written: its revision never advanced.
   expect(state.revision).toBe(REV2); // A advanced rev-1 → rev-2 only
 });
+
+// ------------------------------------------------- local draft undo/redo
+
+test("Art node local draft undo/redo: debounced drag step, keyboard shortcuts, input isolation, and visual save persistence", async ({ page }) => {
+  test.setTimeout(120_000);
+  const state: FixtureState = mkState();
+  await routeBackend(page, state);
+  await page.goto("/");
+
+  // Mount board, switch to Art node tool, and pick shape s0002.
+  await page.getByRole("button", { name: "Edit regions" }).click();
+  await page.getByRole("button", { name: "Art node" }).click();
+  const tap = await artToPage(page, 150, 90);
+  await page.mouse.click(tap.x, tap.y);
+  await expect(overlayGroup(page)).toBeVisible();
+
+  const undoBtn = page.getByRole("button", { name: "Undo", exact: true });
+  const redoBtn = page.getByRole("button", { name: "Redo", exact: true });
+
+  // Initial state: clean draft, undo and redo both disabled, status shows unchanged.
+  await expect(undoBtn).toBeDisabled();
+  await expect(redoBtn).toBeDisabled();
+  await expect(page.getByText("unchanged", { exact: false })).toBeVisible();
+
+  // Regression 1: Drag handle with 30 pointermove steps -> exactly 1 undo step.
+  const handle1 = page.locator('circle[aria-label="Bézier handle 1"]');
+  const h1b = await handle1.boundingBox();
+  const drop1 = await artToPage(page, 170, 60);
+  await page.mouse.move(h1b!.x + h1b!.width / 2, h1b!.y + h1b!.height / 2);
+  await page.mouse.down();
+  await page.mouse.move(drop1.x, drop1.y, { steps: 30 });
+  await page.mouse.up();
+
+  // After 30 moves, undo is enabled, redo is disabled, preview shifted to (187.5, 90).
+  await expect(undoBtn).toBeEnabled();
+  await expect(redoBtn).toBeDisabled();
+  await expect(page.getByText("modified", { exact: false })).toBeVisible();
+  const p1 = await previewArtPoints(page);
+  expect(minDistToPoint(p1, { x: 187.5, y: 90 })).toBeLessThan(3);
+
+  // Regression 2: Ctrl+Z returns geometry to pre-drag position; redo restores dragged position.
+  await page.keyboard.press("Control+z");
+  await expect(undoBtn).toBeDisabled(); // Proves only 1 undo step was recorded despite 30 moves!
+  await expect(redoBtn).toBeEnabled();
+  await expect(page.getByText("unchanged", { exact: false })).toBeVisible();
+  const p0 = await previewArtPoints(page);
+  expect(minDistToPoint(p0, { x: 150, y: 90 })).toBeLessThan(3);
+
+  // Redo via keyboard shortcut (Control+Shift+Z)
+  await page.keyboard.press("Control+Shift+z");
+  await expect(undoBtn).toBeEnabled();
+  await expect(redoBtn).toBeDisabled();
+  await expect(page.getByText("modified", { exact: false })).toBeVisible();
+  const p1Again = await previewArtPoints(page);
+  expect(minDistToPoint(p1Again, { x: 187.5, y: 90 })).toBeLessThan(3);
+
+  // Regression 3: Three sequential drags -> three ordered history steps.
+  // Drag 2: Drag handle 2 to (220, 60)
+  const handle2 = page.locator('circle[aria-label="Bézier handle 2"]');
+  const h2b = await handle2.boundingBox();
+  const drop2 = await artToPage(page, 220, 60);
+  await page.mouse.move(h2b!.x + h2b!.width / 2, h2b!.y + h2b!.height / 2);
+  await page.mouse.down();
+  await page.mouse.move(drop2.x, drop2.y, { steps: 10 });
+  await page.mouse.up();
+
+  // Drag 3: Drag anchor 1 to (80, 190)
+  const anchor1 = page.locator('circle[aria-label="Anchor 1"]');
+  const a1b = await anchor1.boundingBox();
+  const drop3 = await artToPage(page, 80, 190);
+  await page.mouse.move(a1b!.x + a1b!.width / 2, a1b!.y + a1b!.height / 2);
+  await page.mouse.down();
+  await page.mouse.move(drop3.x, drop3.y, { steps: 10 });
+  await page.mouse.up();
+
+  // We now have 3 steps in past:
+  // Step 3 undo (reverts anchor 1 drag)
+  await undoBtn.click();
+  await expect(undoBtn).toBeEnabled();
+  await expect(redoBtn).toBeEnabled();
+
+  // Step 2 undo (reverts handle 2 drag)
+  await undoBtn.click();
+  await expect(undoBtn).toBeEnabled();
+  await expect(redoBtn).toBeEnabled();
+
+  // Step 1 undo (reverts handle 1 drag -> back to original clean draft!)
+  await undoBtn.click();
+  await expect(undoBtn).toBeDisabled();
+  await expect(redoBtn).toBeEnabled();
+  await expect(page.getByText("unchanged", { exact: false })).toBeVisible();
+
+  // Redo back to state after Drag 1
+  await redoBtn.click();
+  await expect(undoBtn).toBeEnabled();
+  const pAfterRedo1 = await previewArtPoints(page);
+  expect(minDistToPoint(pAfterRedo1, { x: 187.5, y: 90 })).toBeLessThan(3);
+
+  // Regression 4: Native text input focus takes precedence over shortcut.
+  const titleInput = page.locator("#studio-title");
+  await titleInput.click();
+  await titleInput.fill("Test Title Typing");
+  // Press Control+z while inside input: Art draft is NOT undone
+  await page.keyboard.press("Control+z");
+  // Undo button for art draft is STILL enabled, draft preview is untouched!
+  await expect(undoBtn).toBeEnabled();
+  const pUntouched = await previewArtPoints(page);
+  expect(minDistToPoint(pUntouched, { x: 187.5, y: 90 })).toBeLessThan(3);
+
+  // Regression 5 & Visual Save persistence:
+  // Save path now saves the current state (state after Drag 1: top curve bulge).
+  state.mode = "success";
+  await saveBar(page).click();
+  await page.getByRole("alertdialog").getByRole("button", { name: "Save path" }).click();
+
+  // Published revision renders the redone geometry: underpainting pixel flips red -> blue.
+  await expectPixel(page, 187, 95, isBlue, 20_000);
+  const payload = state.editCalls[state.editCalls.length - 1];
+  expect(payload).toMatchObject({
+    base_revision: REV1,
+    action: "shape",
+    shape_id: SHAPE,
+    region_ids: [],
+    d: EDITED_D,
+  });
+
+  // Successful revision cleared draft and history controls.
+  await expect(saveBar(page)).toHaveCount(0);
+  await expect(undoBtn).toHaveCount(0);
+  await expect(redoBtn).toHaveCount(0);
+
+  // Reload: the redone state persists.
+  await page.reload();
+  await expect(page.locator(`${BOARD} path[data-region-id="r-blue"]`)).toBeAttached();
+  await expectPixel(page, 187, 95, isBlue);
+});

@@ -14,6 +14,7 @@ import {
   Maximize2,
   MousePointer2,
   PenTool,
+  Redo2,
   RotateCcw,
   Scissors,
   Search,
@@ -421,6 +422,28 @@ export function CanvasWorkspace() {
     baseRevision: string;
   };
 
+  /** Snapshot of a draft geometry step for local undo/redo. */
+  type ArtDraftSnapshot = {
+    commands: PathCommand[];
+    dirty: boolean;
+  };
+
+  type ArtDraftHistory = {
+    projectId: string;
+    baseRevision: string;
+    shapeId: string;
+    draftGeneration: number;
+    past: ArtDraftSnapshot[];
+    future: ArtDraftSnapshot[];
+  };
+
+  function cloneCommands(cmds: PathCommand[]): PathCommand[] {
+    return cmds.map((c) => ({
+      op: c.op,
+      pts: c.pts.map((p) => ({ x: p.x, y: p.y })),
+    }));
+  }
+
   /** The artwork path being node-edited: its identity context, the parsed
    *  commands (M/L/C/Q/Z, absolute), and which control point (command index +
    *  point index) is being dragged. Anchor = command endpoint, handle = a
@@ -434,6 +457,10 @@ export function CanvasWorkspace() {
   const [artSaveOpen, setArtSaveOpen] = useState(false);
   const [artConflictOpen, setArtConflictOpen] = useState(false);
   const artPendingSaveRef = useRef<PendingArtworkSave | null>(null);
+
+  const [artHistory, setArtHistory] = useState<ArtDraftHistory | null>(null);
+  const artDragBeforeSnapshotRef = useRef<ArtDraftSnapshot | null>(null);
+  const draftGenerationRef = useRef<number>(0);
 
   /** True when the project moved past the revision the draft was loaded
    *  from — another operation published while the artist was editing. */
@@ -457,6 +484,9 @@ export function CanvasWorkspace() {
       return cur !== undefined && cur !== artPath.context.originalD;
     })();
 
+  const canUndo = !!artPath && !foreignDraft && !!artHistory && artHistory.past.length > 0;
+  const canRedo = !!artPath && !foreignDraft && !!artHistory && artHistory.future.length > 0;
+
   const pickArtPath = (clientX: number, clientY: number) => {
     const board = boardRef.current;
     const p = project;
@@ -476,6 +506,7 @@ export function CanvasWorkspace() {
     }
     if (!best || best.dist > 20) {
       setArtPath(null);
+      setArtHistory(null);
       toast("Tap directly on an artwork shape outline.");
       return;
     }
@@ -485,6 +516,17 @@ export function CanvasWorkspace() {
       return;
     }
     captureNodeTransform();
+    draftGenerationRef.current += 1;
+    const nextGen = draftGenerationRef.current;
+    artDragBeforeSnapshotRef.current = null;
+    setArtHistory({
+      projectId: p.id,
+      baseRevision: p.currentRevision,
+      shapeId: best.shapeId,
+      draftGeneration: nextGen,
+      past: [],
+      future: [],
+    });
     setArtPath({
       context: {
         projectId: p.id,
@@ -504,6 +546,12 @@ export function CanvasWorkspace() {
       e.currentTarget.setPointerCapture(e.pointerId);
     } catch {
       /* synthetic events / stale ids — continue without capture */
+    }
+    if (artPath) {
+      artDragBeforeSnapshotRef.current = {
+        commands: cloneCommands(artPath.commands),
+        dirty: artPath.dirty,
+      };
     }
     setArtPath((prev) => (prev ? { ...prev, dragging: { cmd, pt } } : prev));
   };
@@ -534,8 +582,107 @@ export function CanvasWorkspace() {
         /* pointer already released */
       }
     }
-    setArtPath((prev) => (prev && prev.dragging ? { ...prev, dragging: null } : prev));
+    const beforeSnap = artDragBeforeSnapshotRef.current;
+    artDragBeforeSnapshotRef.current = null;
+    setArtPath((prev) => {
+      if (!prev || !prev.dragging) return prev;
+      if (beforeSnap) {
+        const beforeD = serializePathCommands(beforeSnap.commands);
+        const afterD = serializePathCommands(prev.commands);
+        if (beforeD !== afterD) {
+          const gen = draftGenerationRef.current;
+          setArtHistory((h) => {
+            if (!h || h.draftGeneration !== gen) return h;
+            return {
+              ...h,
+              past: [...h.past, beforeSnap].slice(-50),
+              future: [],
+            };
+          });
+        }
+      }
+      return { ...prev, dragging: null };
+    });
   };
+
+  const undoArtDraft = useCallback(() => {
+    if (!artPath || foreignDraft) return;
+    const cur = artPath;
+    const gen = draftGenerationRef.current;
+    setArtHistory((h) => {
+      if (!h || h.draftGeneration !== gen || h.past.length === 0) return h;
+      const prevSnap = h.past[h.past.length - 1];
+      const newPast = h.past.slice(0, -1);
+      const currentSnap = { commands: cloneCommands(cur.commands), dirty: cur.dirty };
+      const newFuture = [...h.future, currentSnap].slice(-50);
+      setArtPath({
+        ...cur,
+        commands: cloneCommands(prevSnap.commands),
+        dirty: prevSnap.dirty,
+        dragging: null,
+      });
+      return {
+        ...h,
+        past: newPast,
+        future: newFuture,
+      };
+    });
+  }, [artPath, foreignDraft]);
+
+  const redoArtDraft = useCallback(() => {
+    if (!artPath || foreignDraft) return;
+    const cur = artPath;
+    const gen = draftGenerationRef.current;
+    setArtHistory((h) => {
+      if (!h || h.draftGeneration !== gen || h.future.length === 0) return h;
+      const nextSnap = h.future[h.future.length - 1];
+      const newFuture = h.future.slice(0, -1);
+      const currentSnap = { commands: cloneCommands(cur.commands), dirty: cur.dirty };
+      const newPast = [...h.past, currentSnap].slice(-50);
+      setArtPath({
+        ...cur,
+        commands: cloneCommands(nextSnap.commands),
+        dirty: nextSnap.dirty,
+        dragging: null,
+      });
+      return {
+        ...h,
+        past: newPast,
+        future: newFuture,
+      };
+    });
+  }, [artPath, foreignDraft]);
+
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (view !== "inspect" || tool !== "artnode" || !artPath) return;
+      if (artSaveOpen || artConflictOpen) return;
+      const target = e.target as HTMLElement | null;
+      if (
+        target &&
+        (target.tagName === "INPUT" ||
+          target.tagName === "TEXTAREA" ||
+          target.isContentEditable ||
+          target.closest?.("[contenteditable='true']"))
+      ) {
+        return; // Native text editing wins
+      }
+      const isCmdOrCtrl = e.metaKey || e.ctrlKey;
+      if (isCmdOrCtrl && e.key.toLowerCase() === "z") {
+        e.preventDefault();
+        if (e.shiftKey) {
+          redoArtDraft();
+        } else {
+          undoArtDraft();
+        }
+      } else if (isCmdOrCtrl && e.key.toLowerCase() === "y") {
+        e.preventDefault();
+        redoArtDraft();
+      }
+    };
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, [view, tool, artPath, artSaveOpen, artConflictOpen, undoArtDraft, redoArtDraft]);
 
   /** Save intent: foreign drafts are suspended (no request can target the
    *  wrong project); a stale base routes to the explicit-conflict dialog;
@@ -603,7 +750,10 @@ export function CanvasWorkspace() {
     const job = project?.job;
     if (!job?.id) return;
     artPendingSaveRef.current = null;
-    if (job.id === pending.jobId && job.status === "done") setArtPath(null);
+    if (job.id === pending.jobId && job.status === "done") {
+      setArtPath(null);
+      setArtHistory(null);
+    }
     // Every other terminal outcome (our job failed/canceled/interrupted, or
     // an unrelated job settled) keeps the draft; the poller already toasted
     // failures.
@@ -1727,6 +1877,28 @@ export function CanvasWorkspace() {
           )}
           <Button
             size="sm"
+            variant="outline"
+            className="h-7 rounded-md bg-white px-2.5 text-[10px]"
+            disabled={busy || !canUndo || foreignDraft}
+            onClick={undoArtDraft}
+            title="Undo (Ctrl+Z)"
+          >
+            <Undo2 className="mr-1 size-3" />
+            Undo
+          </Button>
+          <Button
+            size="sm"
+            variant="outline"
+            className="h-7 rounded-md bg-white px-2.5 text-[10px]"
+            disabled={busy || !canRedo || foreignDraft}
+            onClick={redoArtDraft}
+            title="Redo (Ctrl+Shift+Z)"
+          >
+            <Redo2 className="mr-1 size-3" />
+            Redo
+          </Button>
+          <Button
+            size="sm"
             className="h-7 rounded-md bg-[#087f74] px-3 text-[10px] font-semibold text-white hover:bg-[#056a60]"
             disabled={busy || !artPath.dirty || foreignDraft}
             onClick={requestArtSave}
@@ -1738,7 +1910,10 @@ export function CanvasWorkspace() {
             variant="outline"
             className="h-7 rounded-md bg-white px-3 text-[10px]"
             disabled={busy}
-            onClick={() => setArtPath(null)}
+            onClick={() => {
+              setArtPath(null);
+              setArtHistory(null);
+            }}
           >
             Cancel
           </Button>
@@ -1790,6 +1965,7 @@ export function CanvasWorkspace() {
                   setNodeEdge(null);
                   setNodeConfirmOpen(false);
                   setArtPath(null);
+                  setArtHistory(null);
                   setTool(t.key);
                 }}
                 className={`flex min-h-11 items-center gap-1.5 rounded-md px-3 text-[10px] font-medium transition-colors disabled:opacity-50 ${
@@ -1959,7 +2135,10 @@ export function CanvasWorkspace() {
           <AlertDialogFooter className="gap-2 sm:justify-end">
             <AlertDialogCancel
               className="h-9 rounded-md border-[#e1e5df] bg-white text-[10px]"
-              onClick={() => setArtPath(null)}
+              onClick={() => {
+                setArtPath(null);
+                setArtHistory(null);
+              }}
             >
               Discard draft
             </AlertDialogCancel>
