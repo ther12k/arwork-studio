@@ -62,7 +62,7 @@ class EditRequest(StrictModel):
     region_ids: list[str] = Field(max_length=1600,
         description='Validated per action: merge>=2, split/cut/label=1, node=2 (the two regions sharing the dragged boundary), draw=0, others>=1.')
     d: str | None = Field(None, pattern=r'^M[\s\d.,eE+\-MLQCZ]+$',
-        description="SVG path data in master units: 'cut' = open line crossing the region, 'draw' = closed pen shape (Z closes it), 'node' = the dragged new shared-boundary polyline, 'shape' = the edited closed master path (M…Z).")
+        description="SVG path data in master units: 'cut' = open line crossing the region, 'draw' = closed pen shape (Z closes it), 'node' = the dragged new shared-boundary polyline, 'shape' = the edited master path — CLOSED for filled shapes (must end Z), OPEN for ink strokes authored open (M… without Z; per-subpath positive length).")
     group: str = Field('unassigned', pattern=r'^[a-z][a-z0-9_-]{0,39}$')
     palette_id: int | None = None
     x: float | None = Field(None, allow_inf_nan=False)

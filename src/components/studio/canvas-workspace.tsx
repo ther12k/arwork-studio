@@ -450,9 +450,9 @@ export function CanvasWorkspace() {
 
   /** The artwork path being node-edited: its identity context, the parsed
    *  commands (M/L/C/Q/Z, absolute), which control point (command index +
-   *  point index) is being dragged, and whether it is an OPEN ink stroke
-   *  (no ring contract — identity comes from paint.inkPaths). Anchor =
-   *  command endpoint, handle = a Bézier control point. */
+   *  point index) is being dragged, and whether the path was authored OPEN
+   *  (no trailing Z — stroke rules; closed paths, ink included, must keep
+   *  their Z). Anchor = command endpoint, handle = a Bézier control point. */
   const [artPath, setArtPath] = useState<{
     context: ArtworkDraftContext;
     commands: PathCommand[];
@@ -500,15 +500,19 @@ export function CanvasWorkspace() {
     const pt = board.clientToArt(clientX, clientY);
     if (!pt) return;
     // nearest pickable path within ~20 art units of the tap (reverse z =
-    // topmost). Closed paint shapes and OPEN ink strokes are both editable;
-    // ink z sits above the fills it decorates (document order).
+    // topmost). Closed paint shapes and ink strokes are both editable; ink
+    // z sits above the fills it decorates (document order). OPENNESS is a
+    // property of the PATH's own geometry (trailing Z), not of its
+    // classification: a closed ink outline edits under the closed rules
+    // (must keep its Z), an open one under the stroke rules.
+    const isOpenD = (d: string) => !d.trim().toUpperCase().endsWith("Z");
     const entries = [
       ...(bundle.paint.paths ?? [])
         .filter((q) => q.shapeId)
-        .map((q) => ({ shapeId: q.shapeId!, d: q.d, z: q.z ?? -Infinity, open: false })),
+        .map((q) => ({ shapeId: q.shapeId!, d: q.d, z: q.z ?? -Infinity, open: isOpenD(q.d) })),
       ...(bundle.paint.inkPaths ?? [])
         .filter((q) => q.shapeId)
-        .map((q) => ({ shapeId: q.shapeId!, d: q.d, z: q.z ?? -Infinity, open: true })),
+        .map((q) => ({ shapeId: q.shapeId!, d: q.d, z: q.z ?? -Infinity, open: isOpenD(q.d) })),
     ].sort((a, b) => b.z - a.z);
     let best: { shapeId: string; d: string; dist: number; open: boolean } | null = null;
     for (const q of entries) {

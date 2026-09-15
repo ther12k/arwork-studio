@@ -297,6 +297,8 @@ INK_SVG = b'''<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 300 300">
 </g>
 <path d="M 40,40 C 90,10 150,90 200,50 C 230,30 260,60 280,40"
       fill="none" stroke="#1B4F8A" stroke-width="3"/>
+<path d="M 20,140 L 60,140 L 60,170 L 20,170 Z"
+      fill="none" stroke="#1B4F8A" stroke-width="2"/>
 </svg>'''
 
 INK_EDIT_D = 'M 30,60 C 80,20 150,90 200,50 C 230,30 260,60 285,70'
@@ -318,8 +320,9 @@ def test_ink_stroke_edit(client):
 
     before = files(client, pid, rev)
     ink = [p for p in before['paint']['inkPaths']]
-    assert len(ink) == 1
-    ink_id = ink[0]['shapeId']
+    assert len(ink) == 2  # open squiggle + closed outline stroke
+    ink_id = next(p_['shapeId'] for p_ in ink if p_['d'] == 'M 40,40 C 90,10 150,90 200,50 C 230,30 260,60 280,40')
+    closed_ink_id = next(p_['shapeId'] for p_ in ink if p_['d'].rstrip().upper().endswith('Z'))
     filled_before = json.dumps(before['paint']['paths'], sort_keys=True)
     regions_before = sorted(r_['id'] for r_ in before['regions'])
 
@@ -328,14 +331,30 @@ def test_ink_stroke_edit(client):
         'base_revision': rev})
     after = files(client, pid, rev2)
     ink2 = after['paint']['inkPaths']
-    assert len(ink2) == 1 and ink2[0]['shapeId'] == ink_id
-    assert ink2[0]['d'] == INK_EDIT_D
+    assert len(ink2) == 2
+    edited_ink = next(p_ for p_ in ink2 if p_['shapeId'] == ink_id)
+    assert edited_ink['d'] == INK_EDIT_D
+    # The other ink stroke is untouched (per-shape edit, whole recompile).
+    assert next(p_ for p_ in ink2 if p_['shapeId'] == closed_ink_id)['d'].endswith('Z')
     assert not INK_EDIT_D.rstrip().upper().endswith('Z'), 'the edited stroke is open'
     # Determinism guarantee: the filled paint bytes and the gameplay surface
     # set are IDENTICAL — an ink edit never re-derives gameplay.
     assert json.dumps(after['paint']['paths'], sort_keys=True) == filled_before
     assert sorted(r_['id'] for r_ in after['regions']) == regions_before
     assert after['objects'] == before['objects']
+    # P2 contract: a CLOSED ink outline keeps the closed contract — an open d
+    # for it fails the job ("must stay closed"), a closed d publishes.
+    r = client.post(f'/api/projects/{pid}/edit', headers=H, json={
+        'action': 'shape', 'shape_id': closed_ink_id, 'region_ids': [],
+        'd': 'M 20,140 L 60,140 L 60,170', 'base_revision': rev2})
+    assert r.status_code == 200, r.text
+    p = wait(client, pid)
+    assert p['job']['status'] == 'failed', p['job']
+    assert 'must stay closed' in p['job'].get('message', '')
+    rev_c = p['currentRevision']
+    rev_d = step(client, pid, rev_c, {
+        'action': 'shape', 'shape_id': closed_ink_id, 'region_ids': [],
+        'd': 'M 15,135 L 65,140 L 60,170 L 20,170 Z', 'base_revision': rev_c})
     # The master carries the edit at publication (authoritative source).
     assert INK_EDIT_D in after['master']
     assert not after['qa'].get('errors')
@@ -344,7 +363,7 @@ def test_ink_stroke_edit(client):
     blob_shape = next(o for o in after['objects'] if o['id'] == 'obj-blob')['shapeIds'][0]
     r = client.post(f'/api/projects/{pid}/edit', headers=H, json={
         'action': 'shape', 'shape_id': blob_shape, 'region_ids': [],
-        'd': 'M 10,10 L 90,10 L 90,90', 'base_revision': rev2})
+        'd': 'M 10,10 L 90,10 L 90,90', 'base_revision': rev_d})
     assert r.status_code == 200, r.text  # accepted as a job; failure below
     p = wait(client, pid)
     assert p['job']['status'] == 'failed', p['job']
@@ -361,3 +380,20 @@ def test_ink_stroke_edit(client):
     p = wait(client, pid)
     assert p['job']['status'] == 'failed', p['job']
     assert 'collapses to nothing' in p['job'].get('message', '')
+
+    # P1 regression — compound subpaths are validated PER SUBPATH, never
+    # chained: two zero-length subpaths must NOT inherit phantom connector
+    # length from being flattened into one polyline.
+    rev4 = p['currentRevision']
+    r = client.post(f'/api/projects/{pid}/edit', headers=H, json={
+        'action': 'shape', 'shape_id': ink_id, 'region_ids': [],
+        'd': 'M 0,0 L 0,0 M 100,100 L 100,100', 'base_revision': rev4})
+    assert r.status_code == 200, r.text
+    p = wait(client, pid)
+    assert p['job']['status'] == 'failed', p['job']
+    assert 'collapses to nothing' in p['job'].get('message', '')
+    # ...while one drawable subpath is enough even next to a collapsed one.
+    rev5 = p['currentRevision']
+    step(client, pid, rev5, {
+        'action': 'shape', 'shape_id': ink_id, 'region_ids': [],
+        'd': 'M 0,0 L 0,0 M 100,100 L 120,100', 'base_revision': rev5})

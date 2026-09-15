@@ -2991,16 +2991,23 @@ def _edit_master_shape(source: Path, output: Path, request, version: str) -> dic
         raise ValueError('The edited path is empty — move an anchor first, or Cancel.')
     # Ink strokes (open linework, filled=False) are appearance, not gameplay:
     # they carry no ring/simplicity contract, only parseability + enough
-    # length to draw. Closed paint shapes keep the full ring validation.
-    ink_ids = {p.get('shapeId') for p in (bundle['paint'].get('inkPaths') or [])}
-    if shape_id in ink_ids:
+    # length to draw. Validation mode follows the SOURCE path's closure, not
+    # bare ink membership: an ink path authored as a closed outline keeps the
+    # closed contract (a Z ring must stay a Z ring) — only genuinely open
+    # strokes get the lenient stroke rules. Subpaths are independent strokes
+    # and are validated PER SUBPATH — chaining their points would invent
+    # connector length between them (two collapsed subpaths would pass).
+    ink_by_id = {p.get('shapeId'): p for p in (bundle['paint'].get('inkPaths') or [])}
+    source_open = shape_id in ink_by_id and not str(ink_by_id[shape_id].get('d') or '').rstrip().upper().endswith('Z')
+    if source_open:
         if not SAFE_D_OPEN.match(new_d):
             raise ValueError('The edited stroke must use absolute M/L/C/Q commands only.')
         try:
-            stroke_pts = [pt for ring in flatten_d(new_d) for pt in ring]
+            subpaths = flatten_d(new_d)
         except Exception as exc:
             raise ValueError(f'The edited stroke could not be parsed: {exc}')
-        if len(stroke_pts) < 2 or LineString(stroke_pts).length <= 1e-6:
+        drawable = [LineString(ring).length for ring in subpaths if len(ring) >= 2]
+        if not drawable or max(drawable) <= 1e-6:
             raise ValueError('The edited stroke collapses to nothing — move the anchors further apart.')
     else:
         if not new_d.upper().endswith('Z'):

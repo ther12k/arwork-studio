@@ -1990,3 +1990,18 @@ Work Log:
 
 Stage Summary:
 - Art node editing now covers both artwork kinds: closed fills (with their ring/simplicity contract) and open ink linework (parse-and-length only) — one editing grammar, one history, per-kind validation on the backend and per-kind pick/remove rules on the frontend, all proven in the real browser through payload, preview, and reload. Still deferred from Task 33: fill/stroke/width controls on the tool, z-order controls.
+
+---
+Task ID: 39-review1
+Agent: main (ZCode)
+Task: Review round on dc91fd4 — P1 compound-subpath ink validation, P2 closure-based classification, docs, provenance.
+
+Work Log:
+- P1 (validation bug): the ink length check flattened ALL subpaths into one point list before measuring LineString length — independent subpaths were chained, so a phantom connector between them could satisfy the length floor (two zero-length subpaths at (0,0) and (100,100) measured ≈141.4 units and PASSED "collapses to nothing"). Fixed to validate PER SUBPATH: drawable = [LineString(ring).length for ring in flatten_d(new_d) if len(ring) >= 2]; reject when no subpath has length > 1e-6. Regression rows added to the real-app ink test: M 0,0 L 0,0 M 100,100 L 100,100 → job fails "collapses to nothing"; M 0,0 L 0,0 M 100,100 L 120,100 → publishes.
+- P2 (contract cleanup): open/closed is now a property of the PATH'S OWN GEOMETRY (trailing Z), not of ink membership. Backend: source_open = shape in inkPaths AND its source d does not end with Z — an ink path authored as a closed outline keeps the CLOSED contract (open d for it fails "must stay closed"; closed d publishes), only genuinely open strokes get the lenient per-subpath stroke rules. Frontend: picker entries compute open from each path's own d (open: !d.trim().toUpperCase().endsWith("Z")) — a closed ink outline edits under the closed rules in the same grammar (reviewer's option 1), the Z requirement and removePathAnchor floors follow the flag as before. Fixture-independent: the ink test gained a second, closed ink outline stroke and asserts both contracts against the same revision chain.
+- Docs: EditRequest.d description now reads "the edited master path — CLOSED for filled shapes (must end Z), OPEN for ink strokes authored open (M… without Z; per-subpath positive length)" so the next agent does not "fix" open paths back to closed-only.
+- Provenance correction: the Task 39 CI run for dc91fd4 is 34983485908 (backend + frontend green, 2026-09-15); the run id 34860616558 quoted in review correspondence does not appear anywhere in this worklog and belongs to an older commit (2fa2039) — recorded here so test provenance stays unambiguous.
+- Gates: composition suite 2 passed (ink test now covers open-stroke edit + closed-ink contract + degenerate + compound-subpath regressions); vitest 57; tsc clean; eslint clean; studio journeys 5 passed.
+
+Stage Summary:
+- The P1 hole is closed with the reviewer's exact semantics (per-subpath, never chained) and both regression rows are locked in the real-app suite. Open/closed is now honestly geometric everywhere — backend validation, frontend classification, docs — so "open ink editing" means exactly that, and closed ink outlines are first-class closed shapes. Next per the accepted order: appearance controls (fill/stroke/width/opacity with palette semantics), then shape-level z-order under the full ownership/recompile gate.
