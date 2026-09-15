@@ -389,15 +389,18 @@ export function splitPathCommand(
  *  with the FOLLOWING one. C+C and Q+Q merges keep the outer control points
  *  so the endpoint tangents survive; any line involved degrades the merge to
  *  a straight L (a single segment cannot represent two arbitrary curves).
- *  Guards: the M anchor and the last segment's anchor are not removable, and
- *  a closed ring keeps at least three edges. Returns the new commands or
- *  null. */
+ *  Guards: the M anchor and the last segment's anchor are not removable; a
+ *  CLOSED ring (trailing Z) keeps at least three edges, an OPEN stroke at
+ *  least two segments (merging down to a single stroke is still drawable).
+ *  Returns the new commands or null. */
 export function removePathAnchor(cmds: PathCommand[], cmdIndex: number): PathCommand[] | null {
   const cur = cmds[cmdIndex];
   if (cmdIndex < 1 || !cur || !isSegment(cur)) return null;
   const nxt = cmds[cmdIndex + 1];
   if (!nxt || !isSegment(nxt)) return null;
-  if (cmds.filter(isSegment).length < 3) return null;
+  const closed = cmds[cmds.length - 1].op === "Z";
+  const floor = closed ? 3 : 2;
+  if (cmds.filter(isSegment).length < floor) return null;
   const end = nxt.pts[nxt.pts.length - 1];
   let merged: PathCommand;
   if (cur.op === "C" && nxt.op === "C") {

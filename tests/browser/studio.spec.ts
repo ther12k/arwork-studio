@@ -35,6 +35,7 @@ import { expect, test, type Page } from "@playwright/test";
 import { flattenPath } from "../../src/lib/svg-path";
 import {
   EDITED_D,
+  INK,
   ORIGINAL_D,
   REV1,
   REV2,
@@ -621,4 +622,92 @@ test("Art node add/remove nodes: exact split, guarded removal, composes with und
   await expect(saveBar(page)).toHaveCount(0);
   await page.reload();
   await expectPixel(page, 187, 95, isBlue);
+});
+
+// ------------------------------------------------- open ink strokes (Task 39)
+
+test("Art node open ink stroke: pickable, editable, undoable — open payload saved and durable", async ({ page }) => {
+  test.setTimeout(150_000);
+  const state: FixtureState = mkState();
+  await routeBackend(page, state);
+  await page.goto("/");
+
+  await page.getByRole("button", { name: "Edit regions" }).click();
+  await page.getByRole("button", { name: "Art node" }).click();
+
+  // Tap the middle of the ink squiggle's first cubic (≈120,49) — nearest
+  // path there is the STROKE (the lens fills are 30+ units away), so the
+  // draft loads the open path, not the closed fills.
+  const inkOverlay = page.locator(`g[aria-label="Artwork path anchors for shape ${INK}"]`);
+  const tap = await artToPage(page, 120, 49);
+  await page.mouse.click(tap.x, tap.y);
+  await expect(inkOverlay).toBeVisible();
+
+  const anchors = page.locator('circle[aria-label^="Anchor "]');
+  await expect(anchors).toHaveCount(3);
+  // The preview is genuinely OPEN: it starts at (40,40), ends at (280,40),
+  // and does not close back (no Z in the source stroke).
+  const pristine = await previewArtPoints(page);
+  expect(Math.hypot(pristine[0].x - 40, pristine[0].y - 40)).toBeLessThan(2);
+  expect(minDistToPoint(pristine, { x: 280, y: 40 })).toBeLessThan(2);
+  expect(Math.hypot(pristine[0].x - pristine[pristine.length - 1].x, pristine[0].y - pristine[pristine.length - 1].y)).toBeGreaterThan(100);
+
+  // Drag the terminal anchor down to (285,70) — one undo step.
+  const last = page.locator('circle[aria-label="Anchor 3"]');
+  const lb = await last.boundingBox();
+  const drop = await artToPage(page, 285, 70);
+  await page.mouse.move(lb!.x + lb!.width / 2, lb!.y + lb!.height / 2);
+  await page.mouse.down();
+  await page.mouse.move(drop.x, drop.y, { steps: 8 });
+  await page.mouse.up();
+  await expect(page.getByText("modified", { exact: false })).toBeVisible();
+
+  // Add a node on the first cubic (exact split) — a second undo step.
+  await page.mouse.dblclick(tap.x, tap.y);
+  await expect(anchors).toHaveCount(4);
+
+  // Undo ×2 returns the PRISTINE stroke (unchanged, stack exhausted).
+  await page.keyboard.press("Control+z");
+  await page.keyboard.press("Control+z");
+  await expect(anchors).toHaveCount(3);
+  await expect(page.getByText("unchanged", { exact: false })).toBeVisible();
+  const undone = await previewArtPoints(page);
+  expect(minDistToPoint(undone, { x: 280, y: 40 })).toBeLessThan(2);
+  // Redo ×2 re-applies drag + split.
+  await page.keyboard.press("Control+Shift+z");
+  await page.keyboard.press("Control+Shift+z");
+  await expect(anchors).toHaveCount(4);
+  const edited = await previewArtPoints(page);
+  expect(minDistToPoint(edited, { x: 285, y: 70 })).toBeLessThan(2);
+
+  // The closed fills are untouched throughout (ink edits are paint-only —
+  // the fixture echoes the backend determinism guarantee).
+  await expectPixel(page, 187, 95, isRed);
+
+  // Save: payload targets the ink shape, carries an OPEN path (no Z) with
+  // THREE cubics (split included), and publishes cleanly.
+  state.mode = "success";
+  await saveBar(page).click();
+  await page.getByRole("alertdialog").getByRole("button", { name: "Save path" }).click();
+  await expect(saveBar(page)).toHaveCount(0);
+  const payload = state.editCalls[state.editCalls.length - 1];
+  expect(payload).toMatchObject({ base_revision: REV1, action: "shape", shape_id: INK });
+  expect(payload.d.startsWith("M ")).toBe(true);
+  expect(payload.d).not.toContain("Z");
+  expect((payload.d.match(/ C /g) ?? []).length).toBe(3);
+  // s0002's paint was NOT part of the submission.
+  expect(payload.d).not.toBe(ORIGINAL_D);
+
+  // Reload: the published ink revision serves the edited stroke — re-pick
+  // and read the preview back (endpoint (285,70), 4 anchors, still open).
+  await page.reload();
+  await page.getByRole("button", { name: "Edit regions" }).click();
+  await page.getByRole("button", { name: "Art node" }).click();
+  const tap2 = await artToPage(page, 120, 49);
+  await page.mouse.click(tap2.x, tap2.y);
+  await expect(inkOverlay).toBeVisible();
+  await expect(anchors).toHaveCount(4);
+  const reloaded = await previewArtPoints(page);
+  expect(minDistToPoint(reloaded, { x: 285, y: 70 })).toBeLessThan(2);
+  expect(Math.hypot(reloaded[0].x - 40, reloaded[0].y - 40)).toBeLessThan(2);
 });

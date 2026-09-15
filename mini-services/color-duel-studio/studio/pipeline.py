@@ -2989,26 +2989,40 @@ def _edit_master_shape(source: Path, output: Path, request, version: str) -> dic
     new_d = (request.d or '').strip()
     if not new_d:
         raise ValueError('The edited path is empty — move an anchor first, or Cancel.')
-    if not new_d.upper().endswith('Z'):
-        raise ValueError('Artwork paths must stay closed for this slice: the path does not end with Z.')
-    # flatten + simplicity via the same geometry kernel the compiler uses
-    try:
-        rings = flatten_d(new_d)
-    except Exception as exc:
-        raise ValueError(f'The edited path could not be parsed: {exc}')
-    if not rings or len(rings[0]) < 3:
-        raise ValueError('The edited path has no drawable outline.')
-    poly = Polygon(rings[0], rings[1:]) if len(rings) > 1 else Polygon(rings[0])
-    if not poly.is_simple:
-        raise ValueError('The edited path crosses itself; smooth out the crossing before saving.')
-    if poly.is_empty or poly.area <= 1e-6:
-        raise ValueError('The edited path collapses to nothing — move the anchors further apart.')
-    try:
-        poly = make_valid(poly)
-    except Exception:
-        pass
-    if poly.geom_type != 'Polygon' or poly.is_empty:
-        raise ValueError('The edited path is not a single simple outline.')
+    # Ink strokes (open linework, filled=False) are appearance, not gameplay:
+    # they carry no ring/simplicity contract, only parseability + enough
+    # length to draw. Closed paint shapes keep the full ring validation.
+    ink_ids = {p.get('shapeId') for p in (bundle['paint'].get('inkPaths') or [])}
+    if shape_id in ink_ids:
+        if not SAFE_D_OPEN.match(new_d):
+            raise ValueError('The edited stroke must use absolute M/L/C/Q commands only.')
+        try:
+            stroke_pts = [pt for ring in flatten_d(new_d) for pt in ring]
+        except Exception as exc:
+            raise ValueError(f'The edited stroke could not be parsed: {exc}')
+        if len(stroke_pts) < 2 or LineString(stroke_pts).length <= 1e-6:
+            raise ValueError('The edited stroke collapses to nothing — move the anchors further apart.')
+    else:
+        if not new_d.upper().endswith('Z'):
+            raise ValueError('Artwork paths must stay closed for this slice: the path does not end with Z.')
+        # flatten + simplicity via the same geometry kernel the compiler uses
+        try:
+            rings = flatten_d(new_d)
+        except Exception as exc:
+            raise ValueError(f'The edited path could not be parsed: {exc}')
+        if not rings or len(rings[0]) < 3:
+            raise ValueError('The edited path has no drawable outline.')
+        poly = Polygon(rings[0], rings[1:]) if len(rings) > 1 else Polygon(rings[0])
+        if not poly.is_simple:
+            raise ValueError('The edited path crosses itself; smooth out the crossing before saving.')
+        if poly.is_empty or poly.area <= 1e-6:
+            raise ValueError('The edited path collapses to nothing — move the anchors further apart.')
+        try:
+            poly = make_valid(poly)
+        except Exception:
+            pass
+        if poly.geom_type != 'Polygon' or poly.is_empty:
+            raise ValueError('The edited path is not a single simple outline.')
 
     master_file = source / 'source-master.svg'
     if not master_file.is_file():

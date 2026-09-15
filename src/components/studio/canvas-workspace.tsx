@@ -449,14 +449,16 @@ export function CanvasWorkspace() {
   }
 
   /** The artwork path being node-edited: its identity context, the parsed
-   *  commands (M/L/C/Q/Z, absolute), and which control point (command index +
-   *  point index) is being dragged. Anchor = command endpoint, handle = a
-   *  Bézier control point. */
+   *  commands (M/L/C/Q/Z, absolute), which control point (command index +
+   *  point index) is being dragged, and whether it is an OPEN ink stroke
+   *  (no ring contract — identity comes from paint.inkPaths). Anchor =
+   *  command endpoint, handle = a Bézier control point. */
   const [artPath, setArtPath] = useState<{
     context: ArtworkDraftContext;
     commands: PathCommand[];
     dragging: { cmd: number; pt: number } | null;
     dirty: boolean;
+    open: boolean;
   } | null>(null);
   const [artSaveOpen, setArtSaveOpen] = useState(false);
   const [artConflictOpen, setArtConflictOpen] = useState(false);
@@ -497,16 +499,23 @@ export function CanvasWorkspace() {
     if (!board || !bundle?.paint || !p?.currentRevision) return;
     const pt = board.clientToArt(clientX, clientY);
     if (!pt) return;
-    // nearest paint path within ~20 art units of the tap (reverse z = topmost)
-    const entries = [...bundle.paint.paths]
-      .filter((q) => q.shapeId)
-      .sort((a, b) => (b.z ?? -Infinity) - (a.z ?? -Infinity));
-    let best: { shapeId: string; d: string; dist: number } | null = null;
+    // nearest pickable path within ~20 art units of the tap (reverse z =
+    // topmost). Closed paint shapes and OPEN ink strokes are both editable;
+    // ink z sits above the fills it decorates (document order).
+    const entries = [
+      ...(bundle.paint.paths ?? [])
+        .filter((q) => q.shapeId)
+        .map((q) => ({ shapeId: q.shapeId!, d: q.d, z: q.z ?? -Infinity, open: false })),
+      ...(bundle.paint.inkPaths ?? [])
+        .filter((q) => q.shapeId)
+        .map((q) => ({ shapeId: q.shapeId!, d: q.d, z: q.z ?? -Infinity, open: true })),
+    ].sort((a, b) => b.z - a.z);
+    let best: { shapeId: string; d: string; dist: number; open: boolean } | null = null;
     for (const q of entries) {
       const pts = flattenPath(q.d);
       if (pts.length < 2) continue;
       const dist = polylineNearestDistance(pts, { x: pt.x, y: pt.y });
-      if (!best || dist < best.dist) best = { shapeId: q.shapeId!, d: q.d, dist };
+      if (!best || dist < best.dist) best = { shapeId: q.shapeId, d: q.d, dist, open: q.open };
     }
     if (!best || best.dist > 20) {
       setArtPath(null);
@@ -515,7 +524,11 @@ export function CanvasWorkspace() {
       return;
     }
     const commands = parsePathCommands(best.d);
-    if (!commands.length || commands[commands.length - 1].op !== "Z") {
+    if (!commands.length) {
+      toast("This shape's path could not be parsed for node editing.");
+      return;
+    }
+    if (!best.open && commands[commands.length - 1].op !== "Z") {
       toast("This shape is not a closed path — only closed artwork is editable in this slice.");
       return;
     }
@@ -541,6 +554,7 @@ export function CanvasWorkspace() {
       commands,
       dragging: null,
       dirty: false,
+      open: best.open,
     });
   };
 

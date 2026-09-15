@@ -284,3 +284,80 @@ def test_authoring_composition_full_chain(client):
                               capture_output=True, text=True, cwd=str(ROOT), timeout=120)
         assert proc.returncode == 0, f'shipped adapter rejected the composed export:\n{proc.stdout}\n{proc.stderr}'
         assert 'FAIL' not in proc.stdout
+
+
+# ---------------------------------------------------------- Task 39: ink strokes
+
+INK_SVG = b'''<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 300 300">
+<g data-cd-object="obj-blob" data-cd-name="Blob">
+  <path d="M 50,100 C 50,60 120,40 160,70 C 200,100 200,160 160,190 C 120,220 50,190 50,100 Z" fill="#77AA55"/>
+</g>
+<g data-cd-object="obj-plain" data-cd-name="Plain">
+  <rect x="40" y="230" width="220" height="60" fill="#CC8844"/>
+</g>
+<path d="M 40,40 C 90,10 150,90 200,50 C 230,30 260,60 280,40"
+      fill="none" stroke="#1B4F8A" stroke-width="3"/>
+</svg>'''
+
+INK_EDIT_D = 'M 30,60 C 80,20 150,90 200,50 C 230,30 260,60 285,70'
+
+
+def test_ink_stroke_edit(client):
+    """Open linework is editable in Art node mode: the stroke's d changes,
+    identity/ownership survive, and the FILLED artwork is untouched — the
+    recompile's determinism is the guarantee (paint bytes + region set are
+    identical). Closed shapes still refuse open d."""
+    pid = new(client)
+    r = client.post(f'/api/projects/{pid}/upload-svg', headers=H,
+                    files={'file': ('ink.svg', INK_SVG, 'image/svg+xml')},
+                    data={'rights_confirmed': 'true'})
+    assert r.status_code == 200, r.text
+    r = client.post(f'/api/projects/{pid}/build', headers=H, json=BUILD_BODY)
+    assert r.status_code == 200, r.text
+    rev = wait(client, pid)['currentRevision']
+
+    before = files(client, pid, rev)
+    ink = [p for p in before['paint']['inkPaths']]
+    assert len(ink) == 1
+    ink_id = ink[0]['shapeId']
+    filled_before = json.dumps(before['paint']['paths'], sort_keys=True)
+    regions_before = sorted(r_['id'] for r_ in before['regions'])
+
+    rev2 = step(client, pid, rev, {
+        'action': 'shape', 'shape_id': ink_id, 'region_ids': [], 'd': INK_EDIT_D,
+        'base_revision': rev})
+    after = files(client, pid, rev2)
+    ink2 = after['paint']['inkPaths']
+    assert len(ink2) == 1 and ink2[0]['shapeId'] == ink_id
+    assert ink2[0]['d'] == INK_EDIT_D
+    assert not INK_EDIT_D.rstrip().upper().endswith('Z'), 'the edited stroke is open'
+    # Determinism guarantee: the filled paint bytes and the gameplay surface
+    # set are IDENTICAL — an ink edit never re-derives gameplay.
+    assert json.dumps(after['paint']['paths'], sort_keys=True) == filled_before
+    assert sorted(r_['id'] for r_ in after['regions']) == regions_before
+    assert after['objects'] == before['objects']
+    # The master carries the edit at publication (authoritative source).
+    assert INK_EDIT_D in after['master']
+    assert not after['qa'].get('errors')
+
+    # Closed paint shapes still refuse OPEN geometry (existing contract).
+    blob_shape = next(o for o in after['objects'] if o['id'] == 'obj-blob')['shapeIds'][0]
+    r = client.post(f'/api/projects/{pid}/edit', headers=H, json={
+        'action': 'shape', 'shape_id': blob_shape, 'region_ids': [],
+        'd': 'M 10,10 L 90,10 L 90,90', 'base_revision': rev2})
+    assert r.status_code == 200, r.text  # accepted as a job; failure below
+    p = wait(client, pid)
+    assert p['job']['status'] == 'failed', p['job']
+    assert 'must stay closed' in p['job'].get('message', '')
+
+    # A well-formed but DEGENERATE ink stroke (zero length) is a job failure
+    # with an actionable message; non-M garbage never reaches the job — the
+    # request model rejects it at the HTTP boundary (422) by contract.
+    rev3 = p['currentRevision']
+    r = client.post(f'/api/projects/{pid}/edit', headers=H, json={
+        'action': 'shape', 'shape_id': ink_id, 'region_ids': [],
+        'd': 'M 80,45 L 80,45', 'base_revision': rev3})
+    assert r.status_code == 200, r.text
+    p = wait(client, pid)
+    assert p['job']['status'] == 'failed', p['job']
+    assert 'collapses to nothing' in p['job'].get('message', '')

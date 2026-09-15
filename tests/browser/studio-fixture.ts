@@ -23,6 +23,11 @@ export const REV1 = "rev-1";
 export const REV2 = "rev-2";
 export const REV3 = "rev-3";
 export const SHAPE = "s0002";
+/** An OPEN ink stroke (filled:false, above the fills) — the Task 39
+ *  open-path editing target. Midpoint of its first cubic ≈ (120,49). */
+export const INK = "s0003";
+export const INK_D = "M 40,40 C 90,10 150,90 200,50 C 230,30 260,60 280,40";
+export const INK_EDITED_D = "M 40,40 C 90,10 150,90 200,50 C 230,30 260,60 285,70";
 /** Closed two-cubic blob; handle 1 = c1 (70,60) of the first cubic. */
 export const ORIGINAL_D = "M 70,180 C 70,60 230,60 230,180 C 230,300 70,300 70,180 Z";
 /** Serialized result of dragging handle 1 to art (170,60). */
@@ -35,6 +40,9 @@ export type FixtureState = {
   revision: string;
   /** Paint `d` served per revision (revisions carry their own artwork). */
   revPaint: Record<string, string>;
+  revInk: Record<string, string>;
+  /** Which shape the accepted edit job targeted (paint vs ink routing). */
+  pendingShape: string;
   job: Record<string, unknown>;
   editCalls: Array<Record<string, unknown>>;
   objectCalls: Array<Record<string, unknown>>;
@@ -50,6 +58,8 @@ export const mkState = (): FixtureState => ({
   mode: "reject409",
   revision: REV1,
   revPaint: { [REV1]: ORIGINAL_D },
+  revInk: { [REV1]: INK_D },
+  pendingShape: SHAPE,
   job: { status: "idle" },
   editCalls: [],
   objectCalls: [],
@@ -145,7 +155,7 @@ const palette = [
   { id: 2, number: 2, name: "Blue", hex: "#3366CC", paint: { type: "solid", stops: [] } },
 ];
 
-const paintFor = (d: string) => ({
+const paintFor = (d: string, inkD: string) => ({
   schemaVersion: 2,
   artworkId: ART,
   viewBox: [0, 0, 300, 300],
@@ -153,7 +163,7 @@ const paintFor = (d: string) => ({
     { z: 0, shapeId: "s0001", d: "M 20,20 L 280,20 L 280,280 L 20,280 Z", fill: "#CC3333", fillRule: "evenodd" },
     { z: 1, shapeId: SHAPE, d, fill: "#3366CC", fillRule: "evenodd" },
   ],
-  inkPaths: [],
+  inkPaths: [{ z: 2, shapeId: INK, d: inkD, fill: "#1B4F8A", strokeWidth: 3, filled: false }],
   gradients: [],
   sourceColorShapeCount: 2,
 });
@@ -264,8 +274,13 @@ const project = (state: FixtureState) => ({
 const publish = (state: FixtureState) => {
   const next = NEXT_REV[state.revision];
   if (!next) throw new Error("fixture revision chain exhausted");
-  state.revPaint[next] =
-    state.pendingKind === "edit" && state.pendingD ? state.pendingD : state.revPaint[state.revision];
+  const carriesEdit = state.pendingKind === "edit" && !!state.pendingD;
+  state.revPaint[next] = carriesEdit && state.pendingShape === SHAPE
+    ? state.pendingD!
+    : state.revPaint[state.revision];
+  state.revInk[next] = carriesEdit && state.pendingShape === INK
+    ? state.pendingD!
+    : state.revInk[state.revision];
   state.revision = next;
   state.job = {
     id: state.activeJobId,
@@ -301,6 +316,7 @@ const fileFor = (state: FixtureState, rev: string, name: string): unknown => {
     }
   }
   const d = state.revPaint[rev] ?? ORIGINAL_D;
+  const inkD = state.revInk[rev] ?? INK_D;
   switch (name) {
     case "artwork.json":
       return manifestFor(rev);
@@ -309,7 +325,7 @@ const fileFor = (state: FixtureState, rev: string, name: string): unknown => {
     case "palette.json":
       return palette;
     case "paint.json":
-      return paintFor(d);
+      return paintFor(d, inkD);
     case "objects.json":
       return objectsFor(rev);
     default:
@@ -383,6 +399,7 @@ export async function routeBackend(page: Page, state: FixtureState) {
       state.runningGets = 0;
       state.pendingD = String(body.d);
       state.pendingKind = "edit";
+      state.pendingShape = String(body.shape_id ?? SHAPE);
       return json({ jobId: "job-ok", projectId: PID });
     }
     return json({ detail: "fixture route not implemented" }, 404);

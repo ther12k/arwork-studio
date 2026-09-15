@@ -375,3 +375,26 @@ describe("removePathAnchor — neighbor merge with guards", () => {
     expect(removePathAnchor(q3, q3.length - 2)).toBeNull();
   });
 });
+
+describe("removePathAnchor — open strokes", () => {
+  test("an open 2-segment stroke merges down to one segment (M anchor kept)", () => {
+    const cmds = parsePathCommands("M 40,40 C 90,10 150,90 200,50 C 230,30 260,60 280,40");
+    expect(cmds[cmds.length - 1].op).not.toBe("Z"); // open
+    const next = removePathAnchor(cmds, 1)!;
+    expect(next).not.toBeNull();
+    expect(next.length).toBe(2); // M + merged C
+    expect(next[1].op).toBe("C");
+    // Outer controls survive: c1 of the first, c2 of the second.
+    expect(next[1].pts[0]).toEqual({ x: 90, y: 10 });
+    expect(next[1].pts[1]).toEqual({ x: 260, y: 60 });
+    expect(next[1].pts[2]).toEqual({ x: 280, y: 40 });
+    // A single-segment stroke (one interior anchor left) is refused.
+    expect(removePathAnchor(next, 1)).toBeNull();
+  });
+
+  test("a closed 2-edge ring still refuses (closed floor stays 3)", () => {
+    const cmds = parsePathCommands("M 0,0 C 10,0 20,10 20,20 C 20,30 10,40 0,40 Z");
+    expect(cmds.filter((c) => c.op !== "M" && c.op !== "Z").length).toBe(2);
+    expect(removePathAnchor(cmds, 1)).toBeNull();
+  });
+});
