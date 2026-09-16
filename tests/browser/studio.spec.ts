@@ -959,3 +959,62 @@ test("Filled shape appearance journey: fill + outline survive reload and Build, 
   await expect(page.locator('input[aria-label="Outline width"]')).toHaveValue("0");
   await expect(fillInput).toHaveValue(/^#e8760c$/i);
 });
+
+// ---------------------------------------------------- Task 40C: shape order
+
+test("Shape layer order journey: Move backward flips the paint order, survives reload, failed job retains revision, Move forward restores", async ({ page }) => {
+  test.setTimeout(150_000);
+  const state: FixtureState = mkState();
+  state.mode = "success";
+  await routeBackend(page, state);
+  await page.goto("/");
+
+  const region = page.locator(`${BOARD} path[data-region-id="r-blue"]`);
+  await expect(region).toBeAttached();
+  // The blob (z 1) paints over the base rect (z 0) at the overlap.
+  await expectPixel(page, 150, 150, isBlue);
+
+  // Pick the blob and move it one layer BACKWARD.
+  await page.getByRole("button", { name: "Edit regions" }).click();
+  await page.getByRole("button", { name: "Art node" }).click();
+  const tap = await artToPage(page, 150, 90);
+  await page.mouse.click(tap.x, tap.y);
+  await expect(page.locator('input[aria-label="Fill color"]')).toHaveValue(/^#3366cc$/i);
+  await page.getByRole("button", { name: "Move backward" }).click();
+
+  const orderPayloads = () => state.editCalls.filter((c) => c.action === "shape_order");
+  await expect.poll(() => orderPayloads().length).toBe(1);
+  expect(orderPayloads()[0]).toMatchObject({
+    action: "shape_order",
+    shape_id: SHAPE,
+    order: "backward",
+    region_ids: [],
+    base_revision: REV1,
+  });
+  // The published revision paints the BASE RECT over the blob at the overlap
+  // (the whole rect is red there) — paint order really flipped.
+  await expectPixel(page, 150, 150, isRed);
+  await expect(region).toBeAttached();
+
+  // Reload: the new order persists (served from the published revision).
+  await page.reload();
+  await expect(region).toBeAttached();
+  await expectPixel(page, 150, 150, isRed);
+
+  // A FAILED move leaves the healthy revision untouched (order unchanged).
+  await page.getByRole("button", { name: "Edit regions" }).click();
+  await page.getByRole("button", { name: "Art node" }).click();
+  const tap2 = await artToPage(page, 150, 90);
+  await page.mouse.click(tap2.x, tap2.y);
+  state.mode = "jobfail";
+  await page.getByRole("button", { name: "Move forward" }).click();
+  await expect(page.locator("[data-sonner-toast]", { hasText: "not a simple ring" })).toBeVisible();
+  await expectPixel(page, 150, 150, isRed);
+
+  // Move forward (success): the blob returns on top of the base rect.
+  state.mode = "success";
+  await page.getByRole("button", { name: "Move forward" }).click();
+  await expect.poll(() => orderPayloads().length).toBe(3); // incl. the failed attempt
+  expect(orderPayloads()[2]).toMatchObject({ shape_id: SHAPE, order: "forward" });
+  await expectPixel(page, 150, 150, isBlue);
+});

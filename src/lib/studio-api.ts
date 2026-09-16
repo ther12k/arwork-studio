@@ -220,7 +220,8 @@ export type EditAction =
   | "draw"
   | "node"
   | "shape"
-  | "shape_style";
+  | "shape_style"
+  | "shape_order";
 
 export type GeometryMode = "curved" | "legacy";
 
@@ -291,6 +292,10 @@ export interface EditPayload {
   stroke_color?: string;
   /** 'shape_style' ink appearance: stroke opacity 0..1 (>= 1 clears it). */
   opacity?: number;
+  /** 'shape_order' (Task 40C): move the shape one document-order layer —
+   *  'forward' toward the viewer, 'backward' behind. Sibling swap in the
+   *  master; crossing an object group is refused server-side. */
+  order?: "forward" | "backward";
 }
 
 export interface SemanticObjectSubdivision {

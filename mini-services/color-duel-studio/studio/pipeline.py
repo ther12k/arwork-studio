@@ -3153,6 +3153,12 @@ def edit_bundle(source: Path, output: Path, request, version: str):
                 f'"{shape_id}" is not a paintable shape in this revision. Ink strokes and filled '
                 'artwork shapes are styled by shape_id; converted raster artwork (rc-*) is not restylable.')
 
+    # Task 40C — shape-level layer order (shape-addressed, full recompile):
+    # move ONE master path one document-order position. Routed like 'shape':
+    # no region selection; the recompile re-derives regions and paint z.
+    if request.action == 'shape_order':
+        return _edit_master_order(source, output, request, version)
+
     regs = {r['id']: r for r in g['regions']}
     chosen_ids = list(dict.fromkeys(request.region_ids))
     if any(rid not in regs for rid in chosen_ids) and request.action != 'draw':
@@ -4005,6 +4011,98 @@ def _style_master_shape_d(master_text: str, shape_id: str, stroke_color: str | N
     if (target.get('fill') or '').lower() != 'none' and not target.get('fill'):
         target.set('fill', 'none')
     return ET.tostring(root, encoding='unicode')
+
+
+def _reorder_master_shape(master_text: str, shape_id: str, direction: str) -> str:
+    """Task 40C — move ONE master path ONE position in document (paint) order
+    by stable id: 'forward' = one layer toward the viewer (later in document
+    order), 'backward' = one layer behind. The move is a SIBLING SWAP inside
+    the shape's own parent: object ownership lives in the enclosing
+    <g data-cd-object> group, so crossing a group boundary would silently
+    RE-PARENT the shape into another object — that move belongs to the whole-
+    object layer controls and is refused with an actionable message. Only
+    positions change; ids and path data are preserved verbatim. Raises
+    ValueError when the shape is absent or already at the parent's edge."""
+    ET.register_namespace('', 'http://www.w3.org/2000/svg')
+    try:
+        root = ET.fromstring(master_text)
+    except Exception as exc:
+        raise ValueError(f'The source master is not well-formed XML: {exc}')
+    target = None
+    for el in root.iter():
+        if _local_svg_tag(el.tag) == 'path' and el.get('id') == shape_id:
+            target = el
+            break
+    if target is None:
+        raise ValueError(
+            f'Shape "{shape_id}" was not found in the source master. Shapes from converted '
+            'raster artwork (rc-*) cannot be reordered; redraw them with the pen instead.')
+    parent_map = {child: par for par in root.iter() for child in par}
+    parent = parent_map[target]
+    siblings = list(parent)
+    idx = siblings.index(target)
+    step = 1 if direction == 'forward' else -1
+    j = idx + step
+    edge = 'front' if direction == 'forward' else 'back'
+    if not 0 <= j < len(siblings):
+        raise ValueError(
+            f'Shape "{shape_id}" is already at the {edge} of its object group. To move it past '
+            'other objects, use the Object Inspector\'s whole-object layer controls.')
+    neighbor = siblings[j]
+    if _local_svg_tag(neighbor.tag) != 'path' or not neighbor.get('id'):
+        raise ValueError(
+            f'Shape "{shape_id}" cannot move {direction} past its object group\'s edge. To move '
+            'it against other objects, use the Object Inspector\'s whole-object layer controls.')
+    children = list(parent)
+    children[idx], children[j] = children[j], children[idx]
+    for child in children:
+        parent.remove(child)
+    for pos, child in enumerate(children):
+        parent.insert(pos, child)
+    return ET.tostring(root, encoding='unicode')
+
+
+def _edit_master_order(source: Path, output: Path, request, version: str) -> dict:
+    """Task 40C — move ONE shape one layer forward/backward and FULLY
+    RECOMPILE (never a paint.z bump: the master is authoritative, so an
+    ordinary Build would revert a z-only edit). The recompile re-derives
+    paint z AND the visible gameplay surfaces from the new drawing order —
+    overlapping pixels change ownership honestly — while shapeIds and object
+    ownership are preserved by the identity contract (sibling swap only, see
+    _reorder_master_shape). Any failure raises before the output revision
+    exists."""
+    bundle = load_bundle(source)
+    shape_id = (request.shape_id or '').strip()
+    if not shape_id:
+        raise ValueError('Select an artwork shape to move (shape_id is required).')
+    if request.order not in ('forward', 'backward'):
+        raise ValueError('Choose a move direction: forward or backward.')
+    master_file = source / 'source-master.svg'
+    if not master_file.is_file():
+        raise ValueError('Layer moves need a vector master; converted raster '
+                         'artwork (rc-*) cannot be reordered.')
+    synced = _sync_source_master(bundle, source)
+    base_text = synced if synced is not None else master_file.read_text(encoding='utf-8')
+    edited_master = _reorder_master_shape(base_text, shape_id, request.order)
+
+    objects = bundle.get('objects') or []
+    result = _recompile_from_master(
+        edited_master, source, output, bundle, objects, version,
+        provenance_extra={
+            'lastEdit': 'shape_order',
+            'shapeOrder': {
+                'shapeId': shape_id,
+                'order': request.order,
+                'note': ('One artwork shape moved one layer ' + request.order +
+                         ' in Artwork Node mode; the revision was recompiled from the reordered '
+                         'master, re-deriving paint order and visible gameplay surfaces. Shape '
+                         'identity and object ownership are preserved.')}})
+    qa = result['validation']
+    qa.setdefault('warnings', []).append(
+        f'Shape "{shape_id}" moved one layer {request.order}; the visible partition was '
+        're-derived from the new drawing order.')
+    write_json(output / 'validation.json', qa)
+    return result
 
 
 def _edit_master_style(source: Path, output: Path, request, version: str) -> dict:

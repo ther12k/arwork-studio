@@ -10,6 +10,8 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
+  ArrowDown,
+  ArrowUp,
   Gauge,
   Maximize2,
   MousePointer2,
@@ -321,6 +323,7 @@ export function CanvasWorkspace() {
     nodeEdit,
     editShape,
     editShapeStyle,
+    editShapeOrder,
     syncProject,
     recordPlaytest,
     freeColor,
@@ -2195,6 +2198,36 @@ export function CanvasWorkspace() {
             onClick={requestArtSave}
           >
             Save path
+          </Button>
+          {/* Task 40C — instant shape-level layer moves on the CURRENT
+              revision (full recompile; never a paint.z bump). Independent of
+              the geometry draft: the draft survives with the usual conflict
+              chips if the reorder publishes first. */}
+          <Button
+            size="sm"
+            variant="outline"
+            className="h-7 rounded-md bg-white px-2.5 text-[10px]"
+            disabled={busy || foreignDraft}
+            title="Move the shape one layer backward (behind its neighbour)"
+            onClick={() =>
+              void editShapeOrder(artPath.context.shapeId, "backward").catch((e: Error) => toast(e.message))
+            }
+          >
+            <ArrowDown className="mr-1 size-3" />
+            Move backward
+          </Button>
+          <Button
+            size="sm"
+            variant="outline"
+            className="h-7 rounded-md bg-white px-2.5 text-[10px]"
+            disabled={busy || foreignDraft}
+            title="Move the shape one layer forward (in front of its neighbour)"
+            onClick={() =>
+              void editShapeOrder(artPath.context.shapeId, "forward").catch((e: Error) => toast(e.message))
+            }
+          >
+            <ArrowUp className="mr-1 size-3" />
+            Move forward
           </Button>
           <Button
             size="sm"

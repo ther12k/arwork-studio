@@ -58,7 +58,7 @@ class PromoteRequest(StrictModel):
 
 class EditRequest(StrictModel):
     base_revision: str
-    action: Literal['merge', 'group', 'palette', 'recolor', 'label', 'decorate', 'split', 'cut', 'draw', 'node', 'shape', 'shape_style']
+    action: Literal['merge', 'group', 'palette', 'recolor', 'label', 'decorate', 'split', 'cut', 'draw', 'node', 'shape', 'shape_style', 'shape_order']
     region_ids: list[str] = Field(max_length=1600,
         description='Validated per action: merge>=2, split/cut/label=1, node=2 (the two regions sharing the dragged boundary), draw/shape_style=0, others>=1.')
     d: str | None = Field(None, pattern=r'^M[\s\d.,eE+\-MLQCZ]+$',
@@ -94,6 +94,14 @@ class EditRequest(StrictModel):
     # its stable internal id. The full recompile re-derives paint + visible
     # gameplay surfaces; shapeId and object ownership are preserved.
     shape_id: str | None = Field(None, min_length=1, max_length=64)
+    # 'shape_order' (Task 40C): move the shape ONE position in the master's
+    # document (paint) order — 'forward' = one layer toward the viewer,
+    # 'backward' = one layer behind. Swaps with the ADJACENT SIBLING path in
+    # the same parent; crossing an object-group boundary is refused (the
+    # Object Inspector's whole-object layer controls own that move). The
+    # revision is fully recompiled from the edited master — never a paint.z
+    # bump — so regions, labels and QA re-derive honestly.
+    order: str | None = Field(None, pattern=r'^(forward|backward)$')
 
 class ReviewRequest(StrictModel):
     revision: str

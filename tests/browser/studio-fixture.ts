@@ -51,18 +51,23 @@ export type FixtureState = {
   revInkStyle: Record<string, { color: string; width: number; opacity?: number }>;
   /** Task 40B: per-revision filled-shape appearance. */
   revShape: Record<string, ShapeStyle>;
+  /** Task 40C: per-revision paint order — true = the blob sits BEHIND the
+   *  red base rect (z swapped). */
+  revBlobBehind: Record<string, boolean>;
   /** Which shape the accepted edit job targeted (paint vs ink routing). */
   pendingShape: string;
   /** Accepted shape_style job's next appearance. */
   pendingStyle: { color: string; width: number; opacity?: number } | null;
   pendingShapeStyle: ShapeStyle | null;
+  /** Accepted shape_order job's next paint order. */
+  pendingOrder: boolean | null;
   job: Record<string, unknown>;
   editCalls: Array<Record<string, unknown>>;
   objectCalls: Array<Record<string, unknown>>;
   buildCalls: Array<Record<string, unknown>>;
   runningGets: number;
   pendingD: string;
-  pendingKind: "edit" | "objects" | "style" | "build" | null;
+  pendingKind: "edit" | "objects" | "style" | "build" | "order" | null;
   /** jobId returned by the POST — the settled project.job must keep THIS id
    *  (the app's settle-watch attributes outcomes by job identity). */
   activeJobId: string;
@@ -77,9 +82,11 @@ export const mkState = (): FixtureState => ({
   revInk: { [REV1]: INK_D },
   revInkStyle: {},
   revShape: { [REV1]: SHAPE0 },
+  revBlobBehind: { [REV1]: false },
   pendingShape: SHAPE,
   pendingStyle: null,
   pendingShapeStyle: null,
+  pendingOrder: null,
   job: { status: "idle" },
   editCalls: [],
   objectCalls: [],
@@ -185,15 +192,17 @@ const paintFor = (
   d: string,
   inkD: string,
   style: { color: string; width: number; opacity?: number },
-  shape: ShapeStyle
+  shape: ShapeStyle,
+  blobBehind: boolean
 ) => ({
   schemaVersion: 2,
   artworkId: ART,
   viewBox: [0, 0, 300, 300],
   paths: [
-    { z: 0, shapeId: "s0001", d: "M 20,20 L 280,20 L 280,280 L 20,280 Z", fill: "#CC3333", fillRule: "evenodd" },
+    // Task 40C: the order flip swaps the z of the base rect and the blob.
+    { z: blobBehind ? 1 : 0, shapeId: "s0001", d: "M 20,20 L 280,20 L 280,280 L 20,280 Z", fill: "#CC3333", fillRule: "evenodd" },
     {
-      z: 1, shapeId: SHAPE, d, fill: shape.fill, fillRule: "evenodd",
+      z: blobBehind ? 0 : 1, shapeId: SHAPE, d, fill: shape.fill, fillRule: "evenodd",
       ...(shape.stroke && shape.strokeWidth
         ? { stroke: shape.stroke, strokeWidth: shape.strokeWidth }
         : {}),
@@ -313,7 +322,8 @@ const project = (state: FixtureState) => ({
 
 /** Publish the next revision. An edit job carries its submitted paint; an
  *  objects job carries the previous artwork unchanged; a BUILD job is the
- *  recompile-from-master equivalent: the artwork carries over unchanged. */
+ *  recompile-from-master equivalent: the artwork carries over unchanged; an
+ *  ORDER job swaps the base rect and the blob in paint order. */
 const publish = (state: FixtureState) => {
   const next = NEXT_REV[state.revision];
   if (!next) throw new Error("fixture revision chain exhausted");
@@ -330,11 +340,15 @@ const publish = (state: FixtureState) => {
   state.revShape[next] = state.pendingKind === "style" && state.pendingShapeStyle
     ? state.pendingShapeStyle
     : state.revShape[state.revision] ?? SHAPE0;
+  state.revBlobBehind[next] = state.pendingKind === "order" && state.pendingOrder != null
+    ? state.pendingOrder
+    : state.revBlobBehind[state.revision] ?? false;
   state.revision = next;
   state.job = {
     id: state.activeJobId,
     kind: state.pendingKind === "edit" ? "shape edit"
       : state.pendingKind === "build" ? "vector compilation"
+      : state.pendingKind === "order" ? "shape reorder"
       : state.pendingKind === "style" ? "ink style" : "object update",
     status: "done",
     progress: 100,
@@ -377,7 +391,7 @@ const fileFor = (state: FixtureState, rev: string, name: string): unknown => {
     case "palette.json":
       return palette;
     case "paint.json":
-      return paintFor(d, inkD, inkStyle, state.revShape[rev] ?? SHAPE0);
+      return paintFor(d, inkD, inkStyle, state.revShape[rev] ?? SHAPE0, state.revBlobBehind[rev] ?? false);
     case "objects.json":
       return objectsFor(rev);
     default:
@@ -460,6 +474,17 @@ export async function routeBackend(page: Page, state: FixtureState) {
       }
       state.activeJobId = "job-ok";
       state.runningGets = 0;
+      if (body.action === "shape_order") {
+        // Task 40C: one-layer paint-order move — swap the blob and the base
+        // rect in the published paint.
+        state.pendingOrder = body.order === "backward";
+        state.pendingKind = "order";
+        state.pendingD = null;
+        state.pendingShapeStyle = null;
+        state.pendingStyle = null;
+        state.job = { id: "job-ok", kind: "shape reorder", status: "running", progress: 10 };
+        return json({ jobId: "job-ok", projectId: PID });
+      }
       if (body.action === "shape_style" && String(body.shape_id) === SHAPE) {
         // Task 40B: filled target — fill + outline with the backend's
         // deletion semantics (width 0 removes the outline entirely).

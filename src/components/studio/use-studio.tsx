@@ -151,6 +151,9 @@ export interface StudioApi {
       base_revision?: string;
     }
   ) => Promise<{ jobId: string }>;
+  /** Task 40C: move one shape one layer forward/backward (full recompile;
+   *  shape-addressed, never touches the gameplay region selection). */
+  editShapeOrder: (shapeId: string, order: "forward" | "backward") => Promise<{ jobId: string }>;
   /** One poll pass on demand (edit-route 409 recovery): refreshes the
    *  project snapshot so an externally advanced revision becomes visible. */
   syncProject: () => Promise<void>;
@@ -1016,10 +1019,16 @@ export function StudioProvider({ children }: { children: React.ReactNode }) {
       if (isBusyProject(p)) throw new Error("Wait for the current job.");
       if (!p.currentRevision) throw new Error("Build the vector regions first.");
       // Cut/draw supply their own region ids (the target region / none);
-      // 'shape'/'shape_style' are keyed by shape_id and never touch region
-      // selection; everything else uses the current selection.
+      // 'shape'/'shape_style'/'shape_order' are keyed by shape_id and never
+      // touch region selection; everything else uses the current selection.
       const ids = regionIds ?? [...selectedRef.current];
-      if (!ids.length && action !== "draw" && action !== "shape" && action !== "shape_style")
+      if (
+        !ids.length &&
+        action !== "draw" &&
+        action !== "shape" &&
+        action !== "shape_style" &&
+        action !== "shape_order"
+      )
         throw new Error("Select at least one region in Edit regions.");
       const body: EditPayload = {
         base_revision: p.currentRevision,
@@ -1407,6 +1416,14 @@ export function StudioProvider({ children }: { children: React.ReactNode }) {
     },
     [runEdit]
   );
+  /** Task 40C — move one shape one layer forward/backward (shape-addressed;
+   *  instant action on the CURRENT revision — a concurrent publish surfaces
+   *  as the usual 409 toast, never a silent rebase). */
+  const editShapeOrder = useCallback(
+    (shapeId: string, order: "forward" | "backward") =>
+      runEdit("shape_order", { shape_id: shapeId, region_ids: [], order }, []),
+    [runEdit]
+  );
   /** Apply a custom free-mode color (contract §4) and remember it in the
    *  recent list (capped at 10, persisted in localStorage OUTSIDE the board). */
   const setBoardFreeColor = useCallback((hex: string) => {
@@ -1661,6 +1678,7 @@ export function StudioProvider({ children }: { children: React.ReactNode }) {
     nodeEdit,
     editShape,
     editShapeStyle,
+    editShapeOrder,
     syncProject,
     freeColor,
     setBoardFreeColor,

@@ -747,3 +747,155 @@ def test_filled_style_edit(client):
     p = wait(client, pid)
     assert p['job']['status'] == 'failed', p['job']
     assert 'no region selection' in p['job'].get('message', '')
+
+
+# ---------------------------------------------------------- Task 40C: shape order
+
+ORDER_SVG = b'''<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 300 300">
+<g data-cd-object="obj-back" data-cd-name="Back">
+  <path d="M 40,40 L 200,40 L 200,200 L 40,200 Z" fill="#AA3377"/>
+</g>
+<g data-cd-object="obj-front" data-cd-name="Front">
+  <path d="M 120,120 L 260,120 L 260,260 L 120,260 Z" fill="#33AA77"/>
+  <path d="M 150,60 C 200,20 290,60 290,140 C 290,220 240,260 170,250 C 120,240 110,180 130,150 C 140,130 145,80 150,60 Z" fill="#3333AA"/>
+</g>
+</svg>'''
+
+PROBE_STACK = (230, 200)  # inside the green rect AND the blue blob (not the purple rect)
+
+
+def test_shape_order_edit(client):
+    """Task 40C — shape-level layer order, one document-order position per
+    move, FULL RECOMPILE (never a paint.z bump): the visible partition
+    re-derives honestly (overlapping pixels change ownership), shapeIds and
+    object ownership are preserved, group-edge moves are refused with
+    guidance toward the whole-object controls, and an ordinary Build
+    preserves the new order. Ink strokes reorder the same way."""
+    pid = new(client)
+    r = client.post(f'/api/projects/{pid}/upload-svg', headers=H,
+                    files={'file': ('order.svg', ORDER_SVG, 'image/svg+xml')},
+                    data={'rights_confirmed': 'true'})
+    assert r.status_code == 200, r.text
+    r = client.post(f'/api/projects/{pid}/build', headers=H, json=BUILD_BODY)
+    assert r.status_code == 200, r.text
+    rev = wait(client, pid)['currentRevision']
+    d0 = files(client, pid, rev)
+    assert_qa(d0, 'import+build')
+    objs = {o['id']: o for o in d0['objects']}
+    back = next(s for s in objs['obj-back']['shapeIds'])
+    green = next(s for s in objs['obj-front']['shapeIds']
+                 if any(e.get('fill') == '#33AA77' and e.get('shapeId') == s
+                        for e in d0['paint']['paths']))
+    blue = next(s for s in objs['obj-front']['shapeIds'] if s != green)
+    z0 = {e['shapeId']: e['z'] for e in d0['paint']['paths']}
+    assert z0[back] < z0[green] < z0[blue], 'document order must be back < green < blue'
+    # the blob (blue, last in its group) owns the overlapping probe pixel
+    hits0 = owning_regions(d0['regions'], *PROBE_STACK)
+    assert [h['masterShapeId'] for h in hits0] == [blue], \
+        f'probe must be owned by the top shape, got {[h["masterShapeId"] for h in hits0]}'
+
+    # blue backward: now BEHIND green in the same group — the recompile
+    # re-derives the partition so green owns the overlap.
+    rev2 = step(client, pid, rev, {
+        'base_revision': rev, 'action': 'shape_order', 'region_ids': [],
+        'shape_id': blue, 'order': 'backward'})
+    d2 = files(client, pid, rev2)
+    assert_qa(d2, 'shape order backward')
+    z2 = {e['shapeId']: e['z'] for e in d2['paint']['paths']}
+    assert z2[blue] < z2[green], 'backward must swap the sibling order'
+    assert z2[back] == z0[back]
+    hits2 = owning_regions(d2['regions'], *PROBE_STACK)
+    assert [h['masterShapeId'] for h in hits2] == [green], \
+        'the overlap ownership must follow the new paint order'
+    # ownership gate: shapeIds per object are IDENTICAL (a sibling swap can
+    # never re-parent a shape into another object).
+    assert d2['objects'] == d0['objects']
+    region_owner = {r_['masterShapeId']: r_['objectId'] for r_ in d2['regions'] if r_.get('masterShapeId')}
+    assert region_owner.get(green) == 'obj-front' and region_owner.get(back) == 'obj-back'
+    # the blue blob keeps a visible crescent (partial overlap) — still playable
+    assert any(r_.get('masterShapeId') == blue for r_ in d2['regions']), \
+        'a partially covered shape must keep its visible surface'
+
+    # edge refusal: blue is now FIRST in its group — another backward is
+    # refused with guidance toward the whole-object controls.
+    r = client.post(f'/api/projects/{pid}/edit', headers=H, json={
+        'base_revision': rev2, 'action': 'shape_order', 'region_ids': [],
+        'shape_id': blue, 'order': 'backward'})
+    assert r.status_code == 200, r.text
+    p = wait(client, pid)
+    assert p['job']['status'] == 'failed', p['job']
+    assert 'already at the back of its object group' in p['job'].get('message', '')
+
+    # an ordinary Build from the reordered revision preserves the new order.
+    r = client.post(f'/api/projects/{pid}/build', headers=H, json=BUILD_BODY)
+    assert r.status_code == 200, r.text
+    p = wait(client, pid)
+    assert p['job']['status'] == 'done', p['job']
+    d3 = files(client, pid, p['currentRevision'])
+    assert_qa(d3, 'build after reorder')
+    z3 = {e['shapeId']: e['z'] for e in d3['paint']['paths']}
+    assert z3[blue] < z3[green], 'the reordered master is authoritative — Build must not revert'
+    hits3 = owning_regions(d3['regions'], *PROBE_STACK)
+    assert [h['masterShapeId'] for h in hits3] == [green]
+
+    # blue forward: back to the original stack.
+    rev4 = step(client, pid, p['currentRevision'], {
+        'base_revision': p['currentRevision'], 'action': 'shape_order', 'region_ids': [],
+        'shape_id': blue, 'order': 'forward'})
+    d4 = files(client, pid, rev4)
+    z4 = {e['shapeId']: e['z'] for e in d4['paint']['paths']}
+    assert z4[blue] > z4[green]
+    hits4 = owning_regions(d4['regions'], *PROBE_STACK)
+    assert [h['masterShapeId'] for h in hits4] == [blue]
+
+    # ---- ink strokes reorder the same way (root-level siblings) ----------
+    pid2 = new(client)
+    r = client.post(f'/api/projects/{pid2}/upload-svg', headers=H,
+                    files={'file': ('ink.svg', INK_SVG, 'image/svg+xml')},
+                    data={'rights_confirmed': 'true'})
+    assert r.status_code == 200, r.text
+    r = client.post(f'/api/projects/{pid2}/build', headers=H, json=BUILD_BODY)
+    assert r.status_code == 200, r.text
+    rev_i = wait(client, pid2)['currentRevision']
+    di0 = files(client, pid2, rev_i)
+    squiggle = next(p_['shapeId'] for p_ in di0['paint']['inkPaths'] if p_['d'].startswith('M 40,40'))
+    closed = next(p_['shapeId'] for p_ in di0['paint']['inkPaths'] if p_['d'].rstrip().upper().endswith('Z'))
+    zi0 = {p_['shapeId']: p_['z'] for p_ in di0['paint']['inkPaths']}
+    assert zi0[closed] > zi0[squiggle]
+    # the squiggle's backward neighbor is the obj-plain GROUP: refused.
+    r = client.post(f'/api/projects/{pid2}/edit', headers=H, json={
+        'base_revision': rev_i, 'action': 'shape_order', 'region_ids': [],
+        'shape_id': squiggle, 'order': 'backward'})
+    assert r.status_code == 200, r.text
+    p = wait(client, pid2)
+    assert p['job']['status'] == 'failed', p['job']
+    assert 'object group' in p['job'].get('message', '')
+    # the closed ink outline swaps with the squiggle.
+    rev_i2 = step(client, pid2, rev_i, {
+        'base_revision': rev_i, 'action': 'shape_order', 'region_ids': [],
+        'shape_id': closed, 'order': 'backward'})
+    di2 = files(client, pid2, rev_i2)
+    zi2 = {p_['shapeId']: p_['z'] for p_ in di2['paint']['inkPaths']}
+    assert zi2[closed] < zi2[squiggle], 'ink strokes must reorder among themselves'
+    rev_i3 = step(client, pid2, rev_i2, {
+        'base_revision': rev_i2, 'action': 'shape_order', 'region_ids': [],
+        'shape_id': closed, 'order': 'forward'})
+    di3 = files(client, pid2, rev_i3)
+    zi3 = {p_['shapeId']: p_['z'] for p_ in di3['paint']['inkPaths']}
+    assert zi3[closed] > zi3[squiggle], 'forward must restore the original stack'
+
+    # guardrails: missing shape and missing direction fail cleanly.
+    r = client.post(f'/api/projects/{pid2}/edit', headers=H, json={
+        'base_revision': rev_i3, 'action': 'shape_order', 'region_ids': [],
+        'shape_id': 's9999', 'order': 'forward'})
+    assert r.status_code == 200, r.text
+    p = wait(client, pid2)
+    assert p['job']['status'] == 'failed', p['job']
+    assert 'not found in the source master' in p['job'].get('message', '')
+    r = client.post(f'/api/projects/{pid2}/edit', headers=H, json={
+        'base_revision': p['currentRevision'], 'action': 'shape_order',
+        'region_ids': [], 'shape_id': closed})
+    assert r.status_code == 200, r.text  # optional field: the JOB fails
+    p = wait(client, pid2)
+    assert p['job']['status'] == 'failed', p['job']
+    assert 'Choose a move direction' in p['job'].get('message', '')
