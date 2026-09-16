@@ -324,6 +324,8 @@ export function CanvasWorkspace() {
     editShape,
     editShapeStyle,
     editShapeOrder,
+    gatedShapeOrder,
+    dismissGatedShapeOrder,
     syncProject,
     recordPlaytest,
     freeColor,
@@ -680,6 +682,23 @@ export function CanvasWorkspace() {
   const [artHistory, setArtHistory] = useState<ArtDraftHistory | null>(null);
   const artDragBeforeSnapshotRef = useRef<ArtDraftSnapshot | null>(null);
   const draftGenerationRef = useRef<number>(0);
+
+  // ----- Task 40C review: topology-rebuild confirmation flow -----
+  /** A shape-order move the backend REJECTED because the revision carries
+   *  manual gameplay topology (cuts, boundary drags, custom labels). The
+   *  hook's poll loop routes the gate refusal here; this dialog collects the
+   *  artist's explicit consent and re-sends the move WITH the flag — the
+   *  backend owns the gate, the UI never bypasses it. */
+  const moveShapeOrder = (order: "forward" | "backward") => {
+    if (!artPath) return;
+    void editShapeOrder(artPath.context.shapeId, order).catch((e: Error) => toast(e.message));
+  };
+  const confirmGatedOrder = () => {
+    const req = gatedShapeOrder;
+    dismissGatedShapeOrder();
+    if (!req) return;
+    void editShapeOrder(req.shapeId, req.order, true).catch((e: Error) => toast(e.message));
+  };
 
   /** True when the project moved past the revision the draft was loaded
    *  from — another operation published while the artist was editing. */
@@ -2200,18 +2219,18 @@ export function CanvasWorkspace() {
             Save path
           </Button>
           {/* Task 40C — instant shape-level layer moves on the CURRENT
-              revision (full recompile; never a paint.z bump). Independent of
-              the geometry draft: the draft survives with the usual conflict
-              chips if the reorder publishes first. */}
+              revision (full recompile for filled shapes, ink fast path
+              without one; never a paint.z bump). Independent of the geometry
+              draft: the draft survives with the usual conflict chips if the
+              reorder publishes first. A filled move over manual gameplay
+              topology fails server-side until confirmed — the dialog below. */}
           <Button
             size="sm"
             variant="outline"
             className="h-7 rounded-md bg-white px-2.5 text-[10px]"
             disabled={busy || foreignDraft}
             title="Move the shape one layer backward (behind its neighbour)"
-            onClick={() =>
-              void editShapeOrder(artPath.context.shapeId, "backward").catch((e: Error) => toast(e.message))
-            }
+            onClick={() => moveShapeOrder("backward")}
           >
             <ArrowDown className="mr-1 size-3" />
             Move backward
@@ -2222,9 +2241,7 @@ export function CanvasWorkspace() {
             className="h-7 rounded-md bg-white px-2.5 text-[10px]"
             disabled={busy || foreignDraft}
             title="Move the shape one layer forward (in front of its neighbour)"
-            onClick={() =>
-              void editShapeOrder(artPath.context.shapeId, "forward").catch((e: Error) => toast(e.message))
-            }
+            onClick={() => moveShapeOrder("forward")}
           >
             <ArrowUp className="mr-1 size-3" />
             Move forward
@@ -2630,6 +2647,35 @@ export function CanvasWorkspace() {
             >
               <PenTool className="size-3.5" aria-hidden />
               Save against {project?.currentRevision}
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+
+      {/* Task 40C review — topology-rebuild confirmation (backend-gated): a
+          FILLED shape move recompiles the revision and may reset manual
+          gameplay authoring; the artist must opt in explicitly. */}
+      <AlertDialog open={!!gatedShapeOrder} onOpenChange={(o) => !o && dismissGatedShapeOrder()}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle className="text-left text-sm text-[#183837]">
+              Rebuild gameplay surfaces?
+            </AlertDialogTitle>
+            <AlertDialogDescription className="text-left text-[11px] leading-relaxed text-[#657671]">
+              This will rebuild gameplay surfaces; manual cuts/boundaries/label positions may be
+              reset. The previous revision stays available in the revision history.
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter className="gap-2 sm:justify-end">
+            <AlertDialogCancel className="h-9 rounded-md border-[#e1e5df] bg-white text-[10px]">
+              Cancel
+            </AlertDialogCancel>
+            <AlertDialogAction
+              className="h-9 rounded-md bg-[#087f74] text-[10px] font-semibold text-white hover:bg-[#056c62]"
+              disabled={busy}
+              onClick={confirmGatedOrder}
+            >
+              Rebuild &amp; move
             </AlertDialogAction>
           </AlertDialogFooter>
         </AlertDialogContent>

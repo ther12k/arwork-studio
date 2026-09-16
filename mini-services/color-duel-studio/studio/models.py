@@ -102,6 +102,15 @@ class EditRequest(StrictModel):
     # revision is fully recompiled from the edited master — never a paint.z
     # bump — so regions, labels and QA re-derive honestly.
     order: str | None = Field(None, pattern=r'^(forward|backward)$')
+    # 'shape_order' safety gate (Task 40C review): a filled-shape move FULLY
+    # RECOMPILES the revision, which rebuilds the visible gameplay surfaces —
+    # manual cuts / boundary drags / custom label positions may be reset.
+    # When the current revision carries manual gameplay topology (tracked in
+    # manifest.provenance.manualTopology, plus a region-id prefix scan), the
+    # move is REJECTED until the client sends this explicit confirmation —
+    # the UI dialog is a convenience, never the only guard. Ink strokes take
+    # the topology-neutral fast path and never need it.
+    confirm_topology_rebuild: bool = False
 
 class ReviewRequest(StrictModel):
     revision: str

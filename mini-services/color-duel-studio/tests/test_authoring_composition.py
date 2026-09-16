@@ -848,7 +848,60 @@ def test_shape_order_edit(client):
     hits4 = owning_regions(d4['regions'], *PROBE_STACK)
     assert [h['masterShapeId'] for h in hits4] == [blue]
 
-    # ---- ink strokes reorder the same way (root-level siblings) ----------
+    # ---- reviewer's regression chain 1: manual gameplay topology gate -----
+    # Cut a region by hand, then give it a custom label: the revision now
+    # carries manual gameplay topology (provenance flag).
+    back_regions = [r_ for r_ in d4['regions'] if r_.get('masterShapeId') == back]
+    assert back_regions
+    rev5 = step(client, pid, rev4, {
+        'base_revision': rev4, 'action': 'cut', 'region_ids': [back_regions[0]['id']],
+        'd': 'M 40,80 L 200,80'})
+    d5 = files(client, pid, rev5)
+    cut_region_ids = [r_['id'] for r_ in d5['regions'] if r_['id'].startswith('r-c-')]
+    assert cut_region_ids
+    assert d5['manifest']['provenance'].get('manualTopology') is True
+    lower = next(r_ for r_ in d5['regions'] if owning_regions([r_], 100, 140))
+    rev6 = step(client, pid, rev5, {
+        'base_revision': rev5, 'action': 'label', 'region_ids': [lower['id']],
+        'x': 100.0, 'y': 140.0})
+    d6 = files(client, pid, rev6)
+    assert d6['manifest']['provenance'].get('manualTopology') is True, \
+        'a custom label keeps the manual topology flag'
+
+    # A filled move REBUILDS the gameplay surfaces → rejected until the
+    # explicit confirmation flag is sent (the UI dialog is never the only
+    # guard), and the healthy revision is untouched.
+    r = client.post(f'/api/projects/{pid}/edit', headers=H, json={
+        'base_revision': rev6, 'action': 'shape_order', 'region_ids': [],
+        'shape_id': blue, 'order': 'backward'})
+    assert r.status_code == 200, r.text
+    p = wait(client, pid)
+    assert p['job']['status'] == 'failed', p['job']
+    assert 'rebuilds the gameplay surfaces' in p['job'].get('message', '')
+    assert p['currentRevision'] == rev6
+
+    # The confirmed move publishes: the rebuild resets the manual topology
+    # (the cut halves and the custom label are re-derived away), and the
+    # PREVIOUS revision remains fully available in history.
+    rev7 = step(client, pid, rev6, {
+        'base_revision': rev6, 'action': 'shape_order', 'region_ids': [],
+        'shape_id': blue, 'order': 'backward', 'confirm_topology_rebuild': True})
+    d7 = files(client, pid, rev7)
+    assert_qa(d7, 'confirmed topology rebuild')
+    assert not [r_ for r_ in d7['regions'] if r_['id'].startswith('r-c-')], \
+        'the confirmed rebuild re-derives the partition (manual cut halves gone)'
+    assert not d7['manifest']['provenance'].get('manualTopology')
+    assert any('previous revision remains available' in w for w in d7['qa'].get('warnings', []))
+    d6_again = files(client, pid, rev6)
+    assert [r_['id'] for r_ in d6_again['regions'] if r_['id'].startswith('r-c-')] == cut_region_ids, \
+        'the pre-move revision must remain available with its manual topology'
+    assert d7['manifest']['provenance']['shapeOrder']['topologyRebuilt'] is True
+
+    # ---- ink fast path: NO recompile, gameplay bytes identical -----------
+    # (Task 40C review) The squiggle's backward neighbor is the obj-plain
+    # GROUP — a filled-shape move would be refused there, but an ink stroke
+    # takes the topology-neutral fast path: root-level element move, z
+    # re-ranked, gameplay untouched, no confirmation gate.
     pid2 = new(client)
     r = client.post(f'/api/projects/{pid2}/upload-svg', headers=H,
                     files={'file': ('ink.svg', INK_SVG, 'image/svg+xml')},
@@ -862,31 +915,72 @@ def test_shape_order_edit(client):
     closed = next(p_['shapeId'] for p_ in di0['paint']['inkPaths'] if p_['d'].rstrip().upper().endswith('Z'))
     zi0 = {p_['shapeId']: p_['z'] for p_ in di0['paint']['inkPaths']}
     assert zi0[closed] > zi0[squiggle]
-    # the squiggle's backward neighbor is the obj-plain GROUP: refused.
-    r = client.post(f'/api/projects/{pid2}/edit', headers=H, json={
-        'base_revision': rev_i, 'action': 'shape_order', 'region_ids': [],
+
+    # reviewer's regression chain 2: Build → CUT region → move INK stroke →
+    # regions.json identical, the manual cut still exists.
+    objs_i = {o['id']: o for o in di0['objects']}
+    plain_shape = objs_i['obj-plain']['shapeIds'][0]
+    blob_shape_i = objs_i['obj-blob']['shapeIds'][0]
+    plain_regions = sorted(r_['id'] for r_ in di0['regions'] if r_.get('masterShapeId') == plain_shape)
+    rev_i1 = step(client, pid2, rev_i, {
+        'base_revision': rev_i, 'action': 'cut', 'region_ids': [plain_regions[0]],
+        'd': 'M 150,230 L 150,290'})
+    di1 = files(client, pid2, rev_i1)
+    cut_ids = [r_['id'] for r_ in di1['regions'] if r_['id'].startswith('r-c-')]
+    assert cut_ids, 'the cut must create r-c-* regions'
+    assert di1['manifest']['provenance'].get('manualTopology') is True, \
+        'manual gameplay topology must be tracked in provenance'
+
+    rev_i2 = step(client, pid2, rev_i1, {
+        'base_revision': rev_i1, 'action': 'shape_order', 'region_ids': [],
         'shape_id': squiggle, 'order': 'backward'})
-    assert r.status_code == 200, r.text
-    p = wait(client, pid2)
-    assert p['job']['status'] == 'failed', p['job']
-    assert 'object group' in p['job'].get('message', '')
-    # the closed ink outline swaps with the squiggle.
-    rev_i2 = step(client, pid2, rev_i, {
-        'base_revision': rev_i, 'action': 'shape_order', 'region_ids': [],
-        'shape_id': closed, 'order': 'backward'})
     di2 = files(client, pid2, rev_i2)
+    # the fast-path invariants: gameplay carried over byte-identical.
+    assert json.dumps(sorted(di2['regions'], key=lambda r_: r_['id']), sort_keys=True) == \
+        json.dumps(sorted(di1['regions'], key=lambda r_: r_['id']), sort_keys=True), \
+        'ink moves must not touch regions.json'
+    assert di2['palette'] == di1['palette']
+    assert di2['objects'] == di1['objects']
+    assert [r_['id'] for r_ in di2['regions'] if r_['id'].startswith('r-c-')] == cut_ids, \
+        'the manual cut must survive the ink move'
+    assert di2['manifest']['provenance'].get('manualTopology') is True, \
+        'the ink move keeps the manual topology (regions are untouched)'
+    # the squiggle moved behind the obj-plain group's fill (root position
+    # before the group): above the blob fill, below the plain fill, and the
+    # closed outline stays topmost among ink strokes.
     zi2 = {p_['shapeId']: p_['z'] for p_ in di2['paint']['inkPaths']}
-    assert zi2[closed] < zi2[squiggle], 'ink strokes must reorder among themselves'
+    zfills2 = {p_['shapeId']: p_['z'] for p_ in di2['paint']['paths']}
+    assert zfills2[blob_shape_i] < zi2[squiggle] < zfills2[plain_shape], \
+        'the stroke must sit between the two fills after the group-crossing move'
+    assert zi2[closed] > zi2[squiggle]
+    # the master carries the new root order (squiggle before the obj-plain group)
+    assert di2['master'].index(f'id="{squiggle}"') < di2['master'].index('data-cd-object="obj-plain"')
+
+    # closed backward moves one ROOT position: in front of the g-plain group
+    # (its backward neighbor), i.e. behind the plain fill but still above the
+    # squiggle. Forward restores the original stack.
     rev_i3 = step(client, pid2, rev_i2, {
         'base_revision': rev_i2, 'action': 'shape_order', 'region_ids': [],
-        'shape_id': closed, 'order': 'forward'})
+        'shape_id': closed, 'order': 'backward'})
     di3 = files(client, pid2, rev_i3)
     zi3 = {p_['shapeId']: p_['z'] for p_ in di3['paint']['inkPaths']}
-    assert zi3[closed] > zi3[squiggle], 'forward must restore the original stack'
+    zfills3 = {p_['shapeId']: p_['z'] for p_ in di3['paint']['paths']}
+    assert zi3[squiggle] < zi3[closed] < zfills3[plain_shape], \
+        'one root position = behind the neighbour group, still above the squiggle'
+    rev_i4 = step(client, pid2, rev_i3, {
+        'base_revision': rev_i3, 'action': 'shape_order', 'region_ids': [],
+        'shape_id': closed, 'order': 'forward'})
+    di4 = files(client, pid2, rev_i4)
+    zi4 = {p_['shapeId']: p_['z'] for p_ in di4['paint']['inkPaths']}
+    zfills4 = {p_['shapeId']: p_['z'] for p_ in di4['paint']['paths']}
+    assert zi4[closed] > zi4[squiggle] and zi4[closed] > zfills4[plain_shape], \
+        'forward must restore the original stack'
+    assert json.dumps(sorted(di4['regions'], key=lambda r_: r_['id']), sort_keys=True) == \
+        json.dumps(sorted(di1['regions'], key=lambda r_: r_['id']), sort_keys=True)
 
     # guardrails: missing shape and missing direction fail cleanly.
     r = client.post(f'/api/projects/{pid2}/edit', headers=H, json={
-        'base_revision': rev_i3, 'action': 'shape_order', 'region_ids': [],
+        'base_revision': rev_i4, 'action': 'shape_order', 'region_ids': [],
         'shape_id': 's9999', 'order': 'forward'})
     assert r.status_code == 200, r.text
     p = wait(client, pid2)

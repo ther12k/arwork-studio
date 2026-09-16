@@ -1001,7 +1001,33 @@ test("Shape layer order journey: Move backward flips the paint order, survives r
   await expect(region).toBeAttached();
   await expectPixel(page, 150, 150, isRed);
 
-  // A FAILED move leaves the healthy revision untouched (order unchanged).
+  // Task 40C review — the backend's manual-topology gate: a refused shape
+  // order opens the EXPLICIT confirmation dialog (never a silent rebuild,
+  // never just a toast); confirming re-sends the move WITH the flag.
+  await page.getByRole("button", { name: "Edit regions" }).click();
+  await page.getByRole("button", { name: "Art node" }).click();
+  const tapGate = await artToPage(page, 150, 90);
+  await page.mouse.click(tapGate.x, tapGate.y);
+  await expect(page.locator('input[aria-label="Fill color"]')).toHaveValue(/^#3366cc$/i);
+  state.mode = "topologyfail";
+  await page.getByRole("button", { name: "Move backward" }).click();
+  await expect(page.getByText("Rebuild gameplay surfaces?")).toBeVisible({ timeout: 20_000 });
+  await expect(page.getByText(/manual cuts\/boundaries\/label positions may be reset/)).toBeVisible();
+  const gated = orderPayloads()[1];
+  expect(gated).toMatchObject({ shape_id: SHAPE, order: "backward" });
+  expect(gated).not.toHaveProperty("confirm_topology_rebuild");
+  state.mode = "success";
+  await page.getByRole("button", { name: "Rebuild & move" }).click();
+  await expect.poll(() => orderPayloads().length).toBe(3);
+  expect(orderPayloads()[2]).toMatchObject({
+    shape_id: SHAPE,
+    order: "backward",
+    confirm_topology_rebuild: true,
+  });
+  await expectPixel(page, 150, 150, isRed); // backward again: base rect on top
+
+  // A FAILED move (unrelated compile error) leaves the healthy revision
+  // untouched (order unchanged) and raises only a toast — no dialog.
   await page.getByRole("button", { name: "Edit regions" }).click();
   await page.getByRole("button", { name: "Art node" }).click();
   const tap2 = await artToPage(page, 150, 90);
@@ -1014,7 +1040,7 @@ test("Shape layer order journey: Move backward flips the paint order, survives r
   // Move forward (success): the blob returns on top of the base rect.
   state.mode = "success";
   await page.getByRole("button", { name: "Move forward" }).click();
-  await expect.poll(() => orderPayloads().length).toBe(3); // incl. the failed attempt
-  expect(orderPayloads()[2]).toMatchObject({ shape_id: SHAPE, order: "forward" });
+  await expect.poll(() => orderPayloads().length).toBe(5); // incl. both failed attempts
+  expect(orderPayloads()[4]).toMatchObject({ shape_id: SHAPE, order: "forward" });
   await expectPixel(page, 150, 150, isBlue);
 });

@@ -151,9 +151,20 @@ export interface StudioApi {
       base_revision?: string;
     }
   ) => Promise<{ jobId: string }>;
-  /** Task 40C: move one shape one layer forward/backward (full recompile;
-   *  shape-addressed, never touches the gameplay region selection). */
-  editShapeOrder: (shapeId: string, order: "forward" | "backward") => Promise<{ jobId: string }>;
+  /** Task 40C: move one shape one layer forward/backward (full recompile for
+   *  filled shapes; ink takes the topology-neutral fast path). A filled move
+   *  over manual gameplay topology fails until confirmTopologyRebuild is
+   *  sent — the dialog flow retries with it. */
+  editShapeOrder: (
+    shapeId: string,
+    order: "forward" | "backward",
+    confirmTopologyRebuild?: boolean
+  ) => Promise<{ jobId: string }>;
+  /** Task 40C review: a shape-order move the backend refused via the
+   *  manual-topology gate — the canvas renders the explicit confirmation
+   *  dialog for it; Cancel/retry clears it. */
+  gatedShapeOrder: { shapeId: string; order: "forward" | "backward" } | null;
+  dismissGatedShapeOrder: () => void;
   /** One poll pass on demand (edit-route 409 recovery): refreshes the
    *  project snapshot so an externally advanced revision becomes visible. */
   syncProject: () => Promise<void>;
@@ -409,6 +420,11 @@ export function StudioProvider({ children }: { children: React.ReactNode }) {
      *  unrelated job that finished while the operation was unresolved. */
     jobId?: string };
   const pendingOpRef = useRef<PendingOp | null>(null);
+  /** Task 40C review: the in-flight shape-order attempt, matched against the
+   *  job-failure message in the poll loop — a manual-topology gate refusal
+   *  routes to the confirmation dialog instead of an error toast. */
+  const shapeOrderAttemptRef = useRef<{ shapeId: string; order: "forward" | "backward" } | null>(null);
+  const [gatedShapeOrder, setGatedShapeOrder] = useState<{ shapeId: string; order: "forward" | "backward" } | null>(null);
   const pendingCommitRef = useRef<{ sessionId: string; key: string } | null>(null);
 
   // Stable callback (only ever invoked from event handlers / effects): it
@@ -757,7 +773,19 @@ export function StudioProvider({ children }: { children: React.ReactNode }) {
           // until that job settles, even though THIS project is idle.
           pollTimerRef.current = setTimeout(() => void pollRef.current(pid), 2500);
         } else if (next.job?.status === "failed") {
-          toast(next.job.message || "Job failed");
+          // Task 40C review: a shape-order move refused by the manual-topology
+          // gate is not an error toast — it opens the explicit confirmation
+          // dialog (the backend owns the gate; this only routes the refusal).
+          const msg = next.job.message || "Job failed";
+          const attempt = shapeOrderAttemptRef.current;
+          shapeOrderAttemptRef.current = null;
+          if (attempt && msg.includes("rebuilds the gameplay surfaces")) {
+            setGatedShapeOrder(attempt);
+          } else {
+            toast(msg);
+          }
+        } else {
+          shapeOrderAttemptRef.current = null;
         }
       } catch (e) {
         toast(`Job polling stopped: ${(e as Error).message}`);
@@ -1418,12 +1446,27 @@ export function StudioProvider({ children }: { children: React.ReactNode }) {
   );
   /** Task 40C — move one shape one layer forward/backward (shape-addressed;
    *  instant action on the CURRENT revision — a concurrent publish surfaces
-   *  as the usual 409 toast, never a silent rebase). */
+   *  as the usual 409 toast, never a silent rebase). confirmTopologyRebuild
+   *  answers the backend's manual-topology gate for filled shapes. */
   const editShapeOrder = useCallback(
-    (shapeId: string, order: "forward" | "backward") =>
-      runEdit("shape_order", { shape_id: shapeId, region_ids: [], order }, []),
+    (shapeId: string, order: "forward" | "backward", confirmTopologyRebuild?: boolean) => {
+      shapeOrderAttemptRef.current = { shapeId, order };
+      return runEdit(
+        "shape_order",
+        {
+          shape_id: shapeId,
+          region_ids: [],
+          order,
+          ...(confirmTopologyRebuild ? { confirm_topology_rebuild: true } : {}),
+        },
+        []
+      );
+    },
     [runEdit]
   );
+  /** Clear the manual-topology confirmation dialog (Cancel or after the
+   *  confirmed retry is submitted). */
+  const dismissGatedShapeOrder = useCallback(() => setGatedShapeOrder(null), []);
   /** Apply a custom free-mode color (contract §4) and remember it in the
    *  recent list (capped at 10, persisted in localStorage OUTSIDE the board). */
   const setBoardFreeColor = useCallback((hex: string) => {
@@ -1679,6 +1722,8 @@ export function StudioProvider({ children }: { children: React.ReactNode }) {
     editShape,
     editShapeStyle,
     editShapeOrder,
+    gatedShapeOrder,
+    dismissGatedShapeOrder,
     syncProject,
     freeColor,
     setBoardFreeColor,

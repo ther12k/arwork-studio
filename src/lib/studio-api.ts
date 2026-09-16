@@ -296,6 +296,11 @@ export interface EditPayload {
    *  'forward' toward the viewer, 'backward' behind. Sibling swap in the
    *  master; crossing an object group is refused server-side. */
   order?: "forward" | "backward";
+  /** 'shape_order' on a filled shape with manual gameplay topology (cuts,
+   *  boundary drags, custom labels): the move REBUILDS the gameplay surfaces
+   *  and is rejected until the artist explicitly confirms. The backend —
+   *  not the UI — is the guard. */
+  confirm_topology_rebuild?: boolean;
 }
 
 export interface SemanticObjectSubdivision {

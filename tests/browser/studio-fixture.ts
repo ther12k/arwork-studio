@@ -35,7 +35,7 @@ export const ORIGINAL_D = "M 70,180 C 70,60 230,60 230,180 C 230,300 70,300 70,1
 /** Serialized result of dragging handle 1 to art (170,60). */
 export const EDITED_D = "M 70,180 C 170,60 230,60 230,180 C 230,300 70,300 70,180 Z";
 
-export type EditMode = "reject409" | "jobfail" | "success";
+export type EditMode = "reject409" | "jobfail" | "topologyfail" | "success";
 
 /** Task 40B: per-revision appearance of the FILLED blob (fill + outline).
  *  No stroke ⇒ no outline (the backend removes both keys on width 0). */
@@ -471,6 +471,20 @@ export async function routeBackend(page: Page, state: FixtureState) {
           message: "Edited path is not a simple ring.",
         };
         return json({ jobId: "job-fail", projectId: PID });
+      }
+      if (state.mode === "topologyfail" && body.action === "shape_order") {
+        // Task 40C review: the manual-topology gate — the move is refused
+        // until confirm_topology_rebuild is sent.
+        state.activeJobId = "job-gate";
+        state.job = {
+          id: "job-gate",
+          kind: "shape reorder",
+          status: "failed",
+          progress: 0.2,
+          message:
+            "This move rebuilds the gameplay surfaces; manual cuts, boundaries and label positions may be reset. Confirm the topology rebuild to continue.",
+        };
+        return json({ jobId: "job-gate", projectId: PID });
       }
       state.activeJobId = "job-ok";
       state.runningGets = 0;

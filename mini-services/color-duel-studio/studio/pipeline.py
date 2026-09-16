@@ -3611,6 +3611,16 @@ def edit_bundle(source: Path, output: Path, request, version: str):
         g['regions'] = [r for r in g['regions'] if r['id'] not in remove]
         _prune_edges(g, remove)
         g['decorations'].extend(chosen)
+    # Task 40C review — manual gameplay topology provenance: these actions
+    # author the gameplay partition BY HAND (cuts, boundary drags, custom
+    # labels, manual merges/splits, region pen). A later full recompile
+    # (filled shape_order, artwork 'shape', object reorder, ordinary Build)
+    # rebuilds the visible surfaces from the master and may reset them, so
+    # the flag marks revisions a topology-rebuilding move must confirm
+    # against. Appearance-only actions leave the flag untouched (they keep
+    # regions byte-identical — the manual work is still there).
+    if request.action in ('cut', 'node', 'merge', 'split', 'label', 'draw', 'decorate'):
+        m.setdefault('provenance', {})['manualTopology'] = True
     groups = defaultdict(list)
     for r in g['regions']:
         if r['objectId'] != 'unassigned':
@@ -4062,21 +4072,153 @@ def _reorder_master_shape(master_text: str, shape_id: str, direction: str) -> st
     return ET.tostring(root, encoding='unicode')
 
 
+def _move_root_element(master_text: str, shape_id: str, direction: str) -> str:
+    """Task 40C ink fast path — move ONE ROOT-LEVEL element (an ink stroke)
+    one position among the root's children: 'forward' = one layer toward the
+    viewer, 'backward' = one behind. A pure document-order move of the
+    element itself: the stroke is lifted out of nothing and inserted into
+    nothing — group MEMBERSHIP never changes, so objects.json is stable by
+    construction. Raises ValueError when the shape is absent, is not a
+    root-level element (it lives inside an object group, where a move would
+    change group semantics), or already sits at the artwork's edge."""
+    ET.register_namespace('', 'http://www.w3.org/2000/svg')
+    try:
+        root = ET.fromstring(master_text)
+    except Exception as exc:
+        raise ValueError(f'The source master is not well-formed XML: {exc}')
+    target = None
+    for el in root.iter():
+        if _local_svg_tag(el.tag) == 'path' and el.get('id') == shape_id:
+            target = el
+            break
+    if target is None:
+        raise ValueError(
+            f'Shape "{shape_id}" was not found in the source master. Shapes from converted '
+            'raster artwork (rc-*) cannot be reordered; redraw them with the pen instead.')
+    parent_map = {child: par for par in root.iter() for child in par}
+    if parent_map.get(target) is not root:
+        raise ValueError(
+            f'Stroke "{shape_id}" lives inside an object group; its order follows the group. '
+            'Only root-level strokes can be moved without recompiling the artwork.')
+    children = list(root)
+    idx = children.index(target)
+    j = idx + (1 if direction == 'forward' else -1)
+    edge = 'front' if direction == 'forward' else 'back'
+    if not 0 <= j < len(children):
+        raise ValueError(f'Stroke "{shape_id}" is already at the {edge} of the artwork — nothing to swap with.')
+    neighbor = children[j]
+    root.remove(target)
+    root.insert(children.index(neighbor), target)
+    return ET.tostring(root, encoding='unicode')
+
+
+def _master_element_rank(master_text: str) -> dict:
+    """Document-order rank of every id-carrying path element (depth-first —
+    the same order the compiler parses shapes in), so an in-place reorder can
+    rewrite paint z EXACTLY as a recompile would."""
+    root = ET.fromstring(master_text)
+    ranks: dict = {}
+    for el in root.iter():
+        if _local_svg_tag(el.tag) == 'path' and el.get('id'):
+            ranks.setdefault(el.get('id'), len(ranks))
+    return ranks
+
+
+def _edit_ink_order(bundle: dict, source: Path, output: Path, request, version: str) -> dict:
+    """Task 40C review — ink fast path: move one INK stroke one layer without
+    recompiling. Ink is appearance: the gameplay partition, edges, labels and
+    palette/answer key are carried over BYTE-IDENTICAL (no rebuild, so manual
+    cuts survive by construction and no confirmation gate applies). The move
+    happens in the authoritative master (root-level element position) and the
+    paint z values are re-ranked from the new document order — the same
+    mapping a recompile produces, so an ordinary Build keeps the new order."""
+    shape_id = (request.shape_id or '').strip()
+    if request.order not in ('forward', 'backward'):
+        raise ValueError('Choose a move direction: forward or backward.')
+    master_file = source / 'source-master.svg'
+    if not master_file.is_file():
+        raise ValueError('Layer moves need a vector master; converted raster '
+                         'artwork (rc-*) cannot be reordered.')
+    synced = _sync_source_master(bundle, source)
+    base_text = synced if synced is not None else master_file.read_text(encoding='utf-8')
+    edited_master = _move_root_element(base_text, shape_id, request.order)
+
+    paint = bundle['paint']
+    ranks = _master_element_rank(edited_master)
+    for p in (paint.get('paths') or []) + (paint.get('inkPaths') or []):
+        sid = p.get('shapeId')
+        if sid in ranks:
+            p['z'] = ranks[sid]
+
+    m = bundle['manifest']
+    g = bundle['geometry']
+    bundle['objects'] = _sync_objects_from_regions(bundle)
+    m['version'] = version
+    g['artworkVersion'] = version
+    m.pop('review', None)
+    m['provenance']['lastEdit'] = 'shape_order'
+    output.mkdir(parents=True, exist_ok=True)
+    (output / 'source-master.svg').write_text(edited_master, encoding='utf-8')
+    master_name = m['assets'].get('sourceMaster', 'source-master.png')
+    for f in {master_name, 'build-settings.json', 'playtests.json'}:
+        if f != 'source-master.svg' and (source / f).is_file():
+            shutil.copy2(source / f, output / f)
+    qa = emit_bundle(output, bundle)
+    qa.setdefault('warnings', []).append(
+        f'Ink stroke "{shape_id}" moved one layer {request.order}; appearance-only — gameplay '
+        'regions, edges, labels and the answer key are unchanged (no recompile).')
+    write_json(output / 'validation.json', qa)
+    return {'manifest': m, 'validation': qa}
+
+
 def _edit_master_order(source: Path, output: Path, request, version: str) -> dict:
-    """Task 40C — move ONE shape one layer forward/backward and FULLY
-    RECOMPILE (never a paint.z bump: the master is authoritative, so an
-    ordinary Build would revert a z-only edit). The recompile re-derives
-    paint z AND the visible gameplay surfaces from the new drawing order —
-    overlapping pixels change ownership honestly — while shapeIds and object
-    ownership are preserved by the identity contract (sibling swap only, see
-    _reorder_master_shape). Any failure raises before the output revision
-    exists."""
+    """Task 40C — move ONE shape one layer forward/backward.
+
+    Two paths by target type:
+    - INK stroke: the topology-neutral fast path (_edit_ink_order) — no
+      recompile, gameplay bytes identical, no confirmation needed.
+    - FILLED shape: FULL RECOMPILE (never a paint.z bump: the master is
+      authoritative, so a z-only edit would be reverted by the next ordinary
+      Build). The recompile re-derives paint z AND the visible gameplay
+      surfaces — overlapping pixels change ownership honestly — but that
+      rebuild can reset MANUAL gameplay topology (cuts, boundary drags,
+      custom labels, manual merges/splits). When the current revision carries
+      such work (provenance.manualTopology, or a manual region-id prefix scan
+      for revisions made before the flag existed), the move is REJECTED until
+      the client sends confirm_topology_rebuild — the UI dialog is a
+      convenience, never the only guard. ShapeIds and object ownership are
+      preserved by the sibling-swap contract (_reorder_master_shape).
+    Any failure raises before the output revision exists."""
     bundle = load_bundle(source)
     shape_id = (request.shape_id or '').strip()
     if not shape_id:
         raise ValueError('Select an artwork shape to move (shape_id is required).')
     if request.order not in ('forward', 'backward'):
         raise ValueError('Choose a move direction: forward or backward.')
+    ink_ids = {p.get('shapeId') for p in (bundle['paint'].get('inkPaths') or [])}
+    if shape_id in ink_ids:
+        return _edit_ink_order(bundle, source, output, request, version)
+    fill_ids = {p.get('shapeId') for p in (bundle['paint'].get('paths') or [])}
+    if shape_id not in fill_ids:
+        raise ValueError(
+            f'Shape "{shape_id}" was not found in the source master. Shapes from converted '
+            'raster artwork (rc-*) cannot be reordered; redraw them with the pen instead.')
+
+    manual_topology = bool((bundle['manifest'].get('provenance') or {}).get('manualTopology'))
+    manual_prefixes = ('r-c-', 'r-m-', 'r-s-', 'r-n-', 'r-p-', 'r-v-')
+    if not manual_topology:
+        manual_topology = any(
+            str(r.get('id', '')).startswith(manual_prefixes)
+            for r in (bundle['geometry'].get('regions') or []))
+    if manual_topology and not request.confirm_topology_rebuild:
+        raise ValueError(
+            'This move rebuilds the gameplay surfaces; manual cuts, boundaries and label '
+            'positions may be reset. Confirm the topology rebuild to continue.')
+    if manual_topology:
+        # the confirmation was given: the rebuild is sanctioned and the NEW
+        # revision honestly no longer carries the manual topology.
+        bundle['manifest'].setdefault('provenance', {})['manualTopology'] = False
+
     master_file = source / 'source-master.svg'
     if not master_file.is_file():
         raise ValueError('Layer moves need a vector master; converted raster '
@@ -4093,6 +4235,7 @@ def _edit_master_order(source: Path, output: Path, request, version: str) -> dic
             'shapeOrder': {
                 'shapeId': shape_id,
                 'order': request.order,
+                'topologyRebuilt': bool(manual_topology),
                 'note': ('One artwork shape moved one layer ' + request.order +
                          ' in Artwork Node mode; the revision was recompiled from the reordered '
                          'master, re-deriving paint order and visible gameplay surfaces. Shape '
@@ -4100,7 +4243,9 @@ def _edit_master_order(source: Path, output: Path, request, version: str) -> dic
     qa = result['validation']
     qa.setdefault('warnings', []).append(
         f'Shape "{shape_id}" moved one layer {request.order}; the visible partition was '
-        're-derived from the new drawing order.')
+        're-derived from the new drawing order.'
+        + (' Manual gameplay topology was rebuilt — the previous revision remains available '
+           'in the revision history.' if manual_topology else ''))
     write_json(output / 'validation.json', qa)
     return result
 
