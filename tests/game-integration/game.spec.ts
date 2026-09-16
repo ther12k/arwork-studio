@@ -20,12 +20,14 @@
  *     a WRONG number neither fills nor records (penalty indicator).
  *   - Completion: filling every region reaches the completed progress state.
  *   - Persistence: reload → the same artwork restores its filled regions.
+ *   - Free Color: the studio mode accepts a custom HEX outside the palette,
+ *     paints the region with it, and records the progress.
+ *   - Progress identity: records carry the pack's contentVersion; the same
+ *     version restores (Profile "In Progress"), a re-shipped version never
+ *     silently reuses the old completion, and the raw record survives.
+ *   - Duel: the rival's fills stay OUT of the player's progress record while
+ *     both play the identical content.
  *   - Deployment independence: every request stays on the static origin.
- *
- * Not yet covered (documented, next slices): Free Color custom paint, Duel
- * (two players), and content-version-aware progress identity — the game's
- * progressStore keys by artworkId only; gating that requires a game-repo
- * patch.
  */
 
 import { expect, test, type Locator, type Page } from "@playwright/test";
@@ -164,6 +166,38 @@ function progressOf(page: Page, artworkId: string): Promise<{ completed: string[
   }, artworkId);
 }
 
+/** The RAW stored record including its contentVersion — the identity datum
+ *  the version-awareness row reads directly (the game's own reads filter by
+ *  it, so a mismatched record is invisible in the UI by design). */
+function rawProgressOf(
+  page: Page,
+  artworkId: string
+): Promise<{ contentVersion?: string; completed: string[] } | undefined> {
+  return page.evaluate((id) => {
+    const data = JSON.parse(localStorage.getItem("color-duel:progress:v1") ?? "{}");
+    const p = data.artworks?.[id];
+    return p ? { contentVersion: p.contentVersion, completed: p.completedRegionIds } : undefined;
+  }, artworkId);
+}
+
+/** Set the palette's custom paint color. `<input type=color>` has no typable
+ *  field, so the value goes through the native setter + a bubbling input
+ *  event — the game's real React onChange → onSelectCustomColor runs. */
+async function setCustomPaint(page: Page, hex: string) {
+  await page.evaluate((value) => {
+    const input = document.querySelector('input[aria-label="Custom paint color"]') as HTMLInputElement;
+    const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")!.set!;
+    setter.call(input, value);
+    input.dispatchEvent(new Event("input", { bubbles: true }));
+  }, hex);
+}
+
+/** The Profile tab's "In Progress" shelf — the user-visible identity read:
+ *  an artwork appears here only when a progress record matches its OWN
+ *  content version (progressMapFor). */
+const inProgressShelf = (page: Page) =>
+  page.locator("section", { has: page.getByRole("heading", { name: "In Progress" }) });
+
 test.beforeEach(async ({ page }) => {
   // Deployment independence: gameplay must run purely from the game's static
   // pack assets. The gate fails on any STUDIO endpoint (backend ports or the
@@ -252,4 +286,145 @@ test("composition pack: overlap probe resolves the visible owner, fills, complet
   const after = await progressOf(page, "qa-composition");
   expect(after.completed).toHaveLength(3);
   expect(after.isComplete).toBe(true);
+});
+
+// ------------------------------------------------------- Free Color (studio)
+
+test("studio free color: custom HEX outside the palette paints, records, and restores", async ({ page }) => {
+  test.setTimeout(180_000);
+  // Studio mode is entered from Home's Studio card: with a fresh profile it
+  // opens the FIRST catalog family's representative (mosslight-cottage).
+  const { regions, palette } = await loadPackFiles(page, "mosslight-cottage");
+  const manifest = await page.request
+    .get(`${BASE}/artworks/mosslight-cottage/artwork.json`)
+    .then((r) => r.json());
+  expect(manifest.version, "fixture pack must declare a content version").toBeTruthy();
+
+  await page.goto("/");
+  await expect(page.getByText("Mosslight Cottage", { exact: false }).first()).toBeVisible({ timeout: 30_000 });
+  await page.locator("#home-studio-card").click();
+  await expect(page.getByText("Studio Relax")).toBeVisible();
+  await page.locator("#pre-match-start-btn").click();
+  await expect(page.locator("path[id^='region-']").first()).toBeVisible({ timeout: 15_000 });
+
+  // A custom HEX the palette does NOT ship.
+  const CUSTOM_HEX = "#B4D4AA";
+  expect(palette.map((p) => p.hex.toUpperCase())).not.toContain(CUSTOM_HEX);
+  await setCustomPaint(page, CUSTOM_HEX);
+
+  // Studio free color: ANY unfilled region accepts the active paint — the
+  // number-match rejection does not apply (no palette number needed). One
+  // real pointer click fills it.
+  const target = regions[0];
+  const tap = await clickPointFor(page, target.id, target.label.x, target.label.y);
+  await page.mouse.click(tap.x, tap.y);
+
+  // The region actually renders the custom paint…
+  await expect
+    .poll(async () =>
+      page
+        .locator(`path[id='region-${target.id}']`)
+        .evaluate((el) => el.getAttribute("fill")?.toUpperCase())
+    )
+    .toBe(CUSTOM_HEX);
+  // …and the completion is recorded under the pack's content version.
+  await expect.poll(async () => (await progressOf(page, "mosslight-cottage")).completed).toContain(target.id);
+  const raw = await rawProgressOf(page, "mosslight-cottage");
+  expect(raw?.contentVersion).toBe(manifest.version);
+
+  // Restore: same content version → the progress survives a reload and the
+  // Home hero offers to RESUME the same artwork (the real progressMapFor read).
+  await page.reload();
+  await expect(page.getByText("Mosslight Cottage", { exact: false }).first()).toBeVisible({ timeout: 30_000 });
+  await expect(page.locator("#home-hero-solo-btn")).toContainText(`Resume ${manifest.title}`);
+  expect((await progressOf(page, "mosslight-cottage")).completed).toContain(target.id);
+});
+
+// ------------------------------------------- version-aware progress identity
+
+test("progress identity: same version restores, a re-shipped version never reuses old completions", async ({ page }) => {
+  test.setTimeout(180_000);
+  const { regions, palette } = await loadPackFiles(page, "qa-composition");
+  // The shipped version is read, never assumed: the row's contract is
+  // "same version restores / different version does not", whatever it is.
+  const shippedVersion = await page.request
+    .get(`${BASE}/artworks/qa-composition/artwork.json`)
+    .then((r) => r.json())
+    .then((m) => m.version as string);
+  expect(shippedVersion).toBeTruthy();
+
+  // Act 1 — play ONE region at the shipped content version.
+  await openPack(page, "QA Composition");
+  await expect(page.locator("path[id^='region-']")).toHaveCount(3);
+  const first = regions[0];
+  const num = palette.find((e) => e.id === first.paletteId)!.number;
+  await paletteButton(page, num).click();
+  const tap = await clickPointFor(page, first.id, first.label.x, first.label.y);
+  await page.mouse.click(tap.x, tap.y);
+  await expect.poll(async () => (await rawProgressOf(page, "qa-composition"))?.completed).toContain(first.id);
+  expect((await rawProgressOf(page, "qa-composition"))?.contentVersion).toBe(shippedVersion);
+
+  // Same version → Profile's "In Progress" shelf lists the artwork (the
+  // game's real identity-checked read).
+  const gotoProfile = async () => {
+    // A running match covers the tab bar — leave it first if present.
+    const exit = page.locator('button[title="Exit match"]');
+    if (await exit.isVisible()) await exit.click();
+    await page.getByRole("button", { name: "Profile", exact: false }).first().click();
+    await expect(page.getByRole("heading", { name: "In Progress" })).toBeVisible({ timeout: 10_000 });
+  };
+  await gotoProfile();
+  await expect(inProgressShelf(page).getByText("QA Composition", { exact: false })).toBeVisible();
+
+  // Act 2 — the artwork RE-SHIPS as a new content version (same id). The
+  // route serves the bumped manifest: this staged content change IS the
+  // thing under test (the row is about identity, not pack bytes).
+  await page.route("**/artworks/qa-composition/artwork.json", async (route) => {
+    const manifest = (await route.fetch().then((r) => r.json())) as { version: string };
+    manifest.version = "9.9.9";
+    await route.fulfill({ json: manifest });
+  });
+
+  await page.reload();
+  await expect(page.getByText("Mosslight Cottage", { exact: false }).first()).toBeVisible({ timeout: 30_000 });
+  await gotoProfile();
+  // The old completion must NOT silently reuse onto the new version: the
+  // shelf is empty, and the raw shipped-version record is still intact in
+  // storage — identity-filtered, not destroyed.
+  await expect(inProgressShelf(page).getByText("Nothing on the easel")).toBeVisible();
+  const stale = await rawProgressOf(page, "qa-composition");
+  expect(stale?.contentVersion).toBe(shippedVersion);
+  expect(stale?.completed).toContain(first.id);
+});
+
+// ----------------------------------------------------- duel (identical content)
+
+test("duel: rival fills stay out of the player's progress record on identical content", async ({ page }) => {
+  test.setTimeout(180_000);
+  const { regions, palette } = await loadPackFiles(page, "qa-composition");
+  const shippedVersion = await page.request
+    .get(`${BASE}/artworks/qa-composition/artwork.json`)
+    .then((r) => r.json())
+    .then((m) => m.version as string);
+  await openPack(page, "QA Composition");
+  await expect(page.locator("path[id^='region-']")).toHaveCount(3);
+
+  // The player answers ONE region correctly, immediately.
+  const mine = regions[0];
+  const num = palette.find((e) => e.id === mine.paletteId)!.number;
+  await paletteButton(page, num).click();
+  const tap = await clickPointFor(page, mine.id, mine.label.x, mine.label.y);
+  await page.mouse.click(tap.x, tap.y);
+  await expect.poll(async () => (await progressOf(page, "qa-composition")).completed).toContain(mine.id);
+
+  // The rival AI ticks from the same pack (identical content identity): its
+  // 50% toast (floor(3/2) = 1 fill) proves it actually painted.
+  await expect(page.getByText("Rival filled 50%", { exact: false })).toBeVisible({ timeout: 20_000 });
+
+  // The boundary under test: the player's record holds ONLY the player's own
+  // fill — the rival's concurrent fills on the SAME artwork never leak in.
+  const player = await progressOf(page, "qa-composition");
+  expect(player.completed).toEqual([mine.id]);
+  const raw = await rawProgressOf(page, "qa-composition");
+  expect(raw?.contentVersion).toBe(shippedVersion);
 });

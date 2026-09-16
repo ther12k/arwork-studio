@@ -59,3 +59,38 @@ jobs:
         run: bun run build
       - name: Studio Art-node journey gate (Task 33 review, real app + real Chromium)
         run: bun run browser:install && bun run test:studio-browser
+
+  real-game:
+    # Task 36 / Track A — the golden packs play in the REAL Color Duel game
+    # (catalog loader → level picker → canvas → progressStore), driven by
+    # Playwright against a static serve of the built game. The game repo is
+    # cloned at its main head; prepare_game.py records the exact sha +
+    # dirty flag in .serve/game-pin.json, so a dirty or drifted game fails
+    # the identity expectations in the open.
+    #
+    # ther12k/color-duel mirrors zulcoding/color-duel main (same shas): the
+    # CI token identity has no push access to the upstream remote, so the
+    # landed game commits live on the fork. If upstream gains them, switch
+    # this back — the pin's sha is the identity anchor either way.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Checkout the Color Duel game repo
+        uses: actions/checkout@v5
+        with:
+          repository: ther12k/color-duel
+          path: color-duel-game
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+      - run: bun install --frozen-lockfile
+      - name: Real-game golden-pack journey (incl. Free Color, duel isolation, progress identity)
+        env:
+          COLOR_DUEL_DIR: ${{ github.workspace }}/color-duel-game
+          STUDIO_PYTHON: python3
+        run: bun run browser:install && bunx playwright test --config playwright.game.config.ts
+      - name: Report the game pin
+        run: cat tests/game-integration/.serve/game-pin.json
