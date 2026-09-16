@@ -72,15 +72,17 @@ async function loadPackFiles(page: Page, id: string) {
  *  the live coloring canvas. */
 async function openPack(page: Page, card: string, variant?: string) {
   await page.goto("/");
-  // Wait for hydration + catalog load: the cards render from the same
-  // artworks state the Arena picker uses (clicking earlier hits a
-  // not-yet-attached button and silently no-ops).
-  await expect(page.getByText("Mosslight Cottage", { exact: false }).first()).toBeVisible({ timeout: 30_000 });
+  // The Arena TAB is static chrome; the arena card grid renders only once
+  // the catalog has hydrated — so navigate first and wait for the TARGET
+  // CARD there. (A Home text anchor cannot work across environments: the
+  // featured rail shows a local subset in a dev sandbox and only the QA
+  // packs in a fresh CI clone.)
   await page.getByRole("button", { name: "Arena", exact: true }).click();
   await expect(page.getByRole("heading", { name: "Duel Arena" })).toBeVisible({ timeout: 15_000 });
   // Click the card BUTTON (stable accessible name) — text-node clicks raced
   // the grid reflow while card thumbnails loaded and landed on neighbours.
   const cardBtn = page.getByRole("button", { name: new RegExp(`^${card}\\b`) }).first();
+  await expect(cardBtn).toBeVisible({ timeout: 30_000 });
   await cardBtn.scrollIntoViewIfNeeded();
   await cardBtn.click();
   // Multi-tier families open the level picker; single-tier cards select
@@ -293,17 +295,30 @@ test("composition pack: overlap probe resolves the visible owner, fills, complet
 test("studio free color: custom HEX outside the palette paints, records, and restores", async ({ page }) => {
   test.setTimeout(180_000);
   // Studio mode is entered from Home's Studio card: with a fresh profile it
-  // opens the FIRST catalog family's representative (mosslight-cottage).
-  const { regions, palette } = await loadPackFiles(page, "mosslight-cottage");
-  const manifest = await page.request
-    .get(`${BASE}/artworks/mosslight-cottage/artwork.json`)
-    .then((r) => r.json());
-  expect(manifest.version, "fixture pack must declare a content version").toBeTruthy();
-
+  // opens the FIRST catalog family's representative — which is
+  // environment-dependent (the full local artwork set in a dev sandbox, the
+  // staged QA packs in a fresh CI clone). The briefing NAMES the artwork it
+  // is about to open; the catalog maps that title to the id and everything
+  // below reads the SERVED pack — nothing is assumed about which pack runs.
   await page.goto("/");
-  await expect(page.getByText("Mosslight Cottage", { exact: false }).first()).toBeVisible({ timeout: 30_000 });
-  await page.locator("#home-studio-card").click();
-  await expect(page.getByText("Studio Relax")).toBeVisible();
+  const catalog = await page.request.get(`${BASE}/artworks/catalog.json`).then((r) => r.json());
+  // The Studio card is static chrome, but it opens an artwork only once the
+  // catalog has hydrated (featured[0] is undefined before that) — retry the
+  // click until the briefing actually appears.
+  await expect(async () => {
+    await page.locator("#home-studio-card").click();
+    await expect(page.getByText("Studio Relax")).toBeVisible({ timeout: 2_000 });
+  }).toPass({ timeout: 45_000 });
+  const title = (await page.getByRole("heading", { level: 4 }).first().textContent()) ?? "";
+  const artworkId = catalog.artworks.find((e: { title?: string }) => e.title === title)?.id as string;
+  expect(artworkId, `briefing title "${title}" must map to a catalog entry`).toBeTruthy();
+
+  const { regions, palette } = await loadPackFiles(page, artworkId);
+  const manifest = await page.request
+    .get(`${BASE}/artworks/${artworkId}/artwork.json`)
+    .then((r) => r.json());
+  expect(manifest.version, "served pack must declare a content version").toBeTruthy();
+
   await page.locator("#pre-match-start-btn").click();
   await expect(page.locator("path[id^='region-']").first()).toBeVisible({ timeout: 15_000 });
 
@@ -328,16 +343,19 @@ test("studio free color: custom HEX outside the palette paints, records, and res
     )
     .toBe(CUSTOM_HEX);
   // …and the completion is recorded under the pack's content version.
-  await expect.poll(async () => (await progressOf(page, "mosslight-cottage")).completed).toContain(target.id);
-  const raw = await rawProgressOf(page, "mosslight-cottage");
+  await expect.poll(async () => (await progressOf(page, artworkId)).completed).toContain(target.id);
+  const raw = await rawProgressOf(page, artworkId);
   expect(raw?.contentVersion).toBe(manifest.version);
 
   // Restore: same content version → the progress survives a reload and the
-  // Home hero offers to RESUME the same artwork (the real progressMapFor read).
+  // Home hero offers to RESUME the same artwork (the real progressMapFor
+  // read). The hero auto-advances every ~5s; slide 0 carries the Resume CTA,
+  // so allow a full cycle.
   await page.reload();
-  await expect(page.getByText("Mosslight Cottage", { exact: false }).first()).toBeVisible({ timeout: 30_000 });
-  await expect(page.locator("#home-hero-solo-btn")).toContainText(`Resume ${manifest.title}`);
-  expect((await progressOf(page, "mosslight-cottage")).completed).toContain(target.id);
+  // After hydration the hero CTA flips from "Start coloring" to
+  // "Resume <title>" — the flip itself is the hydration signal.
+  await expect(page.locator("#home-hero-solo-btn")).toContainText(`Resume ${title}`, { timeout: 30_000 });
+  expect((await progressOf(page, artworkId)).completed).toContain(target.id);
 });
 
 // ------------------------------------------- version-aware progress identity
@@ -386,12 +404,12 @@ test("progress identity: same version restores, a re-shipped version never reuse
   });
 
   await page.reload();
-  await expect(page.getByText("Mosslight Cottage", { exact: false }).first()).toBeVisible({ timeout: 30_000 });
   await gotoProfile();
   // The old completion must NOT silently reuse onto the new version: the
-  // shelf is empty, and the raw shipped-version record is still intact in
-  // storage — identity-filtered, not destroyed.
-  await expect(inProgressShelf(page).getByText("Nothing on the easel")).toBeVisible();
+  // shelf is empty once the catalog hydrates (Profile chrome is static; the
+  // shelf content is not), and the raw shipped-version record is still
+  // intact in storage — identity-filtered, not destroyed.
+  await expect(inProgressShelf(page).getByText("Nothing on the easel")).toBeVisible({ timeout: 30_000 });
   const stale = await rawProgressOf(page, "qa-composition");
   expect(stale?.contentVersion).toBe(shippedVersion);
   expect(stale?.completed).toContain(first.id);
