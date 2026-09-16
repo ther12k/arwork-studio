@@ -177,8 +177,12 @@ def test_authoring_composition_full_chain(client):
     assert pen3['masterShapeId'] == pen_shape and pen3['objectId'] == pen_object
 
     # ---- 4. Change layer order (bring the blob to front) ------------------
+    # (Task 40C review: the pen drew an r-p-* gameplay region, so the reorder
+    # now hits the manual-topology gate — the chain confirms the rebuild
+    # explicitly, exactly like the UI dialog would.)
     r = client.post(f'/api/projects/{pid}/objects', headers=H, json={
-        'base_revision': rev3, 'object_id': 'obj-blob', 'order_action': 'bring_to_front'})
+        'base_revision': rev3, 'object_id': 'obj-blob', 'order_action': 'bring_to_front',
+        'confirm_topology_rebuild': True})
     assert r.status_code == 200, r.text
     p = wait(client, pid)
     assert p['job']['status'] == 'done', p['job']
@@ -993,3 +997,158 @@ def test_shape_order_edit(client):
     p = wait(client, pid2)
     assert p['job']['status'] == 'failed', p['job']
     assert 'Choose a move direction' in p['job'].get('message', '')
+
+
+def test_topology_gate_generalization(client):
+    """Task 40C review round 2 — the manual-topology confirmation gate is ONE
+    policy across EVERY topology-rebuilding operation, backend-owned:
+
+        manual work      operation                  expected
+        cut + label      filled shape reorder       reject until confirm (covered elsewhere)
+        cut + label      object layer reorder       reject until confirm
+        cut + label      artwork shape geometry edit reject until confirm
+        cut + label      ordinary Build             reject until confirm
+        cut              ink reorder                no gate, regions byte-identical
+        cut              ink/fill appearance edit   no gate, manual work remains
+
+    A confirmed rebuild clears the flag honestly (the new revision carries no
+    manual work) and the previous revision stays fully available."""
+    pid = new(client)
+    r = client.post(f'/api/projects/{pid}/upload-svg', headers=H,
+                    files={'file': ('order.svg', ORDER_SVG, 'image/svg+xml')},
+                    data={'rights_confirmed': 'true'})
+    assert r.status_code == 200, r.text
+    r = client.post(f'/api/projects/{pid}/build', headers=H, json=BUILD_BODY)
+    assert r.status_code == 200, r.text
+    rev = wait(client, pid)['currentRevision']
+    d0 = files(client, pid, rev)
+    # helper over the CURRENT files each time (region ids re-derive)
+    def regions_for(base, shape):
+        return [r_ for r_ in files(client, pid, base)['regions']
+                if r_.get('masterShapeId') == shape]
+
+    objs = {o['id']: o for o in d0['objects']}
+    back = objs['obj-back']['shapeIds'][0]
+    green = next(s for s in objs['obj-front']['shapeIds']
+                 if any(e.get('fill') == '#33AA77' and e.get('shapeId') == s
+                        for e in d0['paint']['paths']))
+
+    def add_manual_work(base):
+        rev_cut = step(client, pid, base, {
+            'base_revision': base, 'action': 'cut',
+            'region_ids': [regions_for(base, back)[0]['id']],
+            'd': 'M 40,80 L 200,80'})
+        lower = next(r_ for r_ in files(client, pid, rev_cut)['regions']
+                     if owning_regions([r_], 100, 140))
+        rev_lab = step(client, pid, rev_cut, {
+            'base_revision': rev_cut, 'action': 'label', 'region_ids': [lower['id']],
+            'x': 100.0, 'y': 140.0})
+        d = files(client, pid, rev_lab)
+        assert d['manifest']['provenance'].get('manualTopology') is True
+        assert any(r_['id'].startswith('r-c-') for r_ in d['regions'])
+        return rev_lab
+
+    # ---- appearance-only row: manual topology REMAINS ---------------------
+    rev_manual = add_manual_work(rev)
+    rev_ap = step(client, pid, rev_manual, {
+        'base_revision': rev_manual, 'action': 'shape_style', 'shape_id': green,
+        'region_ids': [], 'color': '#4C7FE8'})
+    d_ap = files(client, pid, rev_ap)
+    assert d_ap['manifest']['provenance'].get('manualTopology') is True, \
+        'appearance-only edits must keep the manual topology flag'
+    assert any(r_['id'].startswith('r-c-') for r_ in d_ap['regions'])
+
+    # ---- object layer reorder: reject until confirmed ---------------------
+    r = client.post(f'/api/projects/{pid}/objects', headers=H, json={
+        'base_revision': rev_ap, 'object_id': 'obj-back', 'order_action': 'bring_to_front'})
+    assert r.status_code == 200, r.text
+    p = wait(client, pid)
+    assert p['job']['status'] == 'failed', p['job']
+    assert 'rebuilds the gameplay surfaces' in p['job'].get('message', '')
+    assert p['currentRevision'] == rev_ap, 'the refusal must not publish'
+    r = client.post(f'/api/projects/{pid}/objects', headers=H, json={
+        'base_revision': rev_ap, 'object_id': 'obj-back', 'order_action': 'bring_to_front',
+        'confirm_topology_rebuild': True})
+    assert r.status_code == 200, r.text
+    p = wait(client, pid)
+    assert p['job']['status'] == 'done', p['job']
+    rev_ord = p['currentRevision']
+    d_ord = files(client, pid, rev_ord)
+    assert_qa(d_ord, 'confirmed object reorder')
+    assert not d_ord['manifest']['provenance'].get('manualTopology'), \
+        'a confirmed rebuild publishes without the manual-work flag'
+    assert not any(r_['id'].startswith('r-c-') for r_ in d_ord['regions']), \
+        'the confirmed rebuild honestly re-derives the partition (cut halves gone)'
+    d_ap_again = files(client, pid, rev_ap)
+    assert any(r_['id'].startswith('r-c-') for r_ in d_ap_again['regions']), \
+        'the pre-reorder revision remains available with its manual work'
+
+    # ---- artwork shape geometry edit: reject until confirmed --------------
+    rev_manual2 = add_manual_work(rev_ord)
+    edited_back_d = 'M 30,30 L 210,30 L 210,210 L 30,210 Z'
+    r = client.post(f'/api/projects/{pid}/edit', headers=H, json={
+        'base_revision': rev_manual2, 'action': 'shape', 'region_ids': [],
+        'shape_id': back, 'd': edited_back_d})
+    assert r.status_code == 200, r.text
+    p = wait(client, pid)
+    assert p['job']['status'] == 'failed', p['job']
+    assert 'rebuilds the gameplay surfaces' in p['job'].get('message', '')
+    rev_shape = step(client, pid, rev_manual2, {
+        'base_revision': rev_manual2, 'action': 'shape', 'region_ids': [],
+        'shape_id': back, 'd': edited_back_d, 'confirm_topology_rebuild': True})
+    d_shape = files(client, pid, rev_shape)
+    assert_qa(d_shape, 'confirmed shape edit')
+    assert not d_shape['manifest']['provenance'].get('manualTopology')
+    assert next(e for e in d_shape['paint']['paths'] if e['shapeId'] == back)['d'] == edited_back_d
+
+    # ---- ordinary Build: reject until confirmed ---------------------------
+    rev_manual3 = add_manual_work(rev_shape)
+    r = client.post(f'/api/projects/{pid}/build', headers=H, json=BUILD_BODY)
+    assert r.status_code == 200, r.text
+    p = wait(client, pid)
+    assert p['job']['status'] == 'failed', p['job']
+    assert 'rebuilds the gameplay surfaces' in p['job'].get('message', '')
+    assert p['currentRevision'] == rev_manual3
+    r = client.post(f'/api/projects/{pid}/build',
+                    headers=H, json={**BUILD_BODY, 'confirm_topology_rebuild': True})
+    assert r.status_code == 200, r.text
+    p = wait(client, pid)
+    assert p['job']['status'] == 'done', p['job']
+    d_build = files(client, pid, p['currentRevision'])
+    assert_qa(d_build, 'confirmed rebuild')
+    assert not d_build['manifest']['provenance'].get('manualTopology'), \
+        'a fresh compilation carries no manual-work flag'
+    # the persisted build-settings.json stays pure compiler configuration —
+    # the confirmation flag must never leak into it (recompiles re-validate
+    # that file as BuildSettings, extra=forbid).
+    d_prev = files(client, pid, rev_manual3)
+    assert any(r_['id'].startswith('r-c-') for r_ in d_prev['regions'])
+
+    # ink reorder stays gate-free even on a manual-topology revision.
+    d_build2 = files(client, pid, p['currentRevision'])
+    ink_present = d_build2['paint']['inkPaths']
+    assert ink_present == []  # ORDER_SVG has no ink; switch to INK_SVG project
+    pid2 = new(client)
+    r = client.post(f'/api/projects/{pid2}/upload-svg', headers=H,
+                    files={'file': ('ink.svg', INK_SVG, 'image/svg+xml')},
+                    data={'rights_confirmed': 'true'})
+    assert r.status_code == 200, r.text
+    r = client.post(f'/api/projects/{pid2}/build', headers=H, json=BUILD_BODY)
+    assert r.status_code == 200, r.text
+    rev_i = wait(client, pid2)['currentRevision']
+    di0 = files(client, pid2, rev_i)
+    plain_shape = next(o for o in di0['objects'] if o['id'] == 'obj-plain')['shapeIds'][0]
+    squiggle = next(p_['shapeId'] for p_ in di0['paint']['inkPaths'] if p_['d'].startswith('M 40,40'))
+    rev_ic = step(client, pid2, rev_i, {
+        'base_revision': rev_i, 'action': 'cut',
+        'region_ids': [next(r_['id'] for r_ in di0['regions'] if r_.get('masterShapeId') == plain_shape)],
+        'd': 'M 150,230 L 150,290'})
+    assert files(client, pid2, rev_ic)['manifest']['provenance'].get('manualTopology') is True
+    rev_ii = step(client, pid2, rev_ic, {
+        'base_revision': rev_ic, 'action': 'shape_order', 'region_ids': [],
+        'shape_id': squiggle, 'order': 'backward'})
+    di2 = files(client, pid2, rev_ii)
+    assert di2['manifest']['provenance'].get('manualTopology') is True, \
+        'the ink fast path keeps the manual topology (nothing was rebuilt)'
+    assert any(r_['id'].startswith('r-c-') for r_ in di2['regions']), \
+        'the manual cut survives the ink move'

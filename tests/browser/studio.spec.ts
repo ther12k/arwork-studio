@@ -1043,4 +1043,17 @@ test("Shape layer order journey: Move backward flips the paint order, survives r
   await expect.poll(() => orderPayloads().length).toBe(5); // incl. both failed attempts
   expect(orderPayloads()[4]).toMatchObject({ shape_id: SHAPE, order: "forward" });
   await expectPixel(page, 150, 150, isBlue);
+
+  // Gate generalization — an ordinary Build over manual topology demands the
+  // SAME explicit confirmation (the reviewer's Build UX), then retries WITH
+  // the flag.
+  state.mode = "topologyfail";
+  await page.getByRole("button", { name: "Build vector draft" }).click();
+  await expect(page.getByText("Rebuild gameplay surfaces?")).toBeVisible({ timeout: 20_000 });
+  await expect(page.getByText(/contains manually edited gameplay regions/)).toBeVisible();
+  state.mode = "success";
+  await page.getByRole("button", { name: "Rebuild gameplay surfaces", exact: true }).click();
+  await expect.poll(() => state.buildCalls.length).toBe(2); // [0] refused, [1] confirmed
+  expect(state.buildCalls[1]).toMatchObject({ confirm_topology_rebuild: true });
+  await expectPixel(page, 150, 150, isBlue);
 });

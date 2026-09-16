@@ -324,8 +324,9 @@ export function CanvasWorkspace() {
     editShape,
     editShapeStyle,
     editShapeOrder,
-    gatedShapeOrder,
-    dismissGatedShapeOrder,
+    gatedOperation,
+    confirmGatedOperation,
+    dismissGatedOperation,
     syncProject,
     recordPlaytest,
     freeColor,
@@ -684,20 +685,14 @@ export function CanvasWorkspace() {
   const draftGenerationRef = useRef<number>(0);
 
   // ----- Task 40C review: topology-rebuild confirmation flow -----
-  /** A shape-order move the backend REJECTED because the revision carries
-   *  manual gameplay topology (cuts, boundary drags, custom labels). The
-   *  hook's poll loop routes the gate refusal here; this dialog collects the
-   *  artist's explicit consent and re-sends the move WITH the flag — the
-   *  backend owns the gate, the UI never bypasses it. */
+  /** A gated operation (shape order, shape geometry save, object layer
+   *  reorder, Build) the backend REJECTED because the revision carries
+   *  manual gameplay topology. The hook's poll loop routes the refusal here
+   *  with the operation's dialog copy; confirm re-dispatches WITH the flag —
+   *  the backend owns the gate, the UI never bypasses it. */
   const moveShapeOrder = (order: "forward" | "backward") => {
     if (!artPath) return;
     void editShapeOrder(artPath.context.shapeId, order).catch((e: Error) => toast(e.message));
-  };
-  const confirmGatedOrder = () => {
-    const req = gatedShapeOrder;
-    dismissGatedShapeOrder();
-    if (!req) return;
-    void editShapeOrder(req.shapeId, req.order, true).catch((e: Error) => toast(e.message));
   };
 
   /** True when the project moved past the revision the draft was loaded
@@ -2652,18 +2647,17 @@ export function CanvasWorkspace() {
         </AlertDialogContent>
       </AlertDialog>
 
-      {/* Task 40C review — topology-rebuild confirmation (backend-gated): a
-          FILLED shape move recompiles the revision and may reset manual
-          gameplay authoring; the artist must opt in explicitly. */}
-      <AlertDialog open={!!gatedShapeOrder} onOpenChange={(o) => !o && dismissGatedShapeOrder()}>
+      {/* Task 40C review — topology-rebuild confirmation (backend-gated):
+          ANY full-recompile operation over manually authored gameplay asks
+          first. Copy comes from the hook (per operation). */}
+      <AlertDialog open={!!gatedOperation} onOpenChange={(o) => !o && dismissGatedOperation()}>
         <AlertDialogContent>
           <AlertDialogHeader>
             <AlertDialogTitle className="text-left text-sm text-[#183837]">
-              Rebuild gameplay surfaces?
+              {gatedOperation?.title}
             </AlertDialogTitle>
             <AlertDialogDescription className="text-left text-[11px] leading-relaxed text-[#657671]">
-              This will rebuild gameplay surfaces; manual cuts/boundaries/label positions may be
-              reset. The previous revision stays available in the revision history.
+              {gatedOperation?.body}
             </AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter className="gap-2 sm:justify-end">
@@ -2673,9 +2667,9 @@ export function CanvasWorkspace() {
             <AlertDialogAction
               className="h-9 rounded-md bg-[#087f74] text-[10px] font-semibold text-white hover:bg-[#056c62]"
               disabled={busy}
-              onClick={confirmGatedOrder}
+              onClick={confirmGatedOperation}
             >
-              Rebuild &amp; move
+              {gatedOperation?.confirmLabel}
             </AlertDialogAction>
           </AlertDialogFooter>
         </AlertDialogContent>

@@ -3089,6 +3089,13 @@ def _edit_master_shape(source: Path, output: Path, request, version: str) -> dic
     if not master_file.is_file():
         raise ValueError('Artwork path editing needs a vector master; converted raster artwork '
                          '(rc-* shapes) is not path-editable. Redraw with the pen instead.')
+    # Task 40C review generalization: the shape edit FULLY RECOMPILES the
+    # revision (visible surfaces re-derive from the edited outline), so it
+    # sits under the same manual-topology gate as filled shape_order —
+    # manual cuts inside the changed outline would be superseded silently.
+    if require_topology_rebuild_confirmation(bundle, bool(request.confirm_topology_rebuild),
+                                             'Saving the edited shape'):
+        _clear_manual_topology(bundle)
     synced = _sync_source_master(bundle, source)
     base_text = synced if synced is not None else master_file.read_text(encoding='utf-8')
     edited_master = _edit_master_shape_d(base_text, shape_id, new_d)
@@ -3618,8 +3625,11 @@ def edit_bundle(source: Path, output: Path, request, version: str):
     # rebuilds the visible surfaces from the master and may reset them, so
     # the flag marks revisions a topology-rebuilding move must confirm
     # against. Appearance-only actions leave the flag untouched (they keep
-    # regions byte-identical — the manual work is still there).
-    if request.action in ('cut', 'node', 'merge', 'split', 'label', 'draw', 'decorate'):
+    # regions byte-identical — the manual work is still there). The ARTWORK
+    # pen (paint=true) is NOT stamped: its region re-derives faithfully from
+    # the master shape it created, so nothing manual is lost by a rebuild.
+    if request.action in ('cut', 'node', 'merge', 'split', 'label', 'decorate') or (
+            request.action == 'draw' and not request.paint):
         m.setdefault('provenance', {})['manualTopology'] = True
     groups = defaultdict(list)
     for r in g['regions']:
@@ -4072,6 +4082,50 @@ def _reorder_master_shape(master_text: str, shape_id: str, direction: str) -> st
     return ET.tostring(root, encoding='unicode')
 
 
+def require_topology_rebuild_confirmation(bundle: dict, confirmed: bool, operation: str) -> bool:
+    """Task 40C review — the ONE gate for every topology-rebuilding operation
+    (filled shape_order, artwork shape edit, object layer reorder, ordinary
+    Build). Manual gameplay authoring (cuts, boundary drags, custom labels,
+    manual merges/splits, region pen) is tracked by provenance.manualTopology
+    and — for revisions made before the flag existed — by the manual
+    region-id prefixes (r-c-/r-m-/r-s-/r-n-/r-p-/r-v-). When such work is
+    present, the operation is REJECTED until the client sends the explicit
+    confirmation: the UI dialog is a convenience, never the only guard.
+    Returns True when manual topology is present (the caller must clear the
+    flag on the rebuilt revision); False when there is nothing to reset.
+    Appearance-only operations never call this — their regions are
+    byte-identical, so manual work survives them by construction."""
+    m = bundle['manifest']
+    manual = bool((m.get('provenance') or {}).get('manualTopology'))
+    prefixes = ('r-c-', 'r-m-', 'r-s-', 'r-n-', 'r-p-', 'r-v-')
+    if not manual:
+        # Prefix scan for revisions made before the flag existed. Precision:
+        # pen-drawn ARTWORK regions (r-p-*) and pen carves (r-v-*) re-derive
+        # faithfully from their master shapes — only a gameplay-only pen
+        # target (no paint path behind it) would actually be lost by a
+        # rebuild, so paint-path-backed ones are NOT manual topology.
+        paint_shapes = {p.get('shapeId') for p in (bundle['paint'].get('paths') or [])}
+        for r in (bundle['geometry'].get('regions') or []):
+            rid = str(r.get('id', ''))
+            if not rid.startswith(prefixes):
+                continue
+            if rid.startswith(('r-p-', 'r-v-')) and r.get('masterShapeId') in paint_shapes:
+                continue
+            manual = True
+            break
+    if manual and not confirmed:
+        raise ValueError(
+            f'{operation} rebuilds the gameplay surfaces; manual cuts, boundaries and label '
+            'positions may be reset. Confirm the topology rebuild to continue.')
+    return manual
+
+
+def _clear_manual_topology(bundle: dict) -> None:
+    """A confirmed topology-rebuilding operation publishes honestly: the NEW
+    revision no longer carries the manual work, so the flag is cleared."""
+    bundle['manifest'].setdefault('provenance', {})['manualTopology'] = False
+
+
 def _move_root_element(master_text: str, shape_id: str, direction: str) -> str:
     """Task 40C ink fast path — move ONE ROOT-LEVEL element (an ink stroke)
     one position among the root's children: 'forward' = one layer toward the
@@ -4204,20 +4258,10 @@ def _edit_master_order(source: Path, output: Path, request, version: str) -> dic
             f'Shape "{shape_id}" was not found in the source master. Shapes from converted '
             'raster artwork (rc-*) cannot be reordered; redraw them with the pen instead.')
 
-    manual_topology = bool((bundle['manifest'].get('provenance') or {}).get('manualTopology'))
-    manual_prefixes = ('r-c-', 'r-m-', 'r-s-', 'r-n-', 'r-p-', 'r-v-')
-    if not manual_topology:
-        manual_topology = any(
-            str(r.get('id', '')).startswith(manual_prefixes)
-            for r in (bundle['geometry'].get('regions') or []))
-    if manual_topology and not request.confirm_topology_rebuild:
-        raise ValueError(
-            'This move rebuilds the gameplay surfaces; manual cuts, boundaries and label '
-            'positions may be reset. Confirm the topology rebuild to continue.')
+    manual_topology = require_topology_rebuild_confirmation(
+        bundle, bool(request.confirm_topology_rebuild), 'This move')
     if manual_topology:
-        # the confirmation was given: the rebuild is sanctioned and the NEW
-        # revision honestly no longer carries the manual topology.
-        bundle['manifest'].setdefault('provenance', {})['manualTopology'] = False
+        _clear_manual_topology(bundle)
 
     master_file = source / 'source-master.svg'
     if not master_file.is_file():
@@ -4407,6 +4451,11 @@ def edit_objects_bundle(source: Path, output: Path, request, version: str) -> di
                 'Layer ordering needs a vector master: converted raster artwork derives its tap '
                 'surfaces at Convert time, so a pure re-sort would leave the overlap owned by the '
                 'wrong object. Re-run Convert with the new layer order instead.')
+        # Task 40C review generalization: the reorder FULLY RECOMPILES the
+        # revision — the same manual-topology gate as shape_order/shape/Build.
+        if require_topology_rebuild_confirmation(bundle, bool(request.confirm_topology_rebuild),
+                                                 'The layer reorder'):
+            _clear_manual_topology(bundle)
         # R3-2: fold artwork edits (recolor fills, pen shapes) into the master
         # FIRST — recompiling a stale master would revert the color or drop
         # the drawn shape (artwork loss, not topology reconstruction).

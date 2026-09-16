@@ -445,6 +445,19 @@ export async function routeBackend(page: Page, state: FixtureState) {
       // fixture's master always represents the latest published appearance —
       // the real backend guarantees that via _sync_source_master).
       state.buildCalls.push(req.postDataJSON() as Record<string, unknown>);
+      // Task 40C review: the manual-topology gate applies to Builds too.
+      if (state.mode === "topologyfail") {
+        state.activeJobId = "job-gate";
+        state.job = {
+          id: "job-gate",
+          kind: "vector compilation",
+          status: "failed",
+          progress: 0.2,
+          message:
+            "An ordinary Build rebuilds the gameplay surfaces; manual cuts, boundaries and label positions may be reset. Confirm the topology rebuild to continue.",
+        };
+        return json({ jobId: "job-gate", projectId: PID });
+      }
       state.activeJobId = "job-build";
       state.runningGets = 0;
       state.pendingKind = "build";

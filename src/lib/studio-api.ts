@@ -346,6 +346,9 @@ export interface ObjectUpdateRequest {
   max_regions?: number;
   order_action?: "bring_to_front" | "send_to_back" | "above" | "below";
   target_object_id?: string;
+  /** A layer reorder FULLY RECOMPILES — required when the revision carries
+   *  manual gameplay topology (cuts, boundary drags, custom labels). */
+  confirm_topology_rebuild?: boolean;
 }
 
 export const updateProjectObject = (
@@ -704,8 +707,15 @@ export const generateMaster = (
   }
 ): Promise<{ jobId: string; projectId: string }> => post(`/projects/${pid}/generate`, body);
 
-export const buildDraft = (pid: string, settings: BuildSettings): Promise<{ jobId: string; projectId: string }> =>
-  post(`/projects/${pid}/build`, settings);
+export const buildDraft = (
+  pid: string,
+  settings: BuildSettings,
+  confirmTopologyRebuild?: boolean
+): Promise<{ jobId: string; projectId: string }> =>
+  post(`/projects/${pid}/build`, {
+    ...settings,
+    ...(confirmTopologyRebuild ? { confirm_topology_rebuild: true } : {}),
+  });
 
 export const runEdit = (pid: string, payload: EditPayload): Promise<{ jobId: string; projectId: string }> =>
   post(`/projects/${pid}/edit`, payload);

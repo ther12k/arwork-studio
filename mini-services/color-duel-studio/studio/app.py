@@ -14,7 +14,8 @@ from .models import *
 from . import STUDIO_VERSION
 from .pipeline import (BACKENDS, clean_image, compile_image, compile_svg_master,
                         difficulty_profile, edit_bundle, edit_objects_bundle, read_json, write_json, make_export,
-                        load_bundle, normalize_objects, validate_bundle, legacy_geometry, checksum)
+                        load_bundle, normalize_objects, validate_bundle, legacy_geometry, checksum,
+                        require_topology_rebuild_confirmation)
 from .svg_master import clean_svg
 from .ai import Provider
 from .generation import (
@@ -523,7 +524,7 @@ def create_app(workspace: Path|None=None, transport=None):
                     'usage': {'kind': 'svg-generation', 'at': now(), **meta}}
         return start(pid, 'svg generation', run)
     @app.post('/api/projects/{pid}/build')
-    def build(pid:str,body:BuildSettings):
+    def build(pid:str,body:BuildRequest):
         with lock:p=project(pid)
         if not p['master']:raise HTTPException(400,'Upload your own master, load an example, or generate one first.')
         rev='rev-'+ident();version=f'0.{len(p["revisions"])+1}.0'
@@ -542,6 +543,18 @@ def create_app(workspace: Path|None=None, transport=None):
             if changed:
                 effective=body.model_copy(update=changed)
         def run(tick):
+            # Task 40C review generalization: an ordinary Build re-derives the
+            # WHOLE gameplay partition from the master — the same manual-
+            # topology gate as shape_order / shape / object reorder. Rebuilding
+            # manually authored gameplay is a deliberate destructive action,
+            # enforced here (backend-owned), never only in the UI.
+            if p.get('currentRevision'):
+                try:
+                    cur=load_bundle(folder(pid)/'revisions'/p['currentRevision'])
+                except Exception:
+                    cur=None
+                if cur is not None:
+                    require_topology_rebuild_confirmation(cur,body.confirm_topology_rebuild,'An ordinary Build')
             # Task 32 review R3: the CURRENT revision's objects.json is the
             # authoring sidecar — a rebuild overlays it so inspector edits
             # (rename/reparent/lock/detail budgets) survive recompilation

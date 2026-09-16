@@ -133,7 +133,7 @@ export interface StudioApi {
   nodeEdit: (regionIds: [string, string], d: string) => Promise<{ jobId: string }>;
   /** Resolves with the ACCEPTED job's id (not its outcome — the caller owns
    *  settle handling). */
-  editShape: (shapeId: string, d: string) => Promise<{ jobId: string }>;
+  editShape: (shapeId: string, d: string, confirmTopologyRebuild?: boolean) => Promise<{ jobId: string }>;
   /** Task 40A/40B: restyle one shape by stable shapeId — ink strokes take
    *  stroke_color/stroke_width/opacity; filled shapes take color (the fill,
    *  with preserve_shading) and stroke_color/stroke_width (the outline, 0 =
@@ -160,11 +160,13 @@ export interface StudioApi {
     order: "forward" | "backward",
     confirmTopologyRebuild?: boolean
   ) => Promise<{ jobId: string }>;
-  /** Task 40C review: a shape-order move the backend refused via the
-   *  manual-topology gate — the canvas renders the explicit confirmation
-   *  dialog for it; Cancel/retry clears it. */
-  gatedShapeOrder: { shapeId: string; order: "forward" | "backward" } | null;
-  dismissGatedShapeOrder: () => void;
+  /** Task 40C review: an operation the backend refused via the manual-topology
+   *  gate (shape order, shape geometry save, object layer reorder, Build) —
+   *  the canvas renders the explicit confirmation dialog with this copy;
+   *  confirm re-dispatches WITH confirm_topology_rebuild, dismiss clears. */
+  gatedOperation: GatedTopologyRequest | null;
+  confirmGatedOperation: () => void;
+  dismissGatedOperation: () => void;
   /** One poll pass on demand (edit-route 409 recovery): refreshes the
    *  project snapshot so an externally advanced revision becomes visible. */
   syncProject: () => Promise<void>;
@@ -305,6 +307,19 @@ export interface StudioApi {
 
 const StudioContext = createContext<StudioApi | null>(null);
 
+/** Task 40C review — a manual-topology gate refusal, carrying the dialog
+ *  copy and the operation to retry WITH confirm_topology_rebuild. */
+export type GatedTopologyRequest = {
+  title: string;
+  body: string;
+  confirmLabel: string;
+  pending:
+    | { kind: "shape-order"; shapeId: string; order: "forward" | "backward" }
+    | { kind: "shape-edit"; shapeId: string; d: string }
+    | { kind: "object-order"; update: Omit<ObjectUpdateRequest, "base_revision"> }
+    | { kind: "build" };
+};
+
 export function useStudioContext(): StudioApi {
   const ctx = useContext(StudioContext);
   if (!ctx) throw new Error("useStudioContext must be used inside <StudioProvider>");
@@ -420,11 +435,16 @@ export function StudioProvider({ children }: { children: React.ReactNode }) {
      *  unrelated job that finished while the operation was unresolved. */
     jobId?: string };
   const pendingOpRef = useRef<PendingOp | null>(null);
-  /** Task 40C review: the in-flight shape-order attempt, matched against the
-   *  job-failure message in the poll loop — a manual-topology gate refusal
-   *  routes to the confirmation dialog instead of an error toast. */
-  const shapeOrderAttemptRef = useRef<{ shapeId: string; order: "forward" | "backward" } | null>(null);
-  const [gatedShapeOrder, setGatedShapeOrder] = useState<{ shapeId: string; order: "forward" | "backward" } | null>(null);
+  /** Task 40C review — the ONE topology-rebuild gate flow: every gated
+   *  operation (shape order, shape geometry save, object layer reorder,
+   *  ordinary Build) arms this ref with its dialog copy + pending descriptor
+   *  RIGHT BEFORE submitting unconfirmed. When the poll loop sees the
+   *  backend's gate refusal, the pending op routes into `gatedOperation` —
+   *  the explicit confirmation dialog — instead of an error toast. The
+   *  backend owns the gate; this only collects consent and retries with the
+   *  flag (descriptor-based: no self-referencing closures). */
+  const topologyGateRef = useRef<GatedTopologyRequest | null>(null);
+  const [gatedOperation, setGatedOperation] = useState<GatedTopologyRequest | null>(null);
   const pendingCommitRef = useRef<{ sessionId: string; key: string } | null>(null);
 
   // Stable callback (only ever invoked from event handlers / effects): it
@@ -773,19 +793,19 @@ export function StudioProvider({ children }: { children: React.ReactNode }) {
           // until that job settles, even though THIS project is idle.
           pollTimerRef.current = setTimeout(() => void pollRef.current(pid), 2500);
         } else if (next.job?.status === "failed") {
-          // Task 40C review: a shape-order move refused by the manual-topology
-          // gate is not an error toast — it opens the explicit confirmation
-          // dialog (the backend owns the gate; this only routes the refusal).
+          // Task 40C review: a manual-topology gate refusal is not an error
+          // toast — it opens the explicit confirmation dialog for the armed
+          // operation (the backend owns the gate; this only routes it).
           const msg = next.job.message || "Job failed";
-          const attempt = shapeOrderAttemptRef.current;
-          shapeOrderAttemptRef.current = null;
-          if (attempt && msg.includes("rebuilds the gameplay surfaces")) {
-            setGatedShapeOrder(attempt);
+          const gated = topologyGateRef.current;
+          topologyGateRef.current = null;
+          if (gated && msg.includes("rebuilds the gameplay surfaces")) {
+            setGatedOperation(gated);
           } else {
             toast(msg);
           }
         } else {
-          shapeOrderAttemptRef.current = null;
+          topologyGateRef.current = null;
         }
       } catch (e) {
         toast(`Job polling stopped: ${(e as Error).message}`);
@@ -1033,11 +1053,19 @@ export function StudioProvider({ children }: { children: React.ReactNode }) {
     setView("master");
   }, [job, saveBrief]);
 
-  const build = useCallback(async () => {
+  const build = useCallback(async (confirmTopologyRebuild?: boolean) => {
     const p = projectRef.current;
     if (!p) throw new Error("Create a project first.");
+    if (!confirmTopologyRebuild) {
+      topologyGateRef.current = {
+        title: "Rebuild gameplay surfaces?",
+        body: "This artwork contains manually edited gameplay regions. Rebuilding can reset cuts, moved boundaries, merges, and custom labels.",
+        confirmLabel: "Rebuild gameplay surfaces",
+        pending: { kind: "build" },
+      };
+    }
     await saveBrief();
-    await job(() => buildDraft(p.id, buildSettingsRef.current));
+    await job(() => buildDraft(p.id, buildSettingsRef.current, confirmTopologyRebuild));
   }, [job, saveBrief]);
 
   const runEdit = useCallback(
@@ -1416,9 +1444,26 @@ export function StudioProvider({ children }: { children: React.ReactNode }) {
    *  by its stable id. region_ids is intentionally EMPTY — the action is
    *  shape-addressed, so it must never borrow (or require) the gameplay
    *  region selection. Server-side validation + full recompile; the 409
-   *  stale-base guard is the shared edit-route revision check. */
+   *  stale-base guard is the shared edit-route revision check. The full
+   *  recompile sits under the manual-topology gate: an unconfirmed save over
+   *  manually authored gameplay is refused by the BACKEND and the poll loop
+   *  routes the refusal into the confirmation dialog. */
   const editShape = useCallback(
-    (shapeId: string, d: string) => runEdit("shape", { shape_id: shapeId, d }, []),
+    (shapeId: string, d: string, confirmTopologyRebuild?: boolean) => {
+      if (!confirmTopologyRebuild) {
+        topologyGateRef.current = {
+          title: "Rebuild gameplay surfaces?",
+          body: "This will rebuild gameplay surfaces; manual cuts/boundaries/label positions may be reset. The previous revision stays available in the revision history.",
+          confirmLabel: "Rebuild & save",
+          pending: { kind: "shape-edit", shapeId, d },
+        };
+      }
+      return runEdit(
+        "shape",
+        { shape_id: shapeId, d, ...(confirmTopologyRebuild ? { confirm_topology_rebuild: true } : {}) },
+        []
+      );
+    },
     [runEdit]
   );
   /** Task 40A/40B — restyle one shape (shape-addressed; never touches the
@@ -1450,7 +1495,14 @@ export function StudioProvider({ children }: { children: React.ReactNode }) {
    *  answers the backend's manual-topology gate for filled shapes. */
   const editShapeOrder = useCallback(
     (shapeId: string, order: "forward" | "backward", confirmTopologyRebuild?: boolean) => {
-      shapeOrderAttemptRef.current = { shapeId, order };
+      if (!confirmTopologyRebuild) {
+        topologyGateRef.current = {
+          title: "Rebuild gameplay surfaces?",
+          body: "This will rebuild gameplay surfaces; manual cuts/boundaries/label positions may be reset. The previous revision stays available in the revision history.",
+          confirmLabel: "Rebuild & move",
+          pending: { kind: "shape-order", shapeId, order },
+        };
+      }
       return runEdit(
         "shape_order",
         {
@@ -1464,9 +1516,6 @@ export function StudioProvider({ children }: { children: React.ReactNode }) {
     },
     [runEdit]
   );
-  /** Clear the manual-topology confirmation dialog (Cancel or after the
-   *  confirmed retry is submitted). */
-  const dismissGatedShapeOrder = useCallback(() => setGatedShapeOrder(null), []);
   /** Apply a custom free-mode color (contract §4) and remember it in the
    *  recent list (capped at 10, persisted in localStorage OUTSIDE the board). */
   const setBoardFreeColor = useCallback((hex: string) => {
@@ -1614,6 +1663,16 @@ export function StudioProvider({ children }: { children: React.ReactNode }) {
     async (update: Omit<ObjectUpdateRequest, "base_revision">) => {
       const p = projectRef.current;
       if (!p || !p.currentRevision) throw new Error("No active revision to update.");
+      // A layer reorder FULLY RECOMPILES — same manual-topology gate as the
+      // shape-addressed moves (backend-enforced; dialog collects consent).
+      if (update.order_action && !update.confirm_topology_rebuild) {
+        topologyGateRef.current = {
+          title: "Rebuild gameplay surfaces?",
+          body: "This will rebuild gameplay surfaces; manual cuts/boundaries/label positions may be reset. The previous revision stays available in the revision history.",
+          confirmLabel: "Rebuild & move",
+          pending: { kind: "object-order", update },
+        };
+      }
       await job(() =>
         apiUpdateProjectObject(p.id, {
           ...update,
@@ -1623,6 +1682,27 @@ export function StudioProvider({ children }: { children: React.ReactNode }) {
     },
     [job]
   );
+
+  /** Task 40C review — dialog actions for the manual-topology gate. Confirm
+   *  re-dispatches the refused operation WITH the flag (the backend then
+   *  allows the rebuild); Cancel just clears the dialog. Defined after every
+   *  gated submitter so the descriptors resolve without self-reference. */
+  const dismissGatedOperation = useCallback(() => setGatedOperation(null), []);
+  const confirmGatedOperation = useCallback(() => {
+    const op = gatedOperation;
+    setGatedOperation(null);
+    if (!op) return;
+    const p = op.pending;
+    if (p.kind === "shape-order") {
+      void editShapeOrder(p.shapeId, p.order, true).catch((e: Error) => toast(e.message));
+    } else if (p.kind === "shape-edit") {
+      void editShape(p.shapeId, p.d, true).catch((e: Error) => toast(e.message));
+    } else if (p.kind === "object-order") {
+      void updateObject({ ...p.update, confirm_topology_rebuild: true }).catch((e: Error) => toast(e.message));
+    } else {
+      void build(true).catch((e: Error) => toast(e.message));
+    }
+  }, [gatedOperation, editShapeOrder, editShape, updateObject, build]);
 
   const inspectObject = useCallback((id: string) => {
     setSelectedObjectId(id);
@@ -1722,8 +1802,9 @@ export function StudioProvider({ children }: { children: React.ReactNode }) {
     editShape,
     editShapeStyle,
     editShapeOrder,
-    gatedShapeOrder,
-    dismissGatedShapeOrder,
+    gatedOperation,
+    confirmGatedOperation,
+    dismissGatedOperation,
     syncProject,
     freeColor,
     setBoardFreeColor,

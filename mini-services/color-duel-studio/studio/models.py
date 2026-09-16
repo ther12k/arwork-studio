@@ -22,6 +22,17 @@ class BuildSettings(StrictModel):
     auto_subdivide: bool = Field(False,
         description='Deterministically subdivide oversized regions with organic hand-cut boundaries until the target region count is reached (SVG-master builds; true-vector, no rasterization).')
 
+class BuildRequest(BuildSettings):
+    """Task 40C review — a Build that re-derives the whole gameplay partition.
+    When the current revision carries manual gameplay topology (manualTopology
+    provenance / manual region-id prefixes), the build is REJECTED until the
+    client sends this explicit confirmation: rebuilding is a deliberate
+    destructive action for manually authored gameplay, never a surprise.
+    Kept OUT of BuildSettings so build-settings.json stays pure compiler
+    configuration; exclude=True keeps it out of every model_dump() the
+    compiler persists (recompiles re-validate that file as BuildSettings)."""
+    confirm_topology_rebuild: bool = Field(False, exclude=True)
+
 class CreateProject(StrictModel):
     title: str = Field('Untitled artwork', min_length=1, max_length=100)
     brief: str = Field('', max_length=8000)
@@ -170,4 +181,9 @@ class ObjectUpdateRequest(StrictModel):
     max_regions: int | None = Field(None, ge=0, le=5000)
     order_action: Literal['bring_to_front', 'send_to_back', 'above', 'below'] | None = None
     target_object_id: str | None = Field(None, max_length=64)
+    # Layer reorders FULLY RECOMPILE the revision (visible surfaces re-derive
+    # from the reordered master). When the revision carries manual gameplay
+    # topology, the reorder is rejected until this confirmation is sent —
+    # same backend-owned gate as shape_order / shape / Build.
+    confirm_topology_rebuild: bool = False
 
