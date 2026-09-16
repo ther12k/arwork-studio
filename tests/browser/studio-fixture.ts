@@ -37,6 +37,10 @@ export const EDITED_D = "M 70,180 C 170,60 230,60 230,180 C 230,300 70,300 70,18
 
 export type EditMode = "reject409" | "jobfail" | "success";
 
+/** Task 40B: per-revision appearance of the FILLED blob (fill + outline).
+ *  No stroke ⇒ no outline (the backend removes both keys on width 0). */
+export type ShapeStyle = { fill: string; stroke?: string; strokeWidth?: number };
+
 export type FixtureState = {
   mode: EditMode;
   revision: string;
@@ -45,20 +49,26 @@ export type FixtureState = {
   revInk: Record<string, string>;
   /** Task 40A: per-revision ink stroke style (color/width/opacity). */
   revInkStyle: Record<string, { color: string; width: number; opacity?: number }>;
+  /** Task 40B: per-revision filled-shape appearance. */
+  revShape: Record<string, ShapeStyle>;
   /** Which shape the accepted edit job targeted (paint vs ink routing). */
   pendingShape: string;
   /** Accepted shape_style job's next appearance. */
   pendingStyle: { color: string; width: number; opacity?: number } | null;
+  pendingShapeStyle: ShapeStyle | null;
   job: Record<string, unknown>;
   editCalls: Array<Record<string, unknown>>;
   objectCalls: Array<Record<string, unknown>>;
+  buildCalls: Array<Record<string, unknown>>;
   runningGets: number;
   pendingD: string;
-  pendingKind: "edit" | "objects" | "style" | null;
+  pendingKind: "edit" | "objects" | "style" | "build" | null;
   /** jobId returned by the POST — the settled project.job must keep THIS id
    *  (the app's settle-watch attributes outcomes by job identity). */
   activeJobId: string;
 };
+
+const SHAPE0: ShapeStyle = { fill: "#3366CC" };
 
 export const mkState = (): FixtureState => ({
   mode: "reject409",
@@ -66,11 +76,14 @@ export const mkState = (): FixtureState => ({
   revPaint: { [REV1]: ORIGINAL_D },
   revInk: { [REV1]: INK_D },
   revInkStyle: {},
+  revShape: { [REV1]: SHAPE0 },
   pendingShape: SHAPE,
   pendingStyle: null,
+  pendingShapeStyle: null,
   job: { status: "idle" },
   editCalls: [],
   objectCalls: [],
+  buildCalls: [],
   runningGets: 0,
   pendingD: "",
   pendingKind: null,
@@ -78,8 +91,13 @@ export const mkState = (): FixtureState => ({
 });
 
 const ART = "journey-artwork";
-/** Immutable revision chain: each operation publishes the next one. */
-const NEXT_REV: Record<string, string> = { [REV1]: REV2, [REV2]: REV3 };
+/** Immutable revision chain: each operation publishes the next one. The tail
+ *  beyond REV3 serves the fallback (unchanged) artwork — the 40B journeys
+ *  Build twice on top of the style saves. */
+const CHAIN = [REV1, REV2, REV3, "rev-4", "rev-5"];
+const NEXT_REV: Record<string, string> = Object.fromEntries(
+  CHAIN.slice(0, -1).map((r, i) => [r, CHAIN[i + 1]])
+);
 
 const revision = (id: string) => ({
   id,
@@ -163,13 +181,23 @@ const palette = [
   { id: 2, number: 2, name: "Blue", hex: "#3366CC", paint: { type: "solid", stops: [] } },
 ];
 
-const paintFor = (d: string, inkD: string, style: { color: string; width: number; opacity?: number }) => ({
+const paintFor = (
+  d: string,
+  inkD: string,
+  style: { color: string; width: number; opacity?: number },
+  shape: ShapeStyle
+) => ({
   schemaVersion: 2,
   artworkId: ART,
   viewBox: [0, 0, 300, 300],
   paths: [
     { z: 0, shapeId: "s0001", d: "M 20,20 L 280,20 L 280,280 L 20,280 Z", fill: "#CC3333", fillRule: "evenodd" },
-    { z: 1, shapeId: SHAPE, d, fill: "#3366CC", fillRule: "evenodd" },
+    {
+      z: 1, shapeId: SHAPE, d, fill: shape.fill, fillRule: "evenodd",
+      ...(shape.stroke && shape.strokeWidth
+        ? { stroke: shape.stroke, strokeWidth: shape.strokeWidth }
+        : {}),
+    },
   ],
   inkPaths: [{
     z: 2, shapeId: INK, d: inkD, fill: style.color, strokeWidth: style.width, filled: false,
@@ -271,17 +299,21 @@ const project = (state: FixtureState) => ({
   updatedAt: "2026-01-01T00:00:00Z",
   messages: [],
   aiUsage: [],
-  master: null,
+  // A vector master so the right panel's "Build vector draft" is enabled —
+  // the 40B journeys Build after style saves (recompile ⇒ artwork unchanged).
+  master: {
+    file: "master.svg", width: 300, height: 300, sha256: "sha-master",
+    source: "upload", rightsConfirmed: true, createdAt: "2026-01-01T00:00:00Z", kind: "svg",
+  },
   reference: null,
-  revisions: (
-    state.revision === REV3 ? [REV1, REV2, REV3] : state.revision === REV2 ? [REV1, REV2] : [REV1]
-  ).map(revision),
+  revisions: CHAIN.slice(0, CHAIN.indexOf(state.revision) + 1).map(revision),
   currentRevision: state.revision,
   job: state.job,
 });
 
 /** Publish the next revision. An edit job carries its submitted paint; an
- *  objects job carries the previous artwork unchanged. */
+ *  objects job carries the previous artwork unchanged; a BUILD job is the
+ *  recompile-from-master equivalent: the artwork carries over unchanged. */
 const publish = (state: FixtureState) => {
   const next = NEXT_REV[state.revision];
   if (!next) throw new Error("fixture revision chain exhausted");
@@ -295,10 +327,15 @@ const publish = (state: FixtureState) => {
   state.revInkStyle[next] = state.pendingKind === "style" && state.pendingStyle
     ? state.pendingStyle
     : state.revInkStyle[state.revision] ?? INK_STYLE0;
+  state.revShape[next] = state.pendingKind === "style" && state.pendingShapeStyle
+    ? state.pendingShapeStyle
+    : state.revShape[state.revision] ?? SHAPE0;
   state.revision = next;
   state.job = {
     id: state.activeJobId,
-    kind: state.pendingKind === "edit" ? "shape edit" : state.pendingKind === "style" ? "ink style" : "object update",
+    kind: state.pendingKind === "edit" ? "shape edit"
+      : state.pendingKind === "build" ? "vector compilation"
+      : state.pendingKind === "style" ? "ink style" : "object update",
     status: "done",
     progress: 100,
   };
@@ -340,7 +377,7 @@ const fileFor = (state: FixtureState, rev: string, name: string): unknown => {
     case "palette.json":
       return palette;
     case "paint.json":
-      return paintFor(d, inkD, inkStyle);
+      return paintFor(d, inkD, inkStyle, state.revShape[rev] ?? SHAPE0);
     case "objects.json":
       return objectsFor(rev);
     default:
@@ -389,6 +426,18 @@ export async function routeBackend(page: Page, state: FixtureState) {
       state.pendingKind = "objects";
       return json({ jobId: "job-objects" });
     }
+    if (path === `/api/projects/${PID}/build` && req.method() === "POST") {
+      // Recompile from the master: the artwork carries over UNCHANGED (the
+      // fixture's master always represents the latest published appearance —
+      // the real backend guarantees that via _sync_source_master).
+      state.buildCalls.push(req.postDataJSON() as Record<string, unknown>);
+      state.activeJobId = "job-build";
+      state.runningGets = 0;
+      state.pendingKind = "build";
+      state.pendingD = null;
+      state.job = { id: "job-build", kind: "vector compilation", status: "running", progress: 10 };
+      return json({ jobId: "job-build", projectId: PID });
+    }
     if (path === `/api/projects/${PID}/edit` && req.method() === "POST") {
       const body = req.postDataJSON() as Record<string, unknown>;
       if (state.mode !== "reject409" && body.base_revision !== state.revision) {
@@ -411,6 +460,27 @@ export async function routeBackend(page: Page, state: FixtureState) {
       }
       state.activeJobId = "job-ok";
       state.runningGets = 0;
+      if (body.action === "shape_style" && String(body.shape_id) === SHAPE) {
+        // Task 40B: filled target — fill + outline with the backend's
+        // deletion semantics (width 0 removes the outline entirely).
+        const cur = state.revShape[state.revision] ?? SHAPE0;
+        const nextShape: ShapeStyle = { ...cur };
+        if (typeof body.color === "string") nextShape.fill = body.color;
+        if (body.stroke_width === 0) {
+          delete nextShape.stroke;
+          delete nextShape.strokeWidth;
+        } else {
+          if (typeof body.stroke_color === "string") nextShape.stroke = body.stroke_color;
+          if (typeof body.stroke_width === "number") nextShape.strokeWidth = body.stroke_width;
+          else if (nextShape.stroke && !nextShape.strokeWidth) nextShape.strokeWidth = 1.5;
+        }
+        state.pendingShapeStyle = nextShape;
+        state.pendingStyle = null;
+        state.pendingKind = "style";
+        state.pendingD = null;
+        state.job = { id: "job-ok", kind: "ink style", status: "running", progress: 10 };
+        return json({ jobId: "job-ok", projectId: PID });
+      }
       if (body.action === "shape_style") {
         // Task 40A: appearance-only — merge the new style over the current
         // revision's ink style (echoes the real backend's paint behavior).
@@ -426,6 +496,7 @@ export async function routeBackend(page: Page, state: FixtureState) {
               ? { opacity: cur.opacity }
               : {}),
         };
+        state.pendingShapeStyle = null;
         state.pendingKind = "style";
         state.pendingD = null;
         state.job = { id: "job-ok", kind: "ink style", status: "running", progress: 10 };

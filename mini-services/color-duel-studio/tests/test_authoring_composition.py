@@ -477,15 +477,16 @@ def test_ink_style_edit(client):
     ink5 = next(p_ for p_ in d5['paint']['inkPaths'] if p_['shapeId'] == ink_id)
     assert ink5['strokeWidth'] == 2.0
 
-    # Guardrails: not-an-ink target and empty style both fail cleanly.
-    blob_shape = next(o for o in d5['objects'] if o['id'] == 'obj-blob')['shapeIds'][0]
+    # Guardrails: an unknown shape id fails cleanly; an empty style fails
+    # cleanly. (A FILLED target + stroke_color is no longer a guardrail —
+    # Task 40B makes that the outline edit; covered in test_filled_style_edit.)
     r = client.post(f'/api/projects/{pid}/edit', headers=H, json={
-        'base_revision': rev5, 'action': 'shape_style', 'shape_id': blob_shape,
+        'base_revision': rev5, 'action': 'shape_style', 'shape_id': 's9999',
         'region_ids': [], 'stroke_color': STYLE_TEAL})
     assert r.status_code == 200, r.text
     p = wait(client, pid)
     assert p['job']['status'] == 'failed', p['job']
-    assert 'not an ink stroke' in p['job'].get('message', '')
+    assert 'not a paintable shape' in p['job'].get('message', '')
     r = client.post(f'/api/projects/{pid}/edit', headers=H, json={
         'base_revision': p['currentRevision'], 'action': 'shape_style',
         'shape_id': ink_id, 'region_ids': []})
@@ -544,3 +545,205 @@ def test_ink_width_floor(client):
     ink4 = next(p_ for p_ in d4['paint']['inkPaths'] if p_['shapeId'] == ink_id)
     assert ink4.get('opacity') == 0.0 and ink4['strokeWidth'] == 0.4
     assert d4['master'].count(f'id="{ink_id}"') == 1  # still present in source
+
+
+# ---------------------------------------------------------- Task 40B: filled style
+
+FILLED_SVG = b'''<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 300 300">
+<defs>
+  <linearGradient id="sunset" x1="0" y1="0" x2="0" y2="1">
+    <stop offset="0" stop-color="#FFD27D"/>
+    <stop offset="1" stop-color="#C4503A"/>
+  </linearGradient>
+</defs>
+<g data-cd-object="obj-blob" data-cd-name="Blob">
+  <path d="M 50,100 C 50,60 120,40 160,70 C 200,100 200,160 160,190 C 120,220 50,190 50,100 Z" fill="url(#sunset)"/>
+</g>
+<g data-cd-object="obj-plain" data-cd-name="Plain">
+  <rect x="40" y="230" width="220" height="60" fill="#CC8844"/>
+</g>
+</svg>'''
+
+ORANGE = '#E8760C'
+OUTLINE_BLUE = '#1B4F8A'
+SOLID_GREEN = '#3FA34D'
+
+
+def _rgb(hx):
+    hx = hx.lstrip('#')
+    return tuple(int(hx[k:k + 2], 16) for k in (0, 2, 4))
+
+
+def test_filled_style_edit(client):
+    """Task 40B — filled-shape appearance on the mature recolor semantics,
+    shape-addressed. Fill (+ preserve-shading gradient tint) moves EVERY
+    region of the shape to the palette group whose answer color IS the new
+    fill (reuse-or-create, never a shared-swatch mutation) while region
+    GEOMETRY stays identical. Outlines are pure appearance: width 0 REMOVES
+    one, and outline-only edits keep regions.json, palette.json and the
+    answer key byte-identical. An ordinary Build (×2) preserves the tint,
+    the outline and the removal."""
+    pid = new(client)
+    r = client.post(f'/api/projects/{pid}/upload-svg', headers=H,
+                    files={'file': ('filled.svg', FILLED_SVG, 'image/svg+xml')},
+                    data={'rights_confirmed': 'true'})
+    assert r.status_code == 200, r.text
+    r = client.post(f'/api/projects/{pid}/build', headers=H, json=BUILD_BODY)
+    assert r.status_code == 200, r.text
+    rev = wait(client, pid)['currentRevision']
+    d0 = files(client, pid, rev)
+    assert_qa(d0, 'import+build')
+    blob = next(o for o in d0['objects'] if o['id'] == 'obj-blob')['shapeIds'][0]
+    plain = next(o for o in d0['objects'] if o['id'] == 'obj-plain')['shapeIds'][0]
+    blob_regions = {r_['id'] for r_ in d0['regions'] if r_.get('masterShapeId') == blob}
+    plain_regions = {r_['id'] for r_ in d0['regions'] if r_.get('masterShapeId') == plain}
+    geom_before = {r_['id']: r_['d'] for r_ in d0['regions']}
+    pid_before = {r_['id']: r_['paletteId'] for r_ in d0['regions']}
+    stops_before = [s['color'] for s in d0['paint']['gradients'][0]['stops']]
+
+    # ---- 1. Fill with preserve_shading: the gradient TINTS toward orange,
+    # keeps its stop structure, and every blob region moves to the orange
+    # answer group. Region geometry (d bytes) is untouched.
+    rev1 = step(client, pid, rev, {
+        'base_revision': rev, 'action': 'shape_style', 'shape_id': blob,
+        'region_ids': [], 'color': ORANGE, 'preserve_shading': True})
+    d1 = files(client, pid, rev1)
+    assert_qa(d1, 'fill+preserve')
+    entry = next(e for e in d1['paint']['paths'] if e['shapeId'] == blob)
+    assert entry['fill'].startswith('url(#'), 'preserve_shading must keep the gradient'
+    grad = next(g for g in d1['paint']['gradients'] if g['id'] == entry['fill'][5:-1])
+    stops1 = [s['color'] for s in grad['stops']]
+    assert len(stops1) == len(stops_before), 'stop structure must survive the tint'
+    assert stops1 != stops_before, 'the tint must actually shift the stops'
+    avg = [sum(c[k] for c in map(_rgb, stops1)) / len(stops1) for k in range(3)]
+    # tolerance 4: the per-channel ratio tint can CLAMP at 0/255 on individual
+    # stops, which pulls the realized average slightly off the exact target.
+    assert all(abs(a - b) <= 4 for a, b in zip(avg, _rgb(ORANGE))), \
+        f'tint must pull the stop average onto the target, got {stops1}'
+    orange_group = next(e for e in d1['palette'] if e['hex'].upper() == ORANGE)
+    pid_after = {r_['id']: r_['paletteId'] for r_ in d1['regions']}
+    assert all(pid_after[rid] == orange_group['id'] for rid in blob_regions), \
+        'every region of the shape must follow the new answer color'
+    assert all(pid_after[rid] == pid_before[rid] for rid in plain_regions), \
+        'unrelated regions keep their answer color (palette identity)'
+    assert {r_['id']: r_['d'] for r_ in d1['regions']} == geom_before, \
+        'fill edits must not touch region geometry'
+    # the tint is folded into the authoritative master's stops (by ref)
+    assert all(c in d1['master'] for c in stops1)
+    # existing palette groups were not mutated (reuse-or-create only)
+    for e in d1['palette']:
+        old = next((o for o in d0['palette'] if o['id'] == e['id']), None)
+        if old is not None:
+            assert old['hex'] == e['hex'] and old['name'] == e['name']
+
+    # ---- 2. Outline add: pure appearance — regions.json, palette.json and
+    # the answer key are byte-identical.
+    regions1 = sorted(d1['regions'], key=lambda r_: r_['id'])
+    rev2 = step(client, pid, rev1, {
+        'base_revision': rev1, 'action': 'shape_style', 'shape_id': blob,
+        'region_ids': [], 'stroke_color': OUTLINE_BLUE, 'stroke_width': 2.0})
+    d2 = files(client, pid, rev2)
+    assert_qa(d2, 'outline add')
+    entry2 = next(e for e in d2['paint']['paths'] if e['shapeId'] == blob)
+    assert entry2['stroke'] == OUTLINE_BLUE and entry2['strokeWidth'] == 2.0
+    assert sorted(d2['regions'], key=lambda r_: r_['id']) == regions1, \
+        'outline edits must not touch regions.json'
+    assert d2['palette'] == d1['palette'], 'outline edits must not touch palette.json'
+    assert f'stroke="{OUTLINE_BLUE}"' in d2['master']
+    assert 'stroke-width="2.0"' in d2['master'] or 'stroke-width="2"' in d2['master']
+    colored2 = client.get(f'/api/projects/{pid}/revisions/{rev2}/files/colored.svg', headers=H).text
+    assert f'stroke="{OUTLINE_BLUE}"' in colored2, 'outline missing from the exported colored.svg'
+
+    # ---- 3. Ordinary Build ×2 preserves the tint AND the outline; palette
+    # re-derives from the (tinted) master fills — the documented contract.
+    for _ in range(2):
+        r = client.post(f'/api/projects/{pid}/build', headers=H, json=BUILD_BODY)
+        assert r.status_code == 200, r.text
+        p = wait(client, pid)
+        assert p['job']['status'] == 'done', p['job']
+    d3 = files(client, pid, p['currentRevision'])
+    assert_qa(d3, 'build x2')
+    entry3 = next(e for e in d3['paint']['paths'] if e['shapeId'] == blob)
+    assert entry3['fill'].startswith('url(#'), 'gradient flattening lost by Build'
+    grad3 = next(g for g in d3['paint']['gradients'] if g['id'] == entry3['fill'][5:-1])
+    stops3 = [s['color'] for s in grad3['stops']]
+    assert stops3 == stops1, 'gradient tint drifted across Build ×2'
+    assert entry3.get('stroke') == OUTLINE_BLUE and entry3.get('strokeWidth') == 2.0, \
+        'outline lost by an ordinary Build'
+    pid3 = {r_['id']: r_['paletteId'] for r_ in d3['regions']}
+    mid = stops3[len(stops3) // 2]  # the importer's representative fill
+    assert len({pid3[rid] for rid in blob_regions}) == 1, 'the shape\'s regions stay one group'
+    by_hex = {e['hex'].upper(): e['id'] for e in d3['palette']}
+    assert pid3[next(iter(blob_regions))] == by_hex[mid.upper()], \
+        'Build must re-derive the blob group from the tinted representative fill'
+
+    # ---- 4. Outline removal: width 0 — real deletion semantics in paint AND
+    # master; an ordinary Build must not resurrect it.
+    rev4 = step(client, pid, p['currentRevision'], {
+        'base_revision': p['currentRevision'], 'action': 'shape_style',
+        'shape_id': blob, 'region_ids': [], 'stroke_width': 0.0})
+    d4 = files(client, pid, rev4)
+    entry4 = next(e for e in d4['paint']['paths'] if e['shapeId'] == blob)
+    assert 'stroke' not in entry4 and 'strokeWidth' not in entry4
+    assert f'stroke="{OUTLINE_BLUE}"' not in d4['master']
+    r = client.post(f'/api/projects/{pid}/build', headers=H, json=BUILD_BODY)
+    assert r.status_code == 200, r.text
+    p = wait(client, pid)
+    assert p['job']['status'] == 'done', p['job']
+    d5 = files(client, pid, p['currentRevision'])
+    entry5 = next(e for e in d5['paint']['paths'] if e['shapeId'] == blob)
+    assert 'stroke' not in entry5, 'removed outline resurrected by Build'
+
+    # ---- 5. Solid fill replace (preserve_shading=False on a gradient is a
+    # deliberate flatten; here the plain shape is already solid) and the
+    # idempotence guard: requesting the CURRENT fill must not move palette
+    # groups even on manually reassigned regions.
+    rev6 = step(client, pid, p['currentRevision'], {
+        'base_revision': p['currentRevision'], 'action': 'shape_style',
+        'shape_id': plain, 'region_ids': [], 'color': SOLID_GREEN})
+    d6 = files(client, pid, rev6)
+    entry6 = next(e for e in d6['paint']['paths'] if e['shapeId'] == plain)
+    assert entry6['fill'] == SOLID_GREEN
+    green_group = next(e for e in d6['palette'] if e['hex'].upper() == SOLID_GREEN)
+    pid6 = {r_['id']: r_['paletteId'] for r_ in d6['regions']}
+    assert all(pid6[rid] == green_group['id'] for rid in plain_regions)
+    # manual palette reassignment (number group ≠ appearance), then an
+    # outline-only edit carrying the unchanged fill color: the manual group
+    # assignment must survive.
+    manual = next(e for e in d6['palette'] if e['id'] != green_group['id'])
+    rev7 = step(client, pid, rev6, {
+        'base_revision': rev6, 'action': 'palette',
+        'region_ids': [sorted(plain_regions)[0]], 'palette_id': manual['id']})
+    d7 = files(client, pid, rev7)
+    first_plain = sorted(plain_regions)[0]
+    assert next(r_ for r_ in d7['regions'] if r_['id'] == first_plain)['paletteId'] == manual['id']
+    rev8 = step(client, pid, rev7, {
+        'base_revision': rev7, 'action': 'shape_style', 'shape_id': plain,
+        'region_ids': [], 'color': SOLID_GREEN, 'stroke_width': 1.0})
+    d8 = files(client, pid, rev8)
+    assert next(r_ for r_ in d8['regions'] if r_['id'] == first_plain)['paletteId'] == manual['id'], \
+        'an unchanged fill must be a no-op for palette groups (outline-only invariant)'
+
+    # ---- 6. Guardrails: opacity is not available for filled shapes; nonzero
+    # outline widths start at 0.4; a region selection is rejected.
+    r = client.post(f'/api/projects/{pid}/edit', headers=H, json={
+        'base_revision': rev8, 'action': 'shape_style', 'shape_id': plain,
+        'region_ids': [], 'opacity': 0.5})
+    assert r.status_code == 200, r.text
+    p = wait(client, pid)
+    assert p['job']['status'] == 'failed', p['job']
+    assert 'not available for filled shapes' in p['job'].get('message', '')
+    r = client.post(f'/api/projects/{pid}/edit', headers=H, json={
+        'base_revision': p['currentRevision'], 'action': 'shape_style',
+        'shape_id': plain, 'region_ids': [], 'stroke_width': 0.2})
+    assert r.status_code == 200, r.text
+    p = wait(client, pid)
+    assert p['job']['status'] == 'failed', p['job']
+    assert '0.4' in p['job'].get('message', '')
+    r = client.post(f'/api/projects/{pid}/edit', headers=H, json={
+        'base_revision': p['currentRevision'], 'action': 'shape_style',
+        'shape_id': plain, 'region_ids': [first_plain], 'stroke_width': 1.0})
+    assert r.status_code == 200, r.text
+    p = wait(client, pid)
+    assert p['job']['status'] == 'failed', p['job']
+    assert 'no region selection' in p['job'].get('message', '')

@@ -78,10 +78,17 @@ function serializeGradientDefs(gradients: PaintGradient[]): string {
 /** Art-layer path (below the masks): closed fills, z-sorted — the exact
  *  attribute logic the live `vector-paint` group uses in mount(). */
 function serializeArtPath(p: PaintPath): string | null {
-  if (p.filled === false || (p.strokeWidth != null && !p.fill.startsWith("#"))) return null;
+  // Ink classification matches the backend serializer exactly: filled===false
+  // or strokeWidth with NO fill at all (a gradient fill with an outline is a
+  // filled art path, not ink).
+  if (p.filled === false || (p.strokeWidth != null && !p.fill)) return null;
   const gradientFill = p.fill.startsWith("url(#");
   const attrs = [`d="${escapeXml(p.d)}"`, `fill="${escapeXml(p.fill)}"`, `fill-rule="${p.fillRule ?? "evenodd"}"`];
-  if (!gradientFill) {
+  // Explicit outlines (Task 40B) render on gradient fills too; the
+  // fill-colored hairline fallback stays solid-only (invalid stroke url).
+  if (p.stroke && p.strokeWidth && p.strokeWidth > 0) {
+    attrs.push(`stroke="${escapeXml(p.stroke)}"`, `stroke-width="${p.strokeWidth}"`, 'stroke-linejoin="round"');
+  } else if (!gradientFill) {
     attrs.push(`stroke="${escapeXml(p.stroke ?? p.fill)}"`, `stroke-width="${p.strokeWidth ?? 0.55}"`, 'stroke-linejoin="round"');
   }
   if (p.fillOpacity != null && p.fillOpacity < 0.999) attrs.push(`fill-opacity="${p.fillOpacity}"`);
@@ -237,6 +244,21 @@ export interface PaintLayer {
   paths: PaintPath[];
   inkPaths: PaintPath[];
   gradients?: PaintGradient[];
+}
+
+/** Dominant hex of a FILLED paint path: its solid fill, or the rounded
+ *  average of its gradient stops — the same anchor the backend tints toward
+ *  (Task 40B appearance editor seeds its color input with this value). */
+export function paintFillHex(paint: PaintLayer, path: PaintPath): string {
+  const fill = path.fill ?? "";
+  if (!fill.startsWith("url(#")) return /^#[0-9A-Fa-f]{6}$/.test(fill) ? fill.toUpperCase() : "#808080";
+  const grad = (paint.gradients ?? []).find((g) => g.id === fill.slice(5, -1));
+  const stops = (grad?.stops ?? []).filter((s) => /^#[0-9A-Fa-f]{6}$/.test(s.color ?? ""));
+  if (!stops.length) return "#808080";
+  const avg = [0, 1, 2].map(
+    (k) => stops.reduce((sum, s) => sum + parseInt(s.color.slice(1 + k * 2, 3 + k * 2), 16), 0) / stops.length
+  );
+  return "#" + avg.map((v) => Math.round(v).toString(16).padStart(2, "0")).join("").toUpperCase();
 }
 
 export interface ObjectGroup {
@@ -772,21 +794,28 @@ export class VectorBoard {
         (a, b) => (a.z ?? Infinity) - (b.z ?? Infinity)
       );
       for (const p of entries) {
-        if (p.filled === false || (p.strokeWidth != null && !p.fill.startsWith("#"))) continue;
+        // Ink classification = backend semantics: filled===false, or
+        // strokeWidth with NO fill at all. A gradient fill with an outline
+        // (Task 40B) is a filled art path.
+        if (p.filled === false || (p.strokeWidth != null && !p.fill)) continue;
         const gradientFill = p.fill.startsWith("url(#");
         const attrs: Attrs = { d: p.d, fill: p.fill, "fill-rule": p.fillRule ?? "evenodd" };
         if (p.shapeId) attrs["data-shape-id"] = p.shapeId;
-        if (!gradientFill) {
+        // An EXPLICIT outline (Task 40B) renders on every fill, gradients
+        // included — the same contract as the exported colored.svg. Only the
+        // fill-colored hairline fallback is solid-only (a url(#…) stroke
+        // would be invalid).
+        if (p.stroke && p.strokeWidth && p.strokeWidth > 0) {
+          attrs.stroke = p.stroke;
+          attrs["stroke-width"] = p.strokeWidth;
+          attrs["stroke-linejoin"] = "round";
+        } else if (!gradientFill) {
           attrs.stroke = p.stroke ?? p.fill;
           attrs["stroke-width"] = p.strokeWidth ?? 0.55;
           attrs["stroke-linejoin"] = "round";
         }
         if (p.fillOpacity != null && p.fillOpacity < 0.999) attrs["fill-opacity"] = p.fillOpacity;
         if (p.opacity != null && p.opacity < 0.999) attrs.opacity = p.opacity;
-        if (p.stroke && p.strokeWidth && p.strokeWidth > 0 && !gradientFill) {
-          attrs.stroke = p.stroke;
-          attrs["stroke-width"] = p.strokeWidth;
-        }
         art.append(svgNode("path", attrs));
       }
       this.artLayer = art;

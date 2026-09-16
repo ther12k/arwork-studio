@@ -2937,21 +2937,14 @@ def _color_answer_conflicts(bundle: dict, threshold: float = 100.0) -> tuple:
     return checked, conflicts
 
 
-def _recolor_bundle(bundle: dict, chosen, color: str, preserve_shading: bool) -> None:
-    """Recolor the *visible appearance* of the chosen regions' source shapes.
-
-    Separate from the 'palette' action (which assigns the number group):
-    this changes what the player sees. ``preserve_shading`` keeps gradient
-    shading (tinted toward the target); otherwise the fill is replaced.
-    """
+def _restyle_shape_appearance(bundle: dict, shape_ids: set, color: str, preserve_shading: bool) -> None:
+    """Shape-addressed repaint core (Task 40B refactor of _recolor_bundle):
+    replace the fill of the given source shapes' paint paths — or tint their
+    gradients toward ``color`` when ``preserve_shading`` keeps the shading.
+    No palette moves here: callers decide which regions follow (region-selected
+    recolor moves the chosen regions; the Art-node appearance editor moves
+    every region of the shape)."""
     paint = bundle['paint']
-    shape_ids = set()
-    for r in chosen:
-        sid = r.get('masterShapeId')
-        if not sid:
-            raise ValueError(f'Region {r["id"]} has no paintable source shape; '
-                             'raster-built bundles can only be re-colored by rebuilding.')
-        shape_ids.add(sid)
     paths = [p for p in (paint.get('paths') or []) if p.get('shapeId') in shape_ids]
     if not paths:
         raise ValueError('No paint paths found for the selected regions.')
@@ -2964,17 +2957,70 @@ def _recolor_bundle(bundle: dict, chosen, color: str, preserve_shading: bool) ->
         for gradient in (paint.get('gradients') or []):
             if gradient.get('id') in grad_ids:
                 _tint_gradient(gradient, color)
+
+
+def _move_regions_to_color_group(bundle: dict, regions: list, color: str) -> int:
+    """P0.2 palette identity move: relocate ``regions`` to the palette group
+    whose answer color IS ``color`` (reused when it exists, created otherwise
+    — a shared swatch is never mutated, so regions outside the edit keep a
+    truthful answer key). Returns how many regions actually moved."""
+    entry = _palette_entry_for_color(bundle, color)
+    pid = int(entry['id'])
+    moved = 0
+    for r in regions:
+        if r['paletteId'] != pid:
+            r['paletteId'] = pid
+            r['label'] = make_label(region_polygon(r), pid)
+            moved += 1
+    return moved
+
+
+def _fill_is_current(paint: dict, path: dict, color: str) -> bool:
+    """True when ``color`` already IS the shape's appearance — solid fills
+    compare exactly; gradients compare against their stop AVERAGE (the anchor
+    _tint_gradient pulls toward) with a rounding tolerance, because the
+    frontend seeds the input with that same rounded average. A current color
+    is a visual no-op and must never move palette groups (the outline-only
+    invariant would break on manually palette-assigned regions)."""
+    fill = str(path.get('fill', ''))
+    if fill.startswith('url(#'):
+        grad = next((gr for gr in (paint.get('gradients') or []) if gr.get('id') == fill[5:-1]), None)
+        stops = [s for s in (grad or {}).get('stops', []) if s.get('color') and SAFE_HEX.match(s['color'])]
+        if not stops:
+            return False
+        avg = [0.0, 0.0, 0.0]
+        for s in stops:
+            rgb = _hex_rgb(s['color'])
+            avg = [a + b for a, b in zip(avg, rgb)]
+        tgt = _hex_rgb(color)
+        return all(abs(a / len(stops) - b) <= 2.0 for a, b in zip(avg, tgt))
+    cur = fill.upper() if SAFE_HEX.match(fill) else None
+    return cur == color.upper()
+
+
+def _recolor_bundle(bundle: dict, chosen, color: str, preserve_shading: bool) -> None:
+    """Recolor the *visible appearance* of the chosen regions' source shapes.
+
+    Separate from the 'palette' action (which assigns the number group):
+    this changes what the player sees. ``preserve_shading`` keeps gradient
+    shading (tinted toward the target); otherwise the fill is replaced.
+    """
+    shape_ids = set()
+    for r in chosen:
+        sid = r.get('masterShapeId')
+        if not sid:
+            raise ValueError(f'Region {r["id"]} has no paintable source shape; '
+                             'raster-built bundles can only be re-colored by rebuilding.')
+        shape_ids.add(sid)
+    _restyle_shape_appearance(bundle, shape_ids, color, preserve_shading)
     # P0.2 palette identity: NEVER mutate a shared swatch - every OTHER region
     # in that group would silently get a wrong answer color. The chosen
     # regions move to the palette group whose answer color IS the new
     # appearance (reused when it exists, created otherwise). Repainting a
-    # whole group stays a separate, intentional operation.
-    entry = _palette_entry_for_color(bundle, color)
-    pid = int(entry['id'])
-    for r in chosen:
-        if r['paletteId'] != pid:
-            r['paletteId'] = pid
-            r['label'] = make_label(region_polygon(r), pid)
+    # whole group stays a separate, intentional operation. The shape-addressed
+    # Art-node editor (Task 40B) moves every region OF THE SHAPE through the
+    # same primitive; region recolor stays scoped to the artist's selection.
+    _move_regions_to_color_group(bundle, chosen, color)
 
 
 
@@ -3072,6 +3118,7 @@ def edit_bundle(source: Path, output: Path, request, version: str):
     fit_tolerance = float(settings.get('curve_tolerance', 1.0))
     min_px = float(settings.get('min_region_pixels', 35))
     pen_warning: str | None = None
+    style_warning: str | None = None
 
     # Task 33 — Artwork Path node mode (first slice: move existing anchors
     # and Bézier handles of ONE closed master shape). This is a SOURCE edit,
@@ -3083,13 +3130,28 @@ def edit_bundle(source: Path, output: Path, request, version: str):
     if request.action == 'shape':
         return _edit_master_shape(source, output, request, version)
 
-    # Task 40A — Ink appearance (shape-addressed, topology-neutral): restyle
-    # ONE ink stroke's color/width/opacity by stable shapeId. Ink is
-    # appearance-only, so the gameplay surface is guaranteed unchanged: the
-    # recompile re-derives regions from an UNCHANGED geometry source, and the
-    # test suite pins regions.json/paint.paths byte-identity across the edit.
+    # Task 40A/40B — shape-addressed appearance by stable shapeId. INK
+    # strokes take the full-recompile style editor (40A). FILLED shapes fall
+    # through to the in-place body below (40B): the mature recolor semantics,
+    # refactored to be shape-addressed — fill + preserve-shading reuse/move
+    # palette groups, outlines are pure appearance (width 0 removes). The
+    # in-place publication tail syncs the style into the authoritative master
+    # (fill, gradient stops, stroke attrs — including removals), so an
+    # ordinary Build re-derives the SAME style instead of reverting it.
     if request.action == 'shape_style':
-        return _edit_master_style(source, output, request, version)
+        shape_id = (request.shape_id or '').strip()
+        if not shape_id:
+            raise ValueError('Select an artwork shape to restyle (shape_id is required).')
+        if request.region_ids:
+            raise ValueError('The appearance editor works on one shape — no region selection needed.')
+        ink_ids = {p.get('shapeId') for p in (bundle['paint'].get('inkPaths') or [])}
+        fill_ids = {p.get('shapeId') for p in (bundle['paint'].get('paths') or [])}
+        if shape_id in ink_ids:
+            return _edit_master_style(source, output, request, version)
+        if shape_id not in fill_ids:
+            raise ValueError(
+                f'"{shape_id}" is not a paintable shape in this revision. Ink strokes and filled '
+                'artwork shapes are styled by shape_id; converted raster artwork (rc-*) is not restylable.')
 
     regs = {r['id']: r for r in g['regions']}
     chosen_ids = list(dict.fromkeys(request.region_ids))
@@ -3099,11 +3161,13 @@ def edit_bundle(source: Path, output: Path, request, version: str):
         raise ValueError('The pen tool takes no region selection; just draw the shape where you need it.')
     chosen = [regs[rid] for rid in chosen_ids if rid in regs]
     # Per-action selection counts (contract addendum):
-    # merge>=2, split/cut/label=1, node=2, draw=0, others>=1.
+    # merge>=2, split/cut/label=1, node=2, draw/shape_style=0, others>=1.
     need = {'merge': 2, 'split': 1, 'cut': 1, 'label': 1, 'node': 2}.get(request.action, 1)
     if request.action == 'draw':
         if chosen:
             raise ValueError('The pen tool takes no region selection.')
+    elif request.action == 'shape_style':
+        pass  # shape-addressed; region_ids were validated empty above
     elif len(chosen) < need:
         hint = ('two or more adjacent regions' if request.action == 'merge'
                 else 'exactly one region' if request.action in ('split', 'cut', 'label')
@@ -3115,13 +3179,14 @@ def edit_bundle(source: Path, output: Path, request, version: str):
     elif request.action == 'node' and len(chosen) != 2:
         raise ValueError('Select exactly two regions sharing the boundary you want to drag.')
     valid_palette = {p['id'] for p in bundle['palette']}
+    pid: int | None = None
     if request.action == 'draw':
         if request.palette_id is None:
             raise ValueError('Choose a number group (palette) for the drawn region.')
         pid = int(request.palette_id)
-    else:
+    elif request.action != 'shape_style':
         pid = request.palette_id or chosen[0]['paletteId']
-    if pid not in valid_palette: raise ValueError('Unknown palette group.')
+    if pid is not None and pid not in valid_palette: raise ValueError('Unknown palette group.')
     if request.action == 'merge':
         if len(chosen) < 2: raise ValueError('Select two or more adjacent regions.')
         union = unary_union([make_valid(region_polygon(r)) for r in chosen])
@@ -3483,6 +3548,48 @@ def edit_bundle(source: Path, output: Path, request, version: str):
         if not request.color:
             raise ValueError('Choose a #RRGGBB color to recolor with.')
         _recolor_bundle(bundle, chosen, request.color.upper(), bool(request.preserve_shading))
+    elif request.action == 'shape_style':
+        # Task 40B — filled-shape appearance (in place, recolor semantics
+        # shape-addressed). Fill: repaint the source shape (solid replace or
+        # gradient tint) and move EVERY region of that shape to the palette
+        # group whose answer color IS the new fill (reuse-or-create, never a
+        # shared-swatch mutation) — region GEOMETRY is untouched. Outline:
+        # pure appearance — width 0 REMOVES it, regions/palette/answer key
+        # are untouched by construction. A requested fill that already IS the
+        # current appearance is a visual no-op and is skipped (it must not
+        # move palette groups — outline-only edits keep the answer key).
+        if request.opacity is not None:
+            raise ValueError('Overall opacity is not available for filled shapes in this slice — '
+                             'edit the fill color instead.')
+        path = next(p for p in bundle['paint']['paths'] if p.get('shapeId') == shape_id)
+        restyled: list[str] = []
+        if request.color is not None:
+            color = request.color.upper()
+            if not _fill_is_current(bundle['paint'], path, color):
+                _restyle_shape_appearance(bundle, {shape_id}, color, bool(request.preserve_shading))
+                _move_regions_to_color_group(
+                    bundle, [r for r in g['regions'] if r.get('masterShapeId') == shape_id], color)
+                restyled.append('fill')
+        if request.stroke_color is not None or request.stroke_width is not None:
+            if request.stroke_width is not None and 0 < request.stroke_width < 0.4:
+                raise ValueError('Outline width is 0 (removes the outline) or starts at 0.4 px.')
+            if request.stroke_width == 0:
+                path.pop('stroke', None)
+                path.pop('strokeWidth', None)
+            else:
+                if request.stroke_color is not None:
+                    path['stroke'] = request.stroke_color.upper()
+                elif not path.get('stroke'):
+                    path['stroke'] = INK
+                if request.stroke_width is not None:
+                    path['strokeWidth'] = round(request.stroke_width, 3)
+                elif not path.get('strokeWidth'):
+                    path['strokeWidth'] = 1.5
+            restyled.append('outline')
+        if not restyled:
+            raise ValueError('Nothing to restyle — set color, stroke_color or stroke_width.')
+        style_warning = (f'Shape "{shape_id}" was restyled ({" and ".join(restyled)}); appearance-only — '
+                         'region geometry, partition and answer-key integrity are unchanged.')
     elif request.action == 'label':
         if len(chosen) != 1 or request.x is None or request.y is None:
             raise ValueError('Select one region and a label position.')
@@ -3526,9 +3633,10 @@ def edit_bundle(source: Path, output: Path, request, version: str):
     for f in {master_name, 'build-settings.json'}:
         if f != 'source-master.svg' and (source / f).is_file(): shutil.copy2(source / f, output / f)
     qa = emit_bundle(output, bundle)
-    if pen_warning:
-        qa.setdefault('warnings', []).append(pen_warning)
-        write_json(output / 'validation.json', qa)
+    for note in (pen_warning, style_warning):
+        if note:
+            qa.setdefault('warnings', []).append(note)
+            write_json(output / 'validation.json', qa)
     return {'manifest': m, 'validation': qa}
 
 
@@ -3627,6 +3735,13 @@ def _sync_source_master(bundle: dict, source: Path) -> str | None:
         if p.get('stroke') and p.get('strokeWidth'):
             el.set('stroke', p['stroke'])
             el.set('stroke-width', str(p['strokeWidth']))
+            changed = True
+        elif el.get('stroke') is not None or el.get('stroke-width') is not None:
+            # Task 40B outline removal: an outline-free paint path must not
+            # keep a stale master stroke — an ordinary Build would resurrect
+            # the outline the artist removed (Save → Build must be stable).
+            el.attrib.pop('stroke', None)
+            el.attrib.pop('stroke-width', None)
             changed = True
 
     # 1b) ink appearance sync (Task 40A): keep stroke color/width/opacity of
@@ -3909,8 +4024,9 @@ def _edit_master_style(source: Path, output: Path, request, version: str) -> dic
     ink = next((p for p in (bundle['paint'].get('inkPaths') or []) if p.get('shapeId') == shape_id), None)
     if ink is None:
         raise ValueError(
-            f'"{shape_id}" is not an ink stroke. Fill styling is the recolor action; '
-            'ink appearance targets open/closed strokes in paint.inkPaths.')
+            f'"{shape_id}" is not an ink stroke. Filled shapes are styled through the same '
+            'shape_style action with color / stroke_color / stroke_width (the fill and outline '
+            'path); this restyler only targets open/closed strokes in paint.inkPaths.')
     if request.stroke_color is None and request.stroke_width is None and request.opacity is None:
         raise ValueError('Nothing to restyle — set stroke_color, stroke_width, or opacity.')
     # Ink width floor: the compiler normalizes ink strokeWidth to >= 0.4, so

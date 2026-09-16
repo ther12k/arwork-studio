@@ -276,7 +276,9 @@ test("Art node journey: mid-edge pick, no-selection save, preview==payload, reje
   await page.getByTitle("Rename object").click();
   await page.locator('input[value="Blue"]').fill("Blue Renamed");
   await page.locator('input[value="Blue Renamed"]').press("Enter");
-  await expect(page.getByText(/loaded from rev-1, project now at rev-2/)).toBeVisible({ timeout: 20_000 });
+  // (Task 40B: picking the filled shape ALSO seeds an appearance draft, so
+  // both drafts report the conflict — anchor the geometry chip's exact text.)
+  await expect(page.getByText(/^Base changed: loaded from rev-1, project now at rev-2/)).toBeVisible({ timeout: 20_000 });
   await expect(saveBar(page)).toBeVisible();
   await expect(saveBar(page)).toBeEnabled();
   expect(state.revision).toBe(REV2);
@@ -827,3 +829,133 @@ test("Ink appearance: color/width/opacity end-to-end, topology untouched, style 
   expect(stylePayload).toMatchObject({ shape_id: INK, base_revision: REV3 });
 });
 
+
+// ------------------------------------------------ Task 40B: filled appearance
+
+const isOrange = (rgb: readonly [number, number, number] | null) =>
+  !!rgb && Math.abs(rgb[0] - 232) < 30 && Math.abs(rgb[1] - 118) < 30 && Math.abs(rgb[2] - 12) < 30;
+/** The outline stroke color #1B4F8A on the underpaint-art raster (alpha must
+ *  show real coverage — blends with the underlying fill don't count). */
+const isNavyStroke = (px: readonly number[] | null) =>
+  !!px && Math.abs(px[0] - 27) < 45 && Math.abs(px[1] - 79) < 45 && Math.abs(px[2] - 138) < 45 && px[3] > 200;
+
+/** 5x5 grid probe of the underpaint ART layer (the 2px outline can sit within
+ *  a couple of units of the aimed point — same trick as the ink probe). */
+const artGridRGBA = (page: Page, x: number, y: number) =>
+  page.evaluate(
+    ([px, py]) =>
+      new Promise<readonly (readonly number[])[] | null>((resolve) => {
+        const board = document.querySelector('svg[aria-label*="interactive coloring artwork"]');
+        const img = board?.querySelector('image[id$="underpaint-art"]') as SVGImageElement | null;
+        const href = img?.getAttribute("href");
+        if (!href) return resolve(null);
+        const image = new Image();
+        image.onload = () => {
+          const canvas = document.createElement("canvas");
+          canvas.width = 300;
+          canvas.height = 300;
+          const ctx = canvas.getContext("2d")!;
+          ctx.drawImage(image, 0, 0, 300, 300);
+          const out: Array<readonly number[]> = [];
+          for (let dx = -4; dx <= 4; dx += 2) {
+            for (let dy = -4; dy <= 4; dy += 2) {
+              out.push([...ctx.getImageData(px + dx, py + dy, 1, 1).data]);
+            }
+          }
+          resolve(out);
+        };
+        image.onerror = () => resolve(null);
+        image.src = href;
+      }),
+    [x, y] as const
+  );
+const gridHas = async (page: Page, x: number, y: number, ok: (px: readonly number[]) => boolean) =>
+  ((await artGridRGBA(page, x, y)) ?? []).some(ok);
+
+test("Filled shape appearance journey: fill + outline survive reload and Build, width 0 removes the outline for good", async ({ page }) => {
+  test.setTimeout(180_000);
+  const state: FixtureState = mkState();
+  state.mode = "success";
+  await routeBackend(page, state);
+  await page.goto("/");
+
+  const region = page.locator(`${BOARD} path[data-region-id="r-blue"]`);
+  await expect(region).toBeAttached();
+  // The blob's interior paints blue before the edit (s0002 over the red rect).
+  await expectPixel(page, 150, 150, isBlue);
+
+  // Pick the FILLED blob outline at (150,90) — the ink squiggle sits ~35
+  // units away, the blob outline dead-on.
+  await page.getByRole("button", { name: "Edit regions" }).click();
+  await page.getByRole("button", { name: "Art node" }).click();
+  const tap = await artToPage(page, 150, 90);
+  await page.mouse.click(tap.x, tap.y);
+  const fillInput = page.locator('input[aria-label="Fill color"]');
+  await expect(fillInput).toHaveValue(/^#3366cc$/i);
+  await expect(page.locator('input[aria-label="Preserve shading"]')).toBeChecked();
+  // No outline in the source: width seeds at 0 ("none").
+  await expect(page.locator('input[aria-label="Outline width"]')).toHaveValue("0");
+
+  // Act 1 — orange fill + 2px navy outline, one save.
+  await fillInput.fill("#E8760C");
+  await page.locator('input[aria-label="Outline color"]').fill("#1B4F8A");
+  await page.locator('input[aria-label="Outline width"]').fill("2");
+  await page.getByRole("button", { name: "Save appearance" }).click();
+  const stylePayloads = () => state.editCalls.filter((c) => c.action === "shape_style");
+  await expect.poll(() => stylePayloads().length).toBe(1);
+  expect(stylePayloads()[0]).toMatchObject({
+    shape_id: SHAPE,
+    base_revision: REV1,
+    color: "#E8760C",
+    preserve_shading: true,
+    stroke_color: "#1B4F8A",
+    stroke_width: 2,
+  });
+
+  // Published revision: interior orange, outline navy on the underpaint-art
+  // raster (the cached image is the renderer — live paths are never in the
+  // DOM once the underpaint decodes, so pixels ARE the contract here).
+  await expectPixel(page, 150, 150, isOrange);
+  await expect.poll(() => gridHas(page, 150, 90, isNavyStroke), { timeout: 20_000 }).toBe(true);
+
+  // Ordinary Build (recompile from master): appearance must survive. The
+  // style draft SURVIVES the build publish (rebased to rev-2 by its own
+  // save), so the project now sitting at rev-3 makes the draft stale —
+  // the conflict chip appears WITHOUT any reload.
+  await page.getByRole("button", { name: "Build vector draft" }).click();
+  await expect.poll(() => state.buildCalls.length).toBe(1);
+  await expectPixel(page, 150, 150, isOrange);
+  await expect.poll(() => gridHas(page, 150, 90, isNavyStroke), { timeout: 20_000 }).toBe(true);
+  await expect(page.getByText(/style loaded from rev-2, project now at rev-3/)).toBeVisible({ timeout: 20_000 });
+
+  // Act 2 — width 0 REMOVES the outline. Saving the stale draft demands the
+  // explicit "Save against rev-3" rebase. Fill/stroke color stay untouched →
+  // the payload carries ONLY the width-0 removal.
+  await page.locator('input[aria-label="Outline width"]').fill("0");
+  await page.getByRole("button", { name: "Save against rev-3" }).click();
+  await expect.poll(() => stylePayloads().length).toBe(2);
+  expect(stylePayloads()[1]).toMatchObject({ shape_id: SHAPE, base_revision: REV3, stroke_width: 0 });
+  expect(stylePayloads()[1]).not.toHaveProperty("color");
+  expect(stylePayloads()[1]).not.toHaveProperty("stroke_color");
+  // Outline gone from the rendered artwork: the navy stroke probes come up
+  // empty while the orange fill stays (only the invisible hairline fallback
+  // would render — the authored 2px stroke was deleted).
+  await expect.poll(async () => !(await gridHas(page, 150, 90, isNavyStroke)), { timeout: 20_000 }).toBe(true);
+
+  // Reload → still removed; a final Build must NOT resurrect it.
+  await page.reload();
+  await expect(region).toBeAttached();
+  await expectPixel(page, 150, 150, isOrange);
+  await expect.poll(async () => !(await gridHas(page, 150, 90, isNavyStroke)), { timeout: 20_000 }).toBe(true);
+  await page.getByRole("button", { name: "Build vector draft" }).click();
+  await expect.poll(() => state.buildCalls.length).toBe(2);
+  await expectPixel(page, 150, 150, isOrange);
+  await expect.poll(async () => !(await gridHas(page, 150, 90, isNavyStroke)), { timeout: 20_000 }).toBe(true);
+  // The appearance editor seeds the removed-outline state honestly.
+  await page.getByRole("button", { name: "Edit regions" }).click();
+  await page.getByRole("button", { name: "Art node" }).click();
+  const tap3 = await artToPage(page, 150, 90);
+  await page.mouse.click(tap3.x, tap3.y);
+  await expect(page.locator('input[aria-label="Outline width"]')).toHaveValue("0");
+  await expect(fillInput).toHaveValue(/^#e8760c$/i);
+});

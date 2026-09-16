@@ -43,7 +43,14 @@ import { Popover, PopoverAnchor, PopoverContent } from "@/components/ui/popover"
 import { Progress } from "@/components/ui/progress";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Textarea } from "@/components/ui/textarea";
-import type { BoardMode, EdgeEntry, VectorBoard } from "@/lib/detailed-board";
+import {
+  paintFillHex,
+  type BoardMode,
+  type EdgeEntry,
+  type PaintLayer,
+  type PaintPath,
+  type VectorBoard,
+} from "@/lib/detailed-board";
 import { imageUrl, masterSvgUrl, type DifficultyProfile } from "@/lib/studio-api";
 import {
   flattenPath,
@@ -313,7 +320,7 @@ export function CanvasWorkspace() {
     drawRegion,
     nodeEdit,
     editShape,
-    editInkStyle,
+    editShapeStyle,
     syncProject,
     recordPlaytest,
     freeColor,
@@ -465,37 +472,66 @@ export function CanvasWorkspace() {
   const [artConflictOpen, setArtConflictOpen] = useState(false);
   const artPendingSaveRef = useRef<PendingArtworkSave | null>(null);
 
-  // ----- Task 40A: ink appearance (shape-addressed, topology-neutral) -----
+  // ----- Task 40A/40B: shape appearance (shape-addressed) -----
   /** Identity of an appearance draft: which project/revision the style was
    *  loaded from (the P1 contract — the payload's base must be the revision
    *  the artist SAW, never whatever happens to be current at save time),
    *  which shape it styles, and the appearance baseline it was seeded with
    *  (a concurrent publish that changed the appearance demands a warning,
-   *  an unchanged one makes "save against current" safe). Reused by 40B. */
+   *  an unchanged one makes "save against current" safe). Shared by the ink
+   *  stroke editor (40A) and the filled Fill/Outline editor (40B). */
+  type AppearanceValues = {
+    fill: string; // filled: the fill (or gradient-stop average) — ink: the stroke color
+    stroke: string; // filled: outline color ("" = no outline) — ink: unused
+    strokeWidth: number; // filled: outline width (0 = none) — ink: stroke width
+    opacity: number; // ink only this slice
+  };
   type AppearanceDraftContext = {
     projectId: string;
     baseRevision: string;
     shapeId: string;
-    original: { color: string; width: number; opacity: number };
+    original: AppearanceValues;
   };
   /** The CURRENT revision's appearance for the picked shape (from the live
-   *  bundle) — what a fresh seed would capture. */
-  const liveInkAppearance: AppearanceDraftContext | null = (() => {
+   *  bundle) — what a fresh seed would capture, plus which editor applies. */
+  const liveAppearance: { kind: "ink" | "filled"; ctx: AppearanceDraftContext } | null = (() => {
     if (!artPath || !bundle?.paint || !project?.currentRevision) return null;
-    const ink = bundle.paint.inkPaths.find((p) => p.shapeId === artPath.context.shapeId);
-    if (!ink) return null;
+    const sid = artPath.context.shapeId;
+    const ink = bundle.paint.inkPaths.find((p) => p.shapeId === sid);
+    if (ink) {
+      return {
+        kind: "ink",
+        ctx: {
+          projectId: project.id,
+          baseRevision: project.currentRevision,
+          shapeId: ink.shapeId!,
+          original: { fill: ink.fill, stroke: "", strokeWidth: ink.strokeWidth ?? 1.5, opacity: ink.opacity ?? 1 },
+        },
+      };
+    }
+    const fp = bundle.paint.paths.find((p) => p.shapeId === sid);
+    if (!fp) return null;
     return {
-      projectId: project.id,
-      baseRevision: project.currentRevision,
-      shapeId: ink.shapeId!,
-      original: { color: ink.fill, width: ink.strokeWidth ?? 1.5, opacity: ink.opacity ?? 1 },
+      kind: "filled",
+      ctx: {
+        projectId: project.id,
+        baseRevision: project.currentRevision,
+        shapeId: fp.shapeId!,
+        original: {
+          fill: paintFillHex(bundle.paint, fp),
+          stroke: fp.stroke ?? "",
+          strokeWidth: fp.strokeWidth ?? 0,
+          opacity: 1,
+        },
+      },
     };
   })();
   /** The SEEDED draft context — frozen at pick time (per shape), so a
    *  concurrent publish does NOT move the draft's base out from under the
    *  artist. Null until the effect below seeds it. */
   const [styleContext, setStyleContext] = useState<AppearanceDraftContext | null>(null);
-  const [inkStyle, setInkStyle] = useState<{ color: string; width: number; opacity: number } | null>(null);
+  const [styleKind, setStyleKind] = useState<"ink" | "filled" | null>(null);
+  const [styleDraft, setStyleDraft] = useState<(AppearanceValues & { preserveShading: boolean }) | null>(null);
   const savedStyleJobRef = useRef<string | null>(null);
   useEffect(() => {
     // Seed ONCE per edited shape (keyed on the DRAFT's shape id — a stable
@@ -503,13 +539,15 @@ export function CanvasWorkspace() {
     // revision remount): the context freezes the revision the artist saw.
     // Concurrent publishes must surface as a conflict, not as a silent
     // re-seed.
-    if (!artPath || !liveInkAppearance) {
+    if (!artPath || !liveAppearance) {
       setStyleContext(null);
-      setInkStyle(null);
+      setStyleKind(null);
+      setStyleDraft(null);
       return;
     }
-    setStyleContext(liveInkAppearance);
-    setInkStyle({ ...liveInkAppearance.original });
+    setStyleContext(liveAppearance.ctx);
+    setStyleKind(liveAppearance.kind);
+    setStyleDraft({ ...liveAppearance.ctx.original, preserveShading: true });
   }, [artPath?.context.shapeId]);
   // The artist's OWN style save rebases the draft: once ITS job publishes,
   // the artist's draft values ARE the published appearance — adopt them as
@@ -524,24 +562,36 @@ export function CanvasWorkspace() {
       job.status !== "done" ||
       busy ||
       !styleContext ||
-      !inkStyle
+      !styleDraft
     ) {
       return;
     }
     savedStyleJobRef.current = null;
+    // Width 0 MEANS "no outline" (backend deletion semantics) — adopt that
+    // normalized form as the new baseline so the saved draft and the live
+    // revision agree.
+    const saved = styleKind === "filled" && styleDraft.strokeWidth === 0
+      ? { ...styleDraft, stroke: "" }
+      : styleDraft;
     setStyleContext({
       projectId: styleContext.projectId,
       baseRevision: project.currentRevision ?? styleContext.baseRevision,
       shapeId: styleContext.shapeId,
-      original: { ...inkStyle },
+      original: {
+        fill: saved.fill,
+        stroke: saved.stroke,
+        strokeWidth: saved.strokeWidth,
+        opacity: saved.opacity,
+      },
     });
+    setStyleDraft((d) => (d ? { ...d, stroke: saved.stroke } : d));
   }, [project?.job?.id, project?.job?.status, busy]);
 
   /** True when the revision the style draft was seeded from is no longer
    *  current (another operation published in between) — saving then needs
    *  the artist's explicit acknowledgment, exactly like the geometry draft. */
   const staleStyleBase =
-    !!inkStyle &&
+    !!styleDraft &&
     !!styleContext &&
     styleContext.baseRevision !== project?.currentRevision &&
     styleContext.projectId === project?.id;
@@ -549,31 +599,40 @@ export function CanvasWorkspace() {
    *  no longer matches the draft's seed) — saving would silently overwrite
    *  those unseen changes. */
   const styleChangedInBetween = (() => {
-    if (!styleContext) return false;
-    const ink = bundle?.paint?.inkPaths.find((p) => p.shapeId === styleContext.shapeId);
-    if (!ink) return false;
-    const cur = { color: ink.fill, width: ink.strokeWidth ?? 1.5, opacity: ink.opacity ?? 1 };
+    if (!styleContext || !styleKind || !bundle?.paint) return false;
     const o = styleContext.original;
+    if (styleKind === "ink") {
+      const ink = bundle.paint.inkPaths.find((p) => p.shapeId === styleContext.shapeId);
+      if (!ink) return false;
+      return (
+        ink.fill.toUpperCase() !== o.fill.toUpperCase() ||
+        Math.abs((ink.strokeWidth ?? 1.5) - o.strokeWidth) > 1e-6 ||
+        Math.abs((ink.opacity ?? 1) - o.opacity) > 1e-6
+      );
+    }
+    const fp = bundle.paint.paths.find((p) => p.shapeId === styleContext.shapeId);
+    if (!fp) return false;
     return (
-      cur.color.toUpperCase() !== o.color.toUpperCase() ||
-      Math.abs(cur.width - o.width) > 1e-6 ||
-      Math.abs(cur.opacity - o.opacity) > 1e-6
+      paintFillHex(bundle.paint, fp) !== o.fill.toUpperCase() ||
+      (fp.stroke ?? "") !== o.stroke ||
+      Math.abs((fp.strokeWidth ?? 0) - o.strokeWidth) > 1e-6
     );
   })();
 
-  const inkStyleDirty = !!inkStyle && !!styleContext &&
-    (inkStyle.color.toUpperCase() !== styleContext.original.color.toUpperCase() ||
-      Math.abs(inkStyle.width - styleContext.original.width) > 1e-6 ||
-      Math.abs(inkStyle.opacity - styleContext.original.opacity) > 1e-6);
+  const styleDirty = !!styleDraft && !!styleContext &&
+    (styleDraft.fill.toUpperCase() !== styleContext.original.fill.toUpperCase() ||
+      styleDraft.stroke.toUpperCase() !== styleContext.original.stroke.toUpperCase() ||
+      Math.abs(styleDraft.strokeWidth - styleContext.original.strokeWidth) > 1e-6 ||
+      (styleKind === "ink" && Math.abs(styleDraft.opacity - styleContext.original.opacity) > 1e-6));
 
-  const resetInkStyle = () => {
+  const resetStyle = () => {
     if (!styleContext) return;
-    setInkStyle({ ...styleContext.original });
+    setStyleDraft({ ...styleContext.original, preserveShading: styleDraft?.preserveShading ?? true });
   };
 
-  const saveInkStyle = () => {
+  const saveStyle = () => {
     const ctx = styleContext;
-    if (!ctx || !inkStyle || !inkStyleDirty) return;
+    if (!ctx || !styleDraft || !styleDirty || !styleKind) return;
     // Identity guard, same class as the geometry draft's: the draft must go
     // to ITS project. The payload's base is what the artist SAW — unless a
     // concurrent publish moved the project, in which case the visible chip
@@ -585,13 +644,30 @@ export function CanvasWorkspace() {
     }
     const baseRevision = staleStyleBase ? project?.currentRevision : ctx.baseRevision;
     if (!baseRevision) return;
-    const payload: { stroke_color?: string; stroke_width?: number; opacity?: number } = {};
-    if (inkStyle.color.toUpperCase() !== ctx.original.color.toUpperCase()) {
-      payload.stroke_color = inkStyle.color.toUpperCase();
+    const payload: {
+      stroke_color?: string;
+      stroke_width?: number;
+      opacity?: number;
+      color?: string;
+      preserve_shading?: boolean;
+    } = {};
+    if (styleKind === "ink") {
+      if (styleDraft.fill.toUpperCase() !== ctx.original.fill.toUpperCase()) {
+        payload.stroke_color = styleDraft.fill.toUpperCase();
+      }
+      if (Math.abs(styleDraft.strokeWidth - ctx.original.strokeWidth) > 1e-6) payload.stroke_width = styleDraft.strokeWidth;
+      if (Math.abs(styleDraft.opacity - ctx.original.opacity) > 1e-6) payload.opacity = styleDraft.opacity;
+    } else {
+      if (styleDraft.fill.toUpperCase() !== ctx.original.fill.toUpperCase()) {
+        payload.color = styleDraft.fill.toUpperCase();
+        payload.preserve_shading = styleDraft.preserveShading;
+      }
+      if (styleDraft.stroke.toUpperCase() !== ctx.original.stroke.toUpperCase()) {
+        payload.stroke_color = styleDraft.stroke.toUpperCase();
+      }
+      if (Math.abs(styleDraft.strokeWidth - ctx.original.strokeWidth) > 1e-6) payload.stroke_width = styleDraft.strokeWidth;
     }
-    if (Math.abs(inkStyle.width - ctx.original.width) > 1e-6) payload.stroke_width = inkStyle.width;
-    if (Math.abs(inkStyle.opacity - ctx.original.opacity) > 1e-6) payload.opacity = inkStyle.opacity;
-    void editInkStyle(ctx.shapeId, { ...payload, base_revision: baseRevision })
+    void editShapeStyle(ctx.shapeId, { ...payload, base_revision: baseRevision })
       .then((res) => {
         savedStyleJobRef.current = res.jobId;
       })
@@ -2135,58 +2211,123 @@ export function CanvasWorkspace() {
         </div>
       )}
 
-      {/* Task 40A — ink appearance: shape-addressed style editor for the
-          picked ink stroke. Appearance-only: gameplay geometry is untouched
-          (regions re-derive identically); the outline of a FILLED shape is
-          visual, never part of the tap target. */}
-      {tool === "artnode" && artPath && styleContext && inkStyle && !busy && (
+      {/* Task 40A/40B — shape-addressed appearance editor for the picked
+          shape. Ink: stroke color/width/opacity. Filled: Fill (color +
+          preserve shading) and Outline (color, width — 0 removes). Gameplay
+          geometry is untouched; a fill edit may move the shape's regions to
+          the number group whose answer color IS the new fill. */}
+      {tool === "artnode" && artPath && styleContext && styleDraft && !busy && (
         <div className="mt-2 flex flex-wrap items-center gap-x-3 gap-y-1.5 rounded-md border border-[#e1e5df] bg-white px-3 py-2">
-          <span className="text-[10px] font-semibold text-[#183837]">Stroke</span>
-          <label className="flex items-center gap-1.5 text-[10px] text-[#657671]">
-            Color
-            <input
-              type="color"
-              aria-label="Stroke color"
-              value={inkStyle.color}
-              onChange={(e) => setInkStyle({ ...inkStyle, color: e.target.value.toUpperCase() })}
-              className="h-6 w-8 cursor-pointer rounded border border-[#e1e5df] bg-white"
-            />
-            <code className="font-mono text-[10px] text-[#183837]">{inkStyle.color}</code>
-          </label>
-          <label className="flex items-center gap-1.5 text-[10px] text-[#657671]">
-            Width
-            <input
-              type="number"
-              aria-label="Stroke width"
-              min={0.4}
-              max={8}
-              step={0.1}
-              value={inkStyle.width}
-              onChange={(e) => {
-                const v = Number(e.target.value);
-                if (Number.isFinite(v)) setInkStyle({ ...inkStyle, width: Math.min(8, Math.max(0.4, v)) });
-              }}
-              className="h-6 w-14 rounded border border-[#e1e5df] px-1.5 text-[10px]"
-            />
-            px
-          </label>
-          <label className="flex items-center gap-1.5 text-[10px] text-[#657671]">
-            Opacity
-            <input
-              type="number"
-              aria-label="Stroke opacity"
-              min={0}
-              max={100}
-              step={5}
-              value={Math.round(inkStyle.opacity * 100)}
-              onChange={(e) => {
-                const v = Number(e.target.value);
-                if (Number.isFinite(v)) setInkStyle({ ...inkStyle, opacity: Math.min(100, Math.max(0, v)) / 100 });
-              }}
-              className="h-6 w-14 rounded border border-[#e1e5df] px-1.5 text-[10px]"
-            />
-            %
-          </label>
+          {styleKind === "ink" ? (
+            <>
+              <span className="text-[10px] font-semibold text-[#183837]">Stroke</span>
+              <label className="flex items-center gap-1.5 text-[10px] text-[#657671]">
+                Color
+                <input
+                  type="color"
+                  aria-label="Stroke color"
+                  value={styleDraft.fill}
+                  onChange={(e) => setStyleDraft({ ...styleDraft, fill: e.target.value.toUpperCase() })}
+                  className="h-6 w-8 cursor-pointer rounded border border-[#e1e5df] bg-white"
+                />
+                <code className="font-mono text-[10px] text-[#183837]">{styleDraft.fill}</code>
+              </label>
+              <label className="flex items-center gap-1.5 text-[10px] text-[#657671]">
+                Width
+                <input
+                  type="number"
+                  aria-label="Stroke width"
+                  min={0.4}
+                  max={8}
+                  step={0.1}
+                  value={styleDraft.strokeWidth}
+                  onChange={(e) => {
+                    const v = Number(e.target.value);
+                    if (Number.isFinite(v)) setStyleDraft({ ...styleDraft, strokeWidth: Math.min(8, Math.max(0.4, v)) });
+                  }}
+                  className="h-6 w-14 rounded border border-[#e1e5df] px-1.5 text-[10px]"
+                />
+                px
+              </label>
+              <label className="flex items-center gap-1.5 text-[10px] text-[#657671]">
+                Opacity
+                <input
+                  type="number"
+                  aria-label="Stroke opacity"
+                  min={0}
+                  max={100}
+                  step={5}
+                  value={Math.round(styleDraft.opacity * 100)}
+                  onChange={(e) => {
+                    const v = Number(e.target.value);
+                    if (Number.isFinite(v)) setStyleDraft({ ...styleDraft, opacity: Math.min(100, Math.max(0, v)) / 100 });
+                  }}
+                  className="h-6 w-14 rounded border border-[#e1e5df] px-1.5 text-[10px]"
+                />
+                %
+              </label>
+              <span className="text-[9px] text-[#778481]">appearance only — tap targets stay the same</span>
+            </>
+          ) : (
+            <>
+              <span className="text-[10px] font-semibold text-[#183837]">Fill</span>
+              <label className="flex items-center gap-1.5 text-[10px] text-[#657671]">
+                Color
+                <input
+                  type="color"
+                  aria-label="Fill color"
+                  value={styleDraft.fill}
+                  onChange={(e) => setStyleDraft({ ...styleDraft, fill: e.target.value.toUpperCase() })}
+                  className="h-6 w-8 cursor-pointer rounded border border-[#e1e5df] bg-white"
+                />
+                <code className="font-mono text-[10px] text-[#183837]">{styleDraft.fill}</code>
+              </label>
+              <label className="flex items-center gap-1 text-[10px] text-[#657671]">
+                <input
+                  type="checkbox"
+                  aria-label="Preserve shading"
+                  checked={styleDraft.preserveShading}
+                  onChange={(e) => setStyleDraft({ ...styleDraft, preserveShading: e.target.checked })}
+                  className="h-3.5 w-3.5 accent-[#087f74]"
+                />
+                Preserve shading
+              </label>
+              <span className="text-[10px] font-semibold text-[#183837]">Outline</span>
+              <label className="flex items-center gap-1.5 text-[10px] text-[#657671]">
+                Color
+                <input
+                  type="color"
+                  aria-label="Outline color"
+                  value={styleDraft.stroke || "#29383E"}
+                  onChange={(e) => setStyleDraft({ ...styleDraft, stroke: e.target.value.toUpperCase() })}
+                  className="h-6 w-8 cursor-pointer rounded border border-[#e1e5df] bg-white"
+                />
+                <code className="font-mono text-[10px] text-[#183837]">{styleDraft.stroke || "—"}</code>
+              </label>
+              <label className="flex items-center gap-1.5 text-[10px] text-[#657671]">
+                Width
+                <input
+                  type="number"
+                  aria-label="Outline width"
+                  min={0}
+                  max={8}
+                  step={0.1}
+                  value={styleDraft.strokeWidth}
+                  onChange={(e) => {
+                    const v = Number(e.target.value);
+                    // 0 = remove the outline; nonzero values follow the 0.4
+                    // floor (the same compiler minimum as ink strokes).
+                    if (Number.isFinite(v)) setStyleDraft({ ...styleDraft, strokeWidth: v === 0 ? 0 : Math.min(8, Math.max(0.4, v)) });
+                  }}
+                  className="h-6 w-14 rounded border border-[#e1e5df] px-1.5 text-[10px]"
+                />
+                px
+              </label>
+              <span className="text-[9px] text-[#778481]">
+                {styleDraft.strokeWidth === 0 ? "width 0 removes the outline" : "fill may move the number group; outlines never touch gameplay"}
+              </span>
+            </>
+          )}
           {staleStyleBase && (
             <span
               className="rounded-md border border-[#e5d8a8] bg-[#faf5e3] px-2 py-1 text-[10px] font-medium text-[#8a6d1a]"
@@ -2194,28 +2335,31 @@ export function CanvasWorkspace() {
             >
               Base changed: style loaded from {styleContext?.baseRevision}, project now at{" "}
               {project?.currentRevision}
-              {styleChangedInBetween ? " — this stroke's appearance was edited in between" : ""}
+              {styleChangedInBetween ? " — this shape's appearance was edited in between" : ""}
             </span>
           )}
-          <span className="text-[9px] text-[#778481]">appearance only — tap targets stay the same</span>
           <div className="ml-auto flex gap-2">
             <Button
               size="sm"
               variant="outline"
               className="h-7 rounded-md bg-white px-2.5 text-[10px]"
-              disabled={!inkStyleDirty}
-              onClick={resetInkStyle}
+              disabled={!styleDirty}
+              onClick={resetStyle}
             >
               Reset
             </Button>
             <Button
               size="sm"
               className="h-7 rounded-md bg-[#087f74] px-3 text-[10px] font-semibold text-white hover:bg-[#056a60]"
-              disabled={busy || foreignDraft || !inkStyleDirty}
-              onClick={saveInkStyle}
+              disabled={busy || foreignDraft || !styleDirty}
+              onClick={saveStyle}
               title={staleStyleBase ? "Explicitly apply this style on top of the current revision" : undefined}
             >
-              {staleStyleBase ? `Save against ${project?.currentRevision}` : "Save appearance"}
+              {/* The rebase target is only advertised while a save is
+                  actually possible — a clean draft cannot save, and the
+                  label would collide with the geometry bar's own rebase
+                  button on the same shape. */}
+              {staleStyleBase && styleDirty ? `Save against ${project?.currentRevision}` : "Save appearance"}
             </Button>
           </div>
         </div>
