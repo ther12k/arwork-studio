@@ -168,17 +168,22 @@ function progressOf(page: Page, artworkId: string): Promise<{ completed: string[
   }, artworkId);
 }
 
-/** The RAW stored record including its contentVersion — the identity datum
- *  the version-awareness row reads directly (the game's own reads filter by
- *  it, so a mismatched record is invisible in the UI by design). */
+/** The RAW stored record including its contentVersion and free-color paints —
+ *  the identity datum the version-awareness rows read directly (the game's
+ *  own reads filter by it, so a mismatched record is invisible in the UI by
+ *  design). */
 function rawProgressOf(
   page: Page,
   artworkId: string
-): Promise<{ contentVersion?: string; completed: string[] } | undefined> {
+): Promise<
+  { contentVersion?: string; completed: string[]; customRegionColors?: Record<string, string> } | undefined
+> {
   return page.evaluate((id) => {
     const data = JSON.parse(localStorage.getItem("color-duel:progress:v1") ?? "{}");
     const p = data.artworks?.[id];
-    return p ? { contentVersion: p.contentVersion, completed: p.completedRegionIds } : undefined;
+    return p
+      ? { contentVersion: p.contentVersion, completed: p.completedRegionIds, customRegionColors: p.customRegionColors }
+      : undefined;
   }, artworkId);
 }
 
@@ -199,6 +204,23 @@ async function setCustomPaint(page: Page, hex: string) {
  *  content version (progressMapFor). */
 const inProgressShelf = (page: Page) =>
   page.locator("section", { has: page.getByRole("heading", { name: "In Progress" }) });
+
+/** Enter studio mode through the real UI: the Studio card opens an artwork
+ *  only once the catalog has hydrated (featured[0] is undefined before
+ *  that), so the click retries until the briefing actually appears. The
+ *  briefing STAYS OPEN (it names the artwork — rows may read it); start the
+ *  match explicitly with startStudioMatch. */
+async function openStudioBriefing(page: Page) {
+  await expect(async () => {
+    await page.locator("#home-studio-card").click();
+    await expect(page.getByText("Studio Relax")).toBeVisible({ timeout: 2_000 });
+  }).toPass({ timeout: 45_000 });
+}
+
+async function startStudioMatch(page: Page) {
+  await page.locator("#pre-match-start-btn").click();
+  await expect(page.locator("path[id^='region-']").first()).toBeVisible({ timeout: 15_000 });
+}
 
 test.beforeEach(async ({ page }) => {
   // Deployment independence: gameplay must run purely from the game's static
@@ -288,6 +310,19 @@ test("composition pack: overlap probe resolves the visible owner, fills, complet
   const after = await progressOf(page, "qa-composition");
   expect(after.completed).toHaveLength(3);
   expect(after.isComplete).toBe(true);
+
+  // VISUAL persistence (not just storage): the reopened canvas hydrates from
+  // the record at mount — every completed region's opaque white mask
+  // (fill="#FFFFFF" while unfilled) is GONE, replaced by fill="transparent"
+  // so the finished underpainting shows through, exactly as the player left
+  // it. If the canvas only pretended to resume, all three would still mask.
+  for (const r of regions) {
+    await expect
+      .poll(async () =>
+        page.locator(`path[id='region-${r.id}']`).evaluate((el) => el.getAttribute("fill"))
+      )
+      .toBe("transparent");
+  }
 });
 
 // ------------------------------------------------------- Free Color (studio)
@@ -302,13 +337,7 @@ test("studio free color: custom HEX outside the palette paints, records, and res
   // below reads the SERVED pack — nothing is assumed about which pack runs.
   await page.goto("/");
   const catalog = await page.request.get(`${BASE}/artworks/catalog.json`).then((r) => r.json());
-  // The Studio card is static chrome, but it opens an artwork only once the
-  // catalog has hydrated (featured[0] is undefined before that) — retry the
-  // click until the briefing actually appears.
-  await expect(async () => {
-    await page.locator("#home-studio-card").click();
-    await expect(page.getByText("Studio Relax")).toBeVisible({ timeout: 2_000 });
-  }).toPass({ timeout: 45_000 });
+  await openStudioBriefing(page);
   const title = (await page.getByRole("heading", { level: 4 }).first().textContent()) ?? "";
   const artworkId = catalog.artworks.find((e: { title?: string }) => e.title === title)?.id as string;
   expect(artworkId, `briefing title "${title}" must map to a catalog entry`).toBeTruthy();
@@ -319,9 +348,7 @@ test("studio free color: custom HEX outside the palette paints, records, and res
     .then((r) => r.json());
   expect(manifest.version, "served pack must declare a content version").toBeTruthy();
 
-  await page.locator("#pre-match-start-btn").click();
-  await expect(page.locator("path[id^='region-']").first()).toBeVisible({ timeout: 15_000 });
-
+  await startStudioMatch(page);
   // A custom HEX the palette does NOT ship.
   const CUSTOM_HEX = "#B4D4AA";
   expect(palette.map((p) => p.hex.toUpperCase())).not.toContain(CUSTOM_HEX);
@@ -331,6 +358,12 @@ test("studio free color: custom HEX outside the palette paints, records, and res
   // number-match rejection does not apply (no palette number needed). One
   // real pointer click fills it.
   const target = regions[0];
+  // The PRISTINE fill (unfilled mask — white under the underpainting model,
+  // paper tone in standard vector mode) is captured, not assumed: the
+  // version-mismatch act below asserts the region returns to exactly it.
+  const pristineFill = await page
+    .locator(`path[id='region-${target.id}']`)
+    .evaluate((el) => el.getAttribute("fill"));
   const tap = await clickPointFor(page, target.id, target.label.x, target.label.y);
   await page.mouse.click(tap.x, tap.y);
 
@@ -346,16 +379,55 @@ test("studio free color: custom HEX outside the palette paints, records, and res
   await expect.poll(async () => (await progressOf(page, artworkId)).completed).toContain(target.id);
   const raw = await rawProgressOf(page, artworkId);
   expect(raw?.contentVersion).toBe(manifest.version);
+  expect(raw?.customRegionColors?.[target.id]?.toUpperCase()).toBe(CUSTOM_HEX);
 
-  // Restore: same content version → the progress survives a reload and the
-  // Home hero offers to RESUME the same artwork (the real progressMapFor
-  // read). The hero auto-advances every ~5s; slide 0 carries the Resume CTA,
-  // so allow a full cycle.
+  // Restore, VISUALLY (the reviewer's bar: not localStorage reads). Same
+  // content version → reopening the artwork in studio mode brings the
+  // canvas back with the region STILL painted in the artist's custom HEX —
+  // hydrated from the record at mount, not repainted by this act.
   await page.reload();
   // After hydration the hero CTA flips from "Start coloring" to
-  // "Resume <title>" — the flip itself is the hydration signal.
+  // "Resume <title>" — the flip itself is the hydration signal and the
+  // Home-level identity read (the real progressMapFor).
   await expect(page.locator("#home-hero-solo-btn")).toContainText(`Resume ${title}`, { timeout: 30_000 });
-  expect((await progressOf(page, artworkId)).completed).toContain(target.id);
+  await openStudioBriefing(page);
+  await startStudioMatch(page);
+  await expect
+    .poll(async () =>
+      page
+        .locator(`path[id='region-${target.id}']`)
+        .evaluate((el) => el.getAttribute("fill")?.toUpperCase())
+    )
+    .toBe(CUSTOM_HEX);
+
+  // Version mismatch: the SAME artwork re-ships as a new content version
+  // (the route bumps the manifest — the staged content change IS the thing
+  // under test). The custom paint and the completion must NOT reappear: the
+  // region renders its pristine unfilled mask again.
+  await page.route(`**/artworks/${artworkId}/artwork.json`, async (route) => {
+    const bumped = (await route.fetch().then((r) => r.json())) as { version: string };
+    bumped.version = "9.9.9";
+    await route.fulfill({ json: bumped });
+  });
+  await page.reload();
+  await openStudioBriefing(page);
+  await startStudioMatch(page);
+  // The contract is the NEGATION: the artist's custom paint must not come
+  // back. The engine may render the unfilled region as its pristine mask OR
+  // as a target hint (the selected color still has unfilled regions) — both
+  // are honest "not restored" states, so assert against the paint itself.
+  await expect
+    .poll(async () =>
+      page
+        .locator(`path[id='region-${target.id}']`)
+        .evaluate((el) => el.getAttribute("fill")?.toUpperCase())
+    )
+    .not.toBe(CUSTOM_HEX);
+  // The shipped-version record survives in storage, identity-filtered —
+  // filtered, not destroyed: the paints stay with it.
+  const stale = await rawProgressOf(page, artworkId);
+  expect(stale?.contentVersion).toBe(manifest.version);
+  expect(stale?.customRegionColors?.[target.id]?.toUpperCase()).toBe(CUSTOM_HEX);
 });
 
 // ------------------------------------------- version-aware progress identity

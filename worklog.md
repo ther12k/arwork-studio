@@ -2124,3 +2124,31 @@ Work Log:
 
 Stage Summary:
 - Track A's foundation is in: the game repo is commit-pinned and clean, progress can never silently cross content versions, Free Color and Duel are proven in the real game, and CI now plays the golden packs in the real game on every push. The game repo's four commits are pushed so the CI job clones what the pin recorded. Remaining game-side backlog: version-aware cleanup UX (a "content updated — progress reset" notice), Daily/duel-mode depth, and any adapter hardening that falls out of live play.
+
+---
+Task ID: TrackA-2
+Agent: main (ZCode)
+Task: Review round on TrackA-1 — P1 actual gameplay resume: Free Color custom colors and completed regions must survive a reload VISUALLY on the canvas, not just in the progress record.
+
+Work Log:
+- Confirmed the reviewer's diagnosis: progressStore held only completion metadata while customRegionColors lived in local React state, and DuelGameScreen mounted filledRegionIds=[] / customRegionColors={} without reading the store — Home/Profile knew about progress, the canvas resumed blank.
+- Game fix (0dd2748, on ther12k/color-duel): ArtworkProgress gains customRegionColors (studio/free-color only — number/memory/duel colors derive from the palette and add no key); recordRegionCompleted takes {customColor} — carried per content version, overridable on repaint, dropped on version change (the identity contract already blocks cross-version leaks). DuelGameScreen hydrates ONCE at mount from the identity-checked getProgress(artwork.id, artwork.contentVersion): completed regions come back completed, artist paints come back painted. bun tests 11 (paint persistence, repaint override, no cross-version leak, colorless number-mode writes).
+- Real-game gate now asserts the reviewer's bar VISUALLY (fill attributes on the reopened canvas, not localStorage): number mode — after reload the three completed regions' opaque white masks are GONE (fill flips #FFFFFF → transparent, underpainting shows); free color — after reload the region still renders the artist's #B4D4AA; version mismatch — the same artwork re-shipped at v9.9.9 shows NEITHER the paint NOR the completion (asserted against the paint itself: the engine may render the pristine mask or a target hint, both honest not-restored states) while the raw v-shipped record stays intact in storage, identity-filtered not destroyed.
+- Environment notes: dev checkout and a fresh ther12k/color-duel clone both 5/5 (the first fresh-clone attempt failed because the clone predated the game P1 push — re-pushed and re-cloned). openStudio split into openStudioBriefing + startStudioMatch so rows can read the briefing title before starting.
+
+Stage Summary:
+- "Free Color custom HEX → fill → reload → restored" is now true end-to-end and visually proven, and general canvas resume works for number-mode progress under the same version-identity contract. Governance note stands: fork (ther12k/color-duel) carries the commits until upstream write access exists.
+
+---
+Task ID: 41
+Agent: main (ZCode)
+Task: Artwork Content Release Pipeline — a reproducible delivery path for the untracked ~279 MB artwork content from the Studio to any deployment, with assets-first / verify / catalog-last ordering.
+
+Work Log:
+- scripts/release_artwork_content.py (studio backend, stdlib-only): packs (validated artwork.json + assets) → staged under <out>/artworks/<id>/<version>/ (immutable, never overwritten) → every staged byte re-read and SHA-256-verified against the per-file manifest → ONLY THEN the game catalog upserted atomically (tmp + os.replace) and release-state.json + release-manifest.json ({id, version, contentHash, files{relpath: sha256}}) written. contentHash = sha256 over sorted 'relpath sha256' lines; a changed byte bumps the PREVIOUS RELEASE version's patch (re-exports may repeat declared versions, releases may not). Catalog manifest paths are versioned (artworks/<id>/<version>/artwork.json) so CDNs can cache forever without serving old bytes under a new manifest; the game loader resolves sibling assets relative to the manifest, so zero game changes are needed.
+- Ordering is pinned by tests (tests/test_content_release.py, 5 cases): stage+verify precede catalog publish (a forced SHA-256 mismatch aborts with catalog AND state untouched); idempotent unchanged content; changed content bumps patch and retains the old version dir; a tampered existing version directory refuses to publish (immutability); multi-pack upsert preserves pre-existing entries.
+- docs/CONTENT_RELEASE.md documents the contract, the ordering rule, and who consumes what (game loader / CI prepare / progress identity).
+- Full backend suite re-run with the new file (below).
+
+Stage Summary:
+- Content now has a production answer: git carries code + catalog configuration; the release pipeline carries the bytes, content-addressed and verified, catalog published last. Remaining backlog per review: 'content updated — progress reset' UX notice, then Daily/duel depth; the fork-vs-upstream governance decision stays with the reviewer.
